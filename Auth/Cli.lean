@@ -85,6 +85,19 @@ def readValue (given : Option String) : IO String := do
     else pure v
   | none => do pure (← (← IO.getStdin).readToEnd)
 
+/-- The same, as bytes.
+
+Request bodies are not text.  A `git-receive-pack` body is pkt-lines followed
+by a packfile, and reading it as UTF-8 fails outright — which would make
+`auth check` useless for exactly the bodies it is most needed for. -/
+def readBytes (given : Option String) : IO Bytes := do
+  match given with
+  | some v =>
+    if v.startsWith "@" then IO.FS.readBinFile (Str.stripPrefix v "@")
+    else if v == "-" then do pure (← (← IO.getStdin).readBinToEnd)
+    else pure (Bytes.ofString v)
+  | none => do pure (← (← IO.getStdin).readBinToEnd)
+
 /-! ## Commands -/
 
 /-- `auth root-key` — the public key a verifier needs. -/
@@ -297,10 +310,9 @@ def cmdCheck (args : Args) : IO Unit := do
     | some u => pure u
     | none => die "checking needs --url"
   let method := (args.optD "method" "GET").toUpper
-  let bodyText ← match args.opt? "body" with
-    | none => pure ""
-    | some b => readValue (some b)
-  let body := Bytes.ofString bodyText
+  let body ← match args.opt? "body" with
+    | none => pure ByteArray.empty
+    | some b => readBytes (some b)
   let contentType := args.opt? "content-type"
   let text ← readValue (args.opt? "token")
   let root ← Token.rootPublicKey
