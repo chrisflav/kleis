@@ -652,7 +652,9 @@ force_push($ref) <-
 """
 ```
 
-**Grant** (`examples/ci-dev.toml`), written by the owner:
+**Grant** (`examples/ci-dev.toml`), written by the owner.  `examples/` also has
+`read-only`, which clones and reads and cannot write, and `pr-approver`, which
+may approve pull requests on one repository and do nothing else:
 
 ```
 credential   = "github/chrisflav"

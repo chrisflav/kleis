@@ -44,6 +44,10 @@ allow if grant("ci-dev");
 `reject if` rather than `check all` is not a style choice; see §4.3 of the
 design for the two reasons.
 
+`examples/` has three grants to copy from: `ci-dev` pushes to one branch prefix,
+`read-only` clones and reads and cannot write, and `pr-approver` may approve
+pull requests on one repository and do nothing else.
+
 ## Adding a service costs a file
 
 Nothing in the Lean source knows that GitHub exists. A service is a manifest:
@@ -70,7 +74,7 @@ whose decoder is four lines of Python.
 ```sh
 lake build          # the library, `auth` and `authd`
 lake test           # 213 checks: crypto vectors, decoders, policy, TLS
-./scripts/integration.sh   # a real `git push` through a running daemon
+./scripts/integration.sh   # 32 checks: a real git push and clone through a daemon
 ```
 
 Needs OpenSSL headers (`libssl-dev`) for the TLS shim, and `git`, `curl` and
@@ -87,13 +91,16 @@ loopback with the origin in the path.
 git config --global url."http://127.0.0.1:8080/https/github.com/".insteadOf "https://github.com/"
 ```
 
+Pick one mode. They are mutually exclusive, and `auth setup --mode rewrite` or
+`--mode connect` unsets the other for you.
+
 **CONNECT** is the real thing: `HTTPS_PROXY`, a certificate minted per SNI from
 a local CA, TLS terminated and re-established to the origin with full
 verification. `auth setup` prints what to configure and where. The CA goes into
 git's and curl's trust configuration, never into the system store.
 
 ```sh
-eval "$(auth setup --token "$TOKEN")"
+eval "$(auth setup --mode connect --token "$TOKEN")"
 ```
 
 A client that pins certificates cannot be intercepted, and is not pretended

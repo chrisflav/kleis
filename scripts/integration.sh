@@ -6,6 +6,12 @@
 # anywhere and touches nothing of the invoking user's.
 set -uo pipefail
 
+# `cd` is guarded everywhere below.  Without that, a `cd` into a directory a
+# failed step never created leaves the script running in the repository it was
+# launched from -- where the `git config` and `git commit` further down are
+# then applied to somebody's real work.  This happened.
+enter() { cd "$1" || { printf 'auth-test: cannot enter %s\n' "$1" >&2; exit 1; }; }
+
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 export AUTH_HOME="$WORK/home"
@@ -107,6 +113,21 @@ allow if grant("dev-only");
 '''
 EOF
 
+cat > "$AUTH_HOME/config/grants/read.toml" <<'EOF'
+name         = "read-only"
+service      = "demo"
+credential   = "demo/token"
+max_lifetime = "1h"
+
+datalog = '''
+allowed_operation("discover") <-
+  operation("discover"), discover_service("git-upload-pack");
+allowed_operation("fetch") <- operation("fetch");
+check if allowed_operation($x);
+allow if grant("read-only");
+'''
+EOF
+
 cat > "$AUTH_HOME/config/grants/echo.toml" <<'EOF'
 name         = "echo-only"
 service      = "demo"
@@ -129,6 +150,8 @@ DEV_TOKEN="$("$AUTH" token issue --grant dev-only --bearer ci@test --ttl 1h)"
 check $? "issue a token for the push grant"
 ECHO_TOKEN="$("$AUTH" token issue --grant echo-only --bearer ci@test --ttl 1h)"
 check $? "issue a token for the echo grant"
+READ_TOKEN="$("$AUTH" token issue --grant read-only --bearer ci@test --ttl 1h)"
+check $? "issue a token for the read-only grant"
 
 # ---------------------------------------------------------------- the daemon
 "$AUTHD" > "$WORK/authd.log" 2>&1 &
@@ -176,7 +199,7 @@ git config --global "url.$BASE/.insteadOf" "http://127.0.0.1:$ORIGIN_PORT/"
 git config --global http.extraHeader "Proxy-Authorization: Bearer $DEV_TOKEN"
 
 git init --quiet "$WORK/clone"
-cd "$WORK/clone"
+enter "$WORK/clone"
 git remote add origin "http://127.0.0.1:$ORIGIN_PORT/demo.git"
 echo hello > file.txt
 git add file.txt
@@ -185,6 +208,9 @@ git commit --quiet -m "first"
 git branch -M dev/feature
 git push --quiet origin dev/feature > "$WORK/push-dev.log" 2>&1
 check $? "push to dev/feature succeeds" "$(cat "$WORK/push-dev.log")"
+# The bare repo's HEAD still names a branch nothing was ever pushed to, so a
+# clone of it would check out an empty tree.
+git -C "$WORK/repos/demo.git" symbolic-ref HEAD refs/heads/dev/feature
 
 git branch -M main
 git push origin main > "$WORK/push-main.log" 2>&1
@@ -202,7 +228,40 @@ git branch dev/second
 git push origin dev/second main > "$WORK/push-mixed.log" 2>&1
 if [ $? -ne 0 ]; then ok "a mixed push is refused"; else bad "a mixed push is refused" "it succeeded"; fi
 
-cd "$ROOT"
+enter "$ROOT"
+
+echo
+echo "== a real git clone with a read-only token"
+git config --global --unset-all http.extraHeader
+git config --global http.extraHeader "Proxy-Authorization: Bearer $READ_TOKEN"
+rm -rf "$WORK/readclone"
+git clone --quiet "http://127.0.0.1:$ORIGIN_PORT/demo.git" "$WORK/readclone" > "$WORK/clone.log" 2>&1
+check $? "clone succeeds with a read-only token" "$(cat "$WORK/clone.log")"
+[ -f "$WORK/readclone/file.txt" ]
+check $? "and the working tree has the pushed file"
+
+# The same token must not be able to write.
+enter "$WORK/readclone"
+git config user.email r@test
+git config user.name r
+echo more >> file.txt
+git commit --quiet -am "should not land"
+git push origin HEAD:refs/heads/dev/nope > "$WORK/readpush.log" 2>&1
+if [ $? -ne 0 ]; then ok "and the same token cannot push"; else bad "and the same token cannot push" "it succeeded"; fi
+# Refused by policy, not by git having nothing to send.
+grep -q '403' "$WORK/readpush.log"
+check $? "refused by the proxy rather than locally" "$(cat "$WORK/readpush.log")"
+enter "$ROOT"
+
+# ...while the push token cannot clone, which is the other half of the split.
+git config --global --unset-all http.extraHeader
+git config --global http.extraHeader "Proxy-Authorization: Bearer $DEV_TOKEN"
+rm -rf "$WORK/devclone"
+git clone --quiet "http://127.0.0.1:$ORIGIN_PORT/demo.git" "$WORK/devclone" > "$WORK/devclone.log" 2>&1
+if [ $? -ne 0 ]; then ok "and a push-only token cannot clone"; else bad "and a push-only token cannot clone" "it succeeded"; fi
+git config --global --unset-all http.extraHeader
+git config --global http.extraHeader "Proxy-Authorization: Bearer $DEV_TOKEN"
+
 echo
 echo "== revocation"
 REV="$("$AUTH" token list | head -1 | cut -f1)"
@@ -262,7 +321,7 @@ git config --global http.proxyAuthMethod basic
 git config --global http.sslCAInfo "$CA"
 
 git init --quiet "$WORK/tlsclone"
-cd "$WORK/tlsclone"
+enter "$WORK/tlsclone"
 git remote add origin "https://127.0.0.1:$TLS_PORT/tls.git"
 echo tls > file.txt
 git add file.txt
@@ -274,7 +333,7 @@ check $? "push over https through CONNECT succeeds" "$(cat "$WORK/push-tls.log")
 git branch -M main
 git push origin main > "$WORK/push-tls-main.log" 2>&1
 if [ $? -ne 0 ]; then ok "and main is still refused over https"; else bad "and main is still refused over https" "it succeeded"; fi
-cd "$ROOT"
+enter "$ROOT"
 
 echo
 echo "== the audit log"

@@ -1,0 +1,36 @@
+# A grant that can clone, fetch and read, and cannot write anything.
+#
+# The shape to copy: a *whitelist* of operations, so that a route added to the
+# manifest later is refused by default rather than allowed by omission.
+# Listing the operations to reject instead would mean this file has to be
+# revisited every time the manifest grows.
+
+name         = "read-only"
+service      = "github"
+credential   = "github/chrisflav"
+max_lifetime = "12h"
+
+datalog = '''
+// A clone or fetch is two requests, like a push: the ref advertisement first,
+// then the pack.  The advertisement says which it is for, and this grant wants
+// only the `git-upload-pack` one -- allowing the other would let a bearer
+// start a push and be refused halfway, which is a worse error than being
+// refused at the start.
+allowed_operation("discover") <-
+  operation("discover"), discover_service("git-upload-pack");
+allowed_operation("fetch") <- operation("fetch");
+
+// Reads of the API.  `list_or_open_pr` is one route for two methods, so the
+// method has to be checked here: a route fact and a primitive fact join like
+// any others.
+allowed_operation("read") <- operation("read");
+allowed_operation("list_pr") <-
+  operation("list_or_open_pr"), request_method("GET");
+
+check if allowed_operation($x);
+
+// Any repository of this owner, rather than a fixed list.
+check if repository("chrisflav", $r);
+
+allow if grant("read-only");
+'''
