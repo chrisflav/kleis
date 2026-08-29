@@ -110,33 +110,64 @@ def cmdCa (args : Args) : IO Unit := do
   if args.flag "pem" then say root.pem
   else say ((← Dirs.ca) / "ca.crt").toString
 
-/-- `auth setup` — what to put where, so the tools trust and use the proxy. -/
+/-- `auth setup` — what to put where, so the tools trust and use the proxy.
+
+One mode at a time, and the other mode's settings are unset.  The two are
+mutually exclusive and combining them fails in a way that takes a while to
+read: `insteadOf` rewrites the URL to the proxy, `http.proxy` then sends *that*
+through the proxy, and the daemon is asked to fetch from itself.  An earlier
+version of this command printed both configurations one after the other under
+comment headers, which is an invitation to paste the lot. -/
 def cmdSetup (args : Args) : IO Unit := do
   let config ← loadConfig
   let _ ← Ca.loadOrCreateRoot
   let caPath := ((← Dirs.ca) / "ca.crt").toString
   let listen := s!"{config.listenHost}:{config.listenPort}"
   let token := args.optD "token" "<your-biscuit>"
-  say "# Intercepting mode: real URLs, needs the CA trusted."
-  say s!"export HTTPS_PROXY=http://auth:{token}@{listen}"
-  say s!"export HTTP_PROXY=http://auth:{token}@{listen}"
-  say s!"export SSL_CERT_FILE={caPath}"
-  say s!"export GIT_SSL_CAINFO={caPath}"
-  say s!"export NODE_EXTRA_CA_CERTS={caPath}"
-  say ""
-  say "# The same for git, persistently.  `proxyAuthMethod` matters: git's"
-  say "# default probes for a scheme, and curl does not understand Bearer for"
-  say "# a proxy, so without this the first request is an unhelpful failure."
-  say s!"git config --global http.proxy http://auth:{token}@{listen}"
-  say "git config --global http.proxyAuthMethod basic"
-  say s!"git config --global http.sslCAInfo {caPath}"
-  say ""
-  say "# Rewrite mode: no CA, no interception; git sends real URLs to the loopback."
   let registry ← Service.Registry.load
-  for m in registry.manifests do
-    for host in m.hosts do
-      say s!"git config --global url.\"http://{listen}/https/{host}/\".insteadOf \"https://{host}/\""
-  say s!"git config --global http.extraHeader \"X-Auth-Token: {token}\""
+  let mode ← match args.opt? "mode" with
+    | some "connect" => pure Mode.connect
+    | some "rewrite" => pure Mode.rewrite
+    | some m => die s!"--mode is `connect` or `rewrite`, not `{m}`"
+    | none => pure (if config.mode == .rewrite then Mode.rewrite else Mode.connect)
+
+  say "# Run this through a shell, or paste it.  Everything for the other mode"
+  say "# is unset first: the two cannot both be configured."
+  say ""
+
+  match mode with
+  | .rewrite | .both =>
+    say "# --- rewrite mode: no certificate, git sends real URLs to the loopback."
+    say "git config --global --unset http.proxy || true"
+    say "git config --global --unset http.proxyAuthMethod || true"
+    say "unset HTTPS_PROXY HTTP_PROXY"
+    say ""
+    for m in registry.manifests do
+      for host in m.hosts do
+        say s!"git config --global url.\"http://{listen}/https/{host}/\".insteadOf \"https://{host}/\""
+    say s!"git config --global http.extraHeader \"Proxy-Authorization: Bearer {token}\""
+  | .connect =>
+    say "# --- intercepting mode: real URLs through CONNECT, needs the CA trusted."
+    for m in registry.manifests do
+      for host in m.hosts do
+        say s!"git config --global --remove-section url.\"http://{listen}/https/{host}/\" || true"
+    say "git config --global --unset http.extraHeader || true"
+    say ""
+    say s!"export HTTPS_PROXY=http://auth:{token}@{listen}"
+    say s!"export HTTP_PROXY=http://auth:{token}@{listen}"
+    say s!"export SSL_CERT_FILE={caPath}"
+    say s!"export GIT_SSL_CAINFO={caPath}"
+    say s!"export NODE_EXTRA_CA_CERTS={caPath}"
+    say ""
+    say s!"git config --global http.proxy http://auth:{token}@{listen}"
+    say "# `proxyAuthMethod` matters: git's default probes for a scheme, and curl"
+    say "# does not understand Bearer for a proxy."
+    say "git config --global http.proxyAuthMethod basic"
+    say s!"git config --global http.sslCAInfo {caPath}"
+
+  say ""
+  say s!"# The CA lives at {caPath}.  Keep it there: it is read on every request,"
+  say "# and a copy under a temporary directory stops working when that is cleaned."
 
 /-- `auth service list|show` -/
 def cmdService (args : Args) : IO Unit := do
@@ -361,7 +392,8 @@ def usage : String :=
 "auth — a credential proxy
 
 usage:
-  auth setup [--token <biscuit>]     what to configure, and where
+  auth setup [--mode connect|rewrite] [--token <biscuit>]
+                                     what to configure, and where
   auth root-key                      the biscuit root public key
   auth ca [--pem]                    the local certificate authority
 

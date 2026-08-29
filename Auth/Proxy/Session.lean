@@ -146,6 +146,35 @@ def handleConnect (ctx : Context) (client : Net.Stream) (wire : Http.Request)
     catch _ => pure ()
     tls.close
 
+/-- Is this absolute-form request addressed to the proxy itself?
+
+It happens when both interception modes are configured at once: `insteadOf`
+rewrites the URL to point at the proxy, and `http.proxy` then sends that
+rewritten URL *through* the proxy, so the daemon is asked to fetch from itself.
+The symptom is a refusal naming the proxy's own address as an unknown service,
+which takes a while to recognise for what it is. -/
+def addressedToSelf? (ctx : Context) (target : String) : Option String :=
+  let rest :=
+    if target.startsWith "http://" then some (Str.stripPrefix target "http://")
+    else if target.startsWith "https://" then some (Str.stripPrefix target "https://")
+    else none
+  rest.bind fun r =>
+    let authority := (r.splitOn "/").headD r
+    let (host, port) := match Str.splitOnce? authority ":" with
+      | some (h, p) => (h, p.toNat?.getD 80)
+      | none => (authority, 80)
+    if host == ctx.config.listenHost && port == ctx.config.listenPort.toNat then
+      let path := Str.stripPrefix r authority
+      some (if (unrewrite? path).isSome then
+        "both interception modes are configured: `insteadOf` rewrote the URL to \
+        point at this proxy, and `http.proxy` then sent it through this proxy. \
+        Unset one — run `auth setup --mode rewrite` or `auth setup --mode connect`, \
+        which unsets the other for you"
+      else
+        "this request is addressed to the proxy itself; check `http.proxy` and \
+        any `insteadOf` rewrites")
+    else none
+
 /-- Handle a rewrite-mode request, whose target carries the origin. -/
 def handleRewrite (ctx : Context) (client : Net.Stream) (wire : Http.Request)
     (rest : Bytes) (token : Biscuit) (clientIp requestId : String) : IO Unit := do
@@ -188,9 +217,12 @@ def handleConnection (ctx : Context) (client : Net.Stream) (clientIp : String) :
           if ctx.config.mode.intercepts then handleConnect ctx client wire token clientIp
           else refuse client 405 requestId "this proxy is not configured to intercept CONNECT"
         else if wire.target.startsWith "http://" || wire.target.startsWith "https://" then
-          let _ ← forward ctx { client, wire, pipelined := rest, scheme := "http"
-                                tunnel := none, token, clientIp }
-          pure ()
+          match addressedToSelf? ctx wire.target with
+          | some diagnosis => refuse client 400 requestId diagnosis
+          | none =>
+            let _ ← forward ctx { client, wire, pipelined := rest, scheme := "http"
+                                  tunnel := none, token, clientIp }
+            pure ()
         else if ctx.config.mode.rewrites then
           handleRewrite ctx client wire rest token clientIp requestId
         else refuse client 400 requestId "this proxy expects an absolute target or CONNECT"
