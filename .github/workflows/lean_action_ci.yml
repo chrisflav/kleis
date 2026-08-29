@@ -1,0 +1,31 @@
+name: Lean Action CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # `auth` requires `lean-biscuit` from a sibling directory, the way a
+      # developer has the two checked out side by side.
+      - name: Check out lean-biscuit
+        uses: actions/checkout@v5
+        with:
+          repository: chrisflav/lean-biscuit
+          path: ../lean-biscuit
+
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - uses: leanprover/lean-action@v1
+        with:
+          test: true
+
+      - name: Integration test
+        run: ./scripts/integration.sh

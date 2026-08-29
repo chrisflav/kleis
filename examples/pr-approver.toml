@@ -1,0 +1,20 @@
+# A grant that may approve pull requests against one branch, and do nothing
+# else — the second example from the design.
+
+name         = "pr-approver"
+service      = "github"
+credential   = "github/chrisflav"
+max_lifetime = "8h"
+
+datalog = '''
+check if operation("review_pr");
+check if repository("chrisflav", "auth");
+
+// The review must be an approval, and the body says so.  `body_opaque(false)`
+// is the guard that matters: without it, a request whose body nobody could read
+// would satisfy nothing and everything.
+check if body_opaque(false);
+check if body(["event"], "APPROVE");
+
+allow if grant("pr-approver");
+'''

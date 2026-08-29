@@ -1,0 +1,102 @@
+# A service manifest for GitHub.
+#
+# Everything GitHub-specific in this system is in this file.  Nothing in the
+# Lean source knows that GitHub exists.
+#
+# Note on TOML: a key written after a `[[route]]` header belongs to *that*
+# table.  Document-level settings therefore go at the top, before any header.
+
+name  = "github"
+hosts = ["github.com", "api.github.com", "codeload.github.com"]
+modes = ["rewrite", "connect"]
+
+max_body_facts   = 512
+max_decode_prefix = 65536
+
+# Rules deriving what a request means from the primitive and body facts.
+# A manifest may add facts and rules; it may never add a check or a policy.
+datalog = '''
+ref_update($ref) <-
+  body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref";
+
+creates_ref($ref) <-
+  body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref",
+  body($q, true), $q.length() == 3, $q.get(0) == "updates",
+  $q.get(1) == $p.get(1), $q.get(2) == "create";
+
+deletes_ref($ref) <-
+  body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref",
+  body($q, true), $q.length() == 3, $q.get(0) == "updates",
+  $q.get(1) == $p.get(1), $q.get(2) == "delete";
+
+// What a fetch or clone is asking for.
+wants_object($oid) <-
+  body($p, $oid), $p.length() == 2, $p.get(0) == "wants";
+
+// Note what is *not* here: a rule deriving a bare branch name from a ref.
+// Datalog cannot compute a new term in a rule head, so `refs/heads/dev/x` to
+// `dev/x` is not a rule.  A policy writes `$ref.starts_with("refs/heads/")`,
+// or a route captures what it needs.
+'''
+
+[credential]
+provider = "static"
+# The only hosts this credential may ever be sent to, re-checked after every
+# redirect.
+hosts    = ["github.com", "api.github.com", "codeload.github.com"]
+strip    = ["cookie"]
+
+[[credential.inject]]
+kind     = "header"
+name     = "Authorization"
+template = "Bearer {{secret}}"
+
+[[decoder]]
+media   = ["application/x-git-receive-pack-request"]
+decoder = "git-receive-pack"
+
+[[decoder]]
+media   = ["application/x-git-upload-pack-request"]
+decoder = "git-upload-pack"
+
+# ---------------------------------------------------------------- git
+
+[[route]]
+match = "POST github.com /{owner}/{repo%.git}/git-receive-pack"
+emit  = ['operation("push")', 'repository($owner, $repo)']
+
+[[route]]
+match = "POST github.com /{owner}/{repo%.git}/git-upload-pack"
+emit  = ['operation("fetch")', 'repository($owner, $repo)']
+
+# The ref advertisement, which both a push and a fetch begin with.  Which one
+# it is for is in the query string, and a grant that allows pushing should not
+# thereby allow discovering for a fetch.
+[[route]]
+match = "GET github.com /{owner}/{repo%.git}/info/refs"
+capture = { service = "query:service" }
+emit  = ['operation("discover")', 'repository($owner, $repo)',
+         'discover_service($service)']
+
+# ---------------------------------------------------------------- api
+
+[[route]]
+match = "GET|POST api.github.com /repos/{owner}/{repo}/pulls"
+emit  = ['operation("list_or_open_pr")', 'repository($owner, $repo)']
+
+[[route]]
+match = "PUT api.github.com /repos/{owner}/{repo}/pulls/{number:int}/merge"
+emit  = ['operation("merge_pr")', 'repository($owner, $repo)', 'pull_request($number)']
+
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/pulls/{number:int}/reviews"
+emit  = ['operation("review_pr")', 'repository($owner, $repo)', 'pull_request($number)']
+capture = { review_event = "body:event", base = "body:base" }
+
+[[route]]
+match = "GET api.github.com /repos/{owner}/{repo}/{rest*}"
+emit  = ['operation("read")', 'repository($owner, $repo)']
+
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/issues/{number:int}/comments"
+emit  = ['operation("comment")', 'repository($owner, $repo)', 'issue($number)']

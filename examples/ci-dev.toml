@@ -1,0 +1,36 @@
+# A grant: what may be done with a credential, and for how long.
+#
+# The grant is the only contributor that may `allow`.  A manifest says what a
+# request *is*; the token says which grant it claims and may narrow it further;
+# this decides.
+
+name         = "ci-dev"
+service      = "github"
+credential   = "github/chrisflav"
+max_lifetime = "24h"
+
+datalog = '''
+// A push is two requests, not one: git first asks for the ref advertisement
+// (`GET /info/refs?service=git-receive-pack`) and only then sends the pack.  A
+// grant that allows only `operation("push")` refuses the first one, and the
+// push fails before it starts.  Datalog has no `or`, so the disjunction is a
+// pair of rules.
+allowed_operation("push") <- operation("push");
+allowed_operation("discover") <-
+  operation("discover"), discover_service("git-receive-pack");
+
+check if allowed_operation($x);
+check if repository("chrisflav", $r), ["auth", "lean-biscuit"].contains($r);
+
+// `reject if`, not `check all`.  Both catch the mixed push -- one good ref must
+// not carry a bad one through -- but `check all` also requires at least one
+// match, so it would refuse the ref advertisement, which carries no ref updates
+// at all.  `reject if` is vacuously satisfied there and still fails the moment
+// any update falls outside `dev/`.
+reject if ref_update($ref), !$ref.starts_with("refs/heads/dev/");
+
+// Deleting a branch is not pushing to one.
+reject if deletes_ref($any);
+
+allow if grant("ci-dev");
+'''
