@@ -154,6 +154,10 @@ attenuation derived from it.
 The audit log is hash-chained and replayable: authorization is a pure function
 of the facts, and the facts are in the record.
 
+## Licence
+
+Apache 2.0. See [LICENSE](LICENSE).
+
 ## Dependencies
 
 One: [lean-biscuit](https://github.com/chrisflav/lean-biscuit), which brings
