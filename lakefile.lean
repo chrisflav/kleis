@@ -6,7 +6,12 @@ package kleis where
   testDriver := "tests"
   moreLinkArgs := #["-lssl", "-lcrypto"]
 
-require «lean-biscuit» from ".." / "lean-biscuit"
+-- Pinned to a revision rather than tracking a branch: what this builds against
+-- is the thing whose datalog engine and curve arithmetic the properties in
+-- DESIGN.md are stated over, and a dependency that moved underneath them would
+-- make those statements about something else.
+require «lean-biscuit» from git
+  "https://github.com/chrisflav/lean-biscuit" @ "7fbe9020beebcb1b385ca6d31c8711ffb6361e26"
 
 /-- Compile a C shim under `ffi/` into a static library of the same name. -/
 private def ffiStaticLib (pkg : Package) (name : String) : FetchM (Job System.FilePath) := do
