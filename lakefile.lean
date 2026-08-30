@@ -1,7 +1,7 @@
 import Lake
 open Lake DSL
 
-package auth where
+package kleis where
   version := v!"0.1.0"
   testDriver := "tests"
   moreLinkArgs := #["-lssl", "-lcrypto"]
@@ -19,30 +19,30 @@ private def ffiStaticLib (pkg : Package) (name : String) : FetchM (Job System.Fi
   liftM <| buildFileAfterDep libFile oJob fun oFile => do
     compileStaticLib libFile #[oFile]
 
-/-- TLS over OpenSSL, backing `Auth.Net.Tls`.  A byte transform over memory
+/-- TLS over OpenSSL, backing `Kleis.Net.Tls`.  A byte transform over memory
 BIOs: it never sees a socket. -/
 extern_lib Tls pkg := ffiStaticLib pkg "Tls"
 
-/-- Name resolution, backing `Auth.Net.Resolve`.  Lean's networking has sockets
+/-- Name resolution, backing `Kleis.Net.Resolve`.  Lean's networking has sockets
 but no resolver. -/
 extern_lib Net pkg := ffiStaticLib pkg "Net"
 
 @[default_target]
-lean_lib Auth
+lean_lib Kleis
 
-lean_lib AuthTests where
-  globs := #[.andSubmodules `AuthTests]
+lean_lib KleisTests where
+  globs := #[.andSubmodules `KleisTests]
 
 /-- The client: everything a person types. -/
 @[default_target]
-lean_exe auth where
+lean_exe kleis where
   root := `Main
 
 /-- The daemon: the proxy and the control API, in the one process that holds
 credentials. -/
 @[default_target]
-lean_exe authd where
-  root := `Authd
+lean_exe kleisd where
+  root := `Kleisd
 
 lean_exe tests where
-  root := `AuthTests.Main
+  root := `KleisTests.Main

@@ -1,4 +1,7 @@
-# auth
+# kleis
+
+*κλείς, the key; κλειδοῦχος, the one who holds it.*  In a Greek temple the
+kleidouchos held the key and opened the door for you; you never held the key.
 
 A credential proxy. Somebody installs an access token for an external service
 once; everybody else gets a *biscuit* that says, in datalog, what they may do
@@ -18,10 +21,10 @@ See [DESIGN.md](DESIGN.md) for why it is built the way it is.
 
 ```sh
 # The owner installs a token once, and says what may be done with it.
-printf '%s' "$GITHUB_TOKEN" | auth credential add github/chrisflav --service github --secret -
+printf '%s' "$GITHUB_TOKEN" | kleis credential add github/chrisflav --service github --secret -
 
 # A bearer gets a token that names a grant.
-auth token issue --grant ci-dev --bearer ci@build-07 --ttl 8h
+kleis token issue --grant ci-dev --bearer ci@build-07 --ttl 8h
 ```
 
 With the proxy configured, the bearer runs ordinary commands against ordinary
@@ -36,7 +39,7 @@ The grant that decides this is a file:
 
 ```
 check if allowed_operation($x);
-check if repository("chrisflav", $r), ["auth", "lean-biscuit"].contains($r);
+check if repository("chrisflav", $r), ["kleis", "lean-biscuit"].contains($r);
 reject if ref_update($ref), !$ref.starts_with("refs/heads/dev/");
 allow if grant("ci-dev");
 ```
@@ -72,7 +75,7 @@ whose decoder is four lines of Python.
 ## Building
 
 ```sh
-lake build          # the library, `auth` and `authd`
+lake build          # the library, `kleis` and `kleisd`
 lake test           # 213 checks: crypto vectors, decoders, policy, TLS
 ./scripts/integration.sh   # 32 checks: a real git push and clone through a daemon
 ```
@@ -91,16 +94,16 @@ loopback with the origin in the path.
 git config --global url."http://127.0.0.1:8080/https/github.com/".insteadOf "https://github.com/"
 ```
 
-Pick one mode. They are mutually exclusive, and `auth setup --mode rewrite` or
+Pick one mode. They are mutually exclusive, and `kleis setup --mode rewrite` or
 `--mode connect` unsets the other for you.
 
 **CONNECT** is the real thing: `HTTPS_PROXY`, a certificate minted per SNI from
 a local CA, TLS terminated and re-established to the origin with full
-verification. `auth setup` prints what to configure and where. The CA goes into
+verification. `kleis setup` prints what to configure and where. The CA goes into
 git's and curl's trust configuration, never into the system store.
 
 ```sh
-eval "$(auth setup --mode connect --token "$TOKEN")"
+eval "$(kleis setup --mode connect --token "$TOKEN")"
 ```
 
 A client that pins certificates cannot be intercepted, and is not pretended
@@ -114,22 +117,22 @@ was built somewhere other than where it runs, set `upstream_ca_file` in
 ## Commands
 
 ```
-auth setup            what to configure, and where
-auth service          list and inspect manifests
-auth grant            list and inspect grants
-auth credential       install, list and remove credentials
-auth token            issue, attenuate, inspect, list and revoke
-auth audit            tail the log, or verify its hash chain
-auth check            run a request against a policy without a proxy
-authd                 the daemon
+kleis setup            what to configure, and where
+kleis service          list and inspect manifests
+kleis grant            list and inspect grants
+kleis credential       install, list and remove credentials
+kleis token            issue, attenuate, inspect, list and revoke
+kleis audit            tail the log, or verify its hash chain
+kleis check            run a request against a policy without a proxy
+kleisd                 the daemon
 ```
 
-`auth check` is the one worth knowing about. A grant is datalog, datalog is
+`kleis check` is the one worth knowing about. A grant is datalog, datalog is
 easy to get subtly wrong, and this asks "would this be allowed" from a shell:
 
 ```sh
-auth check --token "$T" --method POST \
-  --url https://api.github.com/repos/chrisflav/auth/pulls/7/reviews \
+kleis check --token "$T" --method POST \
+  --url https://api.github.com/repos/chrisflav/kleis/pulls/7/reviews \
   --content-type application/json --body '{"event":"APPROVE"}' --facts
 ```
 

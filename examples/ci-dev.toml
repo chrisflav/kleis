@@ -20,7 +20,7 @@ allowed_operation("discover") <-
   operation("discover"), discover_service("git-receive-pack");
 
 check if allowed_operation($x);
-check if repository("chrisflav", $r), ["auth", "lean-biscuit"].contains($r);
+check if repository("chrisflav", $r), ["kleis", "lean-biscuit"].contains($r);
 
 // `reject if`, not `check all`.  Both catch the mixed push -- one good ref must
 // not carry a bad one through -- but `check all` also requires at least one

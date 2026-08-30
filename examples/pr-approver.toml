@@ -8,7 +8,7 @@ max_lifetime = "8h"
 
 datalog = '''
 check if operation("review_pr");
-check if repository("chrisflav", "auth");
+check if repository("chrisflav", "kleis");
 
 // The review must be an approval, and the body says so.  `body_opaque(false)`
 // is the guard that matters: without it, a request whose body nobody could read

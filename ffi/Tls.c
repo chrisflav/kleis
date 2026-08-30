@@ -2,8 +2,8 @@
  * A TLS shim over OpenSSL, exposed to Lean as a byte transform.
  *
  * The session never touches a socket.  It owns two memory BIOs: ciphertext is
- * fed in with auth_tls_feed and drawn out with auth_tls_pull, while plaintext
- * goes in and out through auth_tls_write and auth_tls_read.  Whatever carries
+ * fed in with kleis_tls_feed and drawn out with kleis_tls_pull, while plaintext
+ * goes in and out through kleis_tls_write and kleis_tls_read.  Whatever carries
  * the bytes -- libuv, a unix socket, a test harness holding two sessions
  * face to face -- is the caller's business.
  *
@@ -45,10 +45,10 @@ typedef struct {
     BIO *rbio;  /* ciphertext in  */
     BIO *wbio;  /* ciphertext out */
     char last_error[256];
-} auth_conn;
+} kleis_conn;
 
 static void conn_finalize(void *p) {
-    auth_conn *c = (auth_conn *)p;
+    kleis_conn *c = (kleis_conn *)p;
     if (!c) return;
     if (c->ssl) SSL_free(c->ssl);  /* frees the BIOs it owns */
     free(c);
@@ -88,7 +88,7 @@ static lean_obj_res mk_bytes(const unsigned char *data, size_t len) {
 /* A client context.  Verification is always on: this proxy exists to hold a
  * credential, and a credential handed to an unauthenticated peer is worse than
  * no proxy at all.  caFile may be empty for the system trust store. */
-LEAN_EXPORT lean_obj_res auth_tls_ctx_client(b_lean_obj_arg ca_file, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_ctx_client(b_lean_obj_arg ca_file, lean_obj_arg w) {
     (void)w;
     ensure_classes();
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
@@ -116,7 +116,7 @@ LEAN_EXPORT lean_obj_res auth_tls_ctx_client(b_lean_obj_arg ca_file, lean_obj_ar
  * context that trusts nothing and a confusing verification failure on the
  * first request; asking the store how big it is turns that into a startup
  * error naming the problem. */
-LEAN_EXPORT lean_obj_res auth_tls_ctx_size(b_lean_obj_arg ctx_obj, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_ctx_size(b_lean_obj_arg ctx_obj, lean_obj_arg w) {
     (void)w;
     SSL_CTX *ctx = (SSL_CTX *)lean_get_external_data(ctx_obj);
     X509_STORE *store = SSL_CTX_get_cert_store(ctx);
@@ -130,7 +130,7 @@ LEAN_EXPORT lean_obj_res auth_tls_ctx_size(b_lean_obj_arg ctx_obj, lean_obj_arg 
  * memory.  In memory rather than on disk because a leaf certificate here is
  * minted per connection and would otherwise be a temporary file holding a
  * private key. */
-LEAN_EXPORT lean_obj_res auth_tls_ctx_server(b_lean_obj_arg cert_pem,
+LEAN_EXPORT lean_obj_res kleis_tls_ctx_server(b_lean_obj_arg cert_pem,
                                              b_lean_obj_arg key_pem,
                                              lean_obj_arg w) {
     (void)w;
@@ -181,14 +181,14 @@ LEAN_EXPORT lean_obj_res auth_tls_ctx_server(b_lean_obj_arg cert_pem,
 /* Sessions                                                             */
 /* ------------------------------------------------------------------ */
 
-LEAN_EXPORT lean_obj_res auth_tls_conn_new(b_lean_obj_arg ctx_obj,
+LEAN_EXPORT lean_obj_res kleis_tls_conn_new(b_lean_obj_arg ctx_obj,
                                            uint8_t is_server,
                                            b_lean_obj_arg hostname,
                                            lean_obj_arg w) {
     (void)w;
     ensure_classes();
     SSL_CTX *ctx = (SSL_CTX *)lean_get_external_data(ctx_obj);
-    auth_conn *c = (auth_conn *)calloc(1, sizeof(auth_conn));
+    kleis_conn *c = (kleis_conn *)calloc(1, sizeof(kleis_conn));
     if (!c) return io_error("out of memory");
     c->ssl = SSL_new(ctx);
     if (!c->ssl) { free(c); return io_error_ssl("could not create a TLS session"); }
@@ -217,10 +217,10 @@ LEAN_EXPORT lean_obj_res auth_tls_conn_new(b_lean_obj_arg ctx_obj,
 }
 
 /* Feed received ciphertext into the session. */
-LEAN_EXPORT lean_obj_res auth_tls_feed(b_lean_obj_arg conn_obj,
+LEAN_EXPORT lean_obj_res kleis_tls_feed(b_lean_obj_arg conn_obj,
                                        b_lean_obj_arg bytes, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     size_t len = lean_sarray_size(bytes);
     if (len) {
         const unsigned char *p = lean_sarray_cptr(bytes);
@@ -235,9 +235,9 @@ LEAN_EXPORT lean_obj_res auth_tls_feed(b_lean_obj_arg conn_obj,
 }
 
 /* Draw ciphertext the session wants sent. */
-LEAN_EXPORT lean_obj_res auth_tls_pull(b_lean_obj_arg conn_obj, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_pull(b_lean_obj_arg conn_obj, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     size_t pending = BIO_ctrl_pending(c->wbio);
     if (pending == 0) return lean_io_result_mk_ok(mk_bytes(NULL, 0));
     unsigned char *buf = (unsigned char *)malloc(pending);
@@ -250,9 +250,9 @@ LEAN_EXPORT lean_obj_res auth_tls_pull(b_lean_obj_arg conn_obj, lean_obj_arg w) 
 }
 
 /* Advance the handshake.  0 = complete, 1 = needs more input, 2 = failed. */
-LEAN_EXPORT lean_obj_res auth_tls_handshake(b_lean_obj_arg conn_obj, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_handshake(b_lean_obj_arg conn_obj, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     ERR_clear_error();
     int r = SSL_do_handshake(c->ssl);
     if (r == 1) return lean_io_result_mk_ok(lean_box(0));
@@ -275,10 +275,10 @@ LEAN_EXPORT lean_obj_res auth_tls_handshake(b_lean_obj_arg conn_obj, lean_obj_ar
 
 /* Encrypt plaintext.  Returns the number of bytes accepted; a short write
  * means the caller should pull ciphertext and try again. */
-LEAN_EXPORT lean_obj_res auth_tls_write(b_lean_obj_arg conn_obj,
+LEAN_EXPORT lean_obj_res kleis_tls_write(b_lean_obj_arg conn_obj,
                                         b_lean_obj_arg bytes, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     size_t len = lean_sarray_size(bytes);
     if (len == 0) return lean_io_result_mk_ok(lean_box_uint32(0));
     ERR_clear_error();
@@ -291,11 +291,11 @@ LEAN_EXPORT lean_obj_res auth_tls_write(b_lean_obj_arg conn_obj,
 }
 
 /* Decrypt whatever is available, up to `max` bytes.  An empty result means
- * nothing is ready; use auth_tls_eof to tell that from a closed session. */
-LEAN_EXPORT lean_obj_res auth_tls_read(b_lean_obj_arg conn_obj,
+ * nothing is ready; use kleis_tls_eof to tell that from a closed session. */
+LEAN_EXPORT lean_obj_res kleis_tls_read(b_lean_obj_arg conn_obj,
                                        uint32_t max, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     if (max == 0) return lean_io_result_mk_ok(mk_bytes(NULL, 0));
     unsigned char *buf = (unsigned char *)malloc(max);
     if (!buf) return io_error("out of memory");
@@ -315,33 +315,33 @@ LEAN_EXPORT lean_obj_res auth_tls_read(b_lean_obj_arg conn_obj,
 }
 
 /* Has the peer sent close_notify? */
-LEAN_EXPORT lean_obj_res auth_tls_eof(b_lean_obj_arg conn_obj, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_eof(b_lean_obj_arg conn_obj, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     int shutdown = SSL_get_shutdown(c->ssl);
     return lean_io_result_mk_ok(lean_box((shutdown & SSL_RECEIVED_SHUTDOWN) ? 1 : 0));
 }
 
 /* Begin an orderly close. */
-LEAN_EXPORT lean_obj_res auth_tls_close(b_lean_obj_arg conn_obj, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_close(b_lean_obj_arg conn_obj, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     ERR_clear_error();
     SSL_shutdown(c->ssl);
     return lean_io_result_mk_ok(lean_box(0));
 }
 
 /* The last handshake failure, for a log line. */
-LEAN_EXPORT lean_obj_res auth_tls_error(b_lean_obj_arg conn_obj, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_error(b_lean_obj_arg conn_obj, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     return lean_io_result_mk_ok(lean_mk_string(c->last_error));
 }
 
 /* The negotiated protocol version, for the audit record. */
-LEAN_EXPORT lean_obj_res auth_tls_version(b_lean_obj_arg conn_obj, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_tls_version(b_lean_obj_arg conn_obj, lean_obj_arg w) {
     (void)w;
-    auth_conn *c = (auth_conn *)lean_get_external_data(conn_obj);
+    kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     const char *v = SSL_get_version(c->ssl);
     return lean_io_result_mk_ok(lean_mk_string(v ? v : ""));
 }

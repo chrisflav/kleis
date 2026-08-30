@@ -19,7 +19,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 
-LEAN_EXPORT lean_obj_res auth_net_resolve(b_lean_obj_arg host, lean_obj_arg w) {
+LEAN_EXPORT lean_obj_res kleis_net_resolve(b_lean_obj_arg host, lean_obj_arg w) {
     (void)w;
     const char *name = lean_string_cstr(host);
 

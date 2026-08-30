@@ -8,6 +8,6 @@
    "inherited": false,
    "dir": "../lean-biscuit",
    "configFile": "lakefile.toml"}],
- "name": "auth",
+ "name": "kleis",
  "lakeDir": ".lake",
  "fixedToolchain": false}

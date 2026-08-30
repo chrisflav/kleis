@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End to end: a real `curl` and a real `git push` through a running daemon.
 #
-# Everything happens in a temporary AUTH_HOME, against a local origin, over
+# Everything happens in a temporary KLEIS_HOME, against a local origin, over
 # plain HTTP in rewrite mode -- so the test needs no certificate installed
 # anywhere and touches nothing of the invoking user's.
 set -uo pipefail
@@ -10,14 +10,14 @@ set -uo pipefail
 # failed step never created leaves the script running in the repository it was
 # launched from -- where the `git config` and `git commit` further down are
 # then applied to somebody's real work.  This happened.
-enter() { cd "$1" || { printf 'auth-test: cannot enter %s\n' "$1" >&2; exit 1; }; }
+enter() { cd "$1" || { printf 'kleis-test: cannot enter %s\n' "$1" >&2; exit 1; }; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
-export AUTH_HOME="$WORK/home"
-export AUTH_STORE_KEY="$(printf '%064d' 7)"
-AUTH="$ROOT/.lake/build/bin/auth"
-AUTHD="$ROOT/.lake/build/bin/authd"
+export KLEIS_HOME="$WORK/home"
+export KLEIS_STORE_KEY="$(printf '%064d' 7)"
+KLEIS="$ROOT/.lake/build/bin/kleis"
+KLEISD="$ROOT/.lake/build/bin/kleisd"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
@@ -25,7 +25,7 @@ bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '  
 check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
 
 cleanup() {
-  [ -n "${AUTHD_PID:-}" ] && kill "$AUTHD_PID" 2>/dev/null
+  [ -n "${KLEISD_PID:-}" ] && kill "$KLEISD_PID" 2>/dev/null
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
   [ -n "${TLS_ORIGIN_PID:-}" ] && kill "$TLS_ORIGIN_PID" 2>/dev/null
   rm -rf "$WORK"
@@ -35,9 +35,9 @@ trap cleanup EXIT
 free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
 
 ORIGIN_PORT="$(free_port)"
-AUTH_PORT="$(free_port)"
+KLEIS_PORT="$(free_port)"
 
-mkdir -p "$AUTH_HOME/config/services" "$AUTH_HOME/config/grants" "$WORK/repos"
+mkdir -p "$KLEIS_HOME/config/services" "$KLEIS_HOME/config/grants" "$WORK/repos"
 
 # ---------------------------------------------------------------- the origin
 git init --quiet --bare "$WORK/repos/demo.git"
@@ -50,12 +50,12 @@ for _ in $(seq 50); do
 done
 
 # ---------------------------------------------------------------- config
-cat > "$AUTH_HOME/config/config.toml" <<EOF
-listen = "127.0.0.1:$AUTH_PORT"
+cat > "$KLEIS_HOME/config/config.toml" <<EOF
+listen = "127.0.0.1:$KLEIS_PORT"
 mode = "rewrite"
 EOF
 
-cat > "$AUTH_HOME/config/services/demo.toml" <<'EOF'
+cat > "$KLEIS_HOME/config/services/demo.toml" <<'EOF'
 name  = "demo"
 hosts = ["127.0.0.1"]
 modes = ["rewrite"]
@@ -97,7 +97,7 @@ match = "GET|POST 127.0.0.1 /echo"
 emit  = ['operation("echo")']
 EOF
 
-cat > "$AUTH_HOME/config/grants/dev.toml" <<'EOF'
+cat > "$KLEIS_HOME/config/grants/dev.toml" <<'EOF'
 name         = "dev-only"
 service      = "demo"
 credential   = "demo/token"
@@ -113,7 +113,7 @@ allow if grant("dev-only");
 '''
 EOF
 
-cat > "$AUTH_HOME/config/grants/read.toml" <<'EOF'
+cat > "$KLEIS_HOME/config/grants/read.toml" <<'EOF'
 name         = "read-only"
 service      = "demo"
 credential   = "demo/token"
@@ -128,7 +128,7 @@ allow if grant("read-only");
 '''
 EOF
 
-cat > "$AUTH_HOME/config/grants/echo.toml" <<'EOF'
+cat > "$KLEIS_HOME/config/grants/echo.toml" <<'EOF'
 name         = "echo-only"
 service      = "demo"
 credential   = "demo/token"
@@ -141,27 +141,27 @@ allow if grant("echo-only");
 EOF
 
 echo "== configuration"
-printf 'upstream-secret-42' | "$AUTH" credential add demo/token --service demo --secret - >/dev/null
+printf 'upstream-secret-42' | "$KLEIS" credential add demo/token --service demo --secret - >/dev/null
 check $? "install a credential"
-"$AUTHD" --check >/dev/null 2>&1
+"$KLEISD" --check >/dev/null 2>&1
 check $? "the daemon loads its configuration"
 
-DEV_TOKEN="$("$AUTH" token issue --grant dev-only --bearer ci@test --ttl 1h)"
+DEV_TOKEN="$("$KLEIS" token issue --grant dev-only --bearer ci@test --ttl 1h)"
 check $? "issue a token for the push grant"
-ECHO_TOKEN="$("$AUTH" token issue --grant echo-only --bearer ci@test --ttl 1h)"
+ECHO_TOKEN="$("$KLEIS" token issue --grant echo-only --bearer ci@test --ttl 1h)"
 check $? "issue a token for the echo grant"
-READ_TOKEN="$("$AUTH" token issue --grant read-only --bearer ci@test --ttl 1h)"
+READ_TOKEN="$("$KLEIS" token issue --grant read-only --bearer ci@test --ttl 1h)"
 check $? "issue a token for the read-only grant"
 
 # ---------------------------------------------------------------- the daemon
-"$AUTHD" > "$WORK/authd.log" 2>&1 &
-AUTHD_PID=$!
+"$KLEISD" > "$WORK/kleisd.log" 2>&1 &
+KLEISD_PID=$!
 for _ in $(seq 50); do
-  curl -s -o /dev/null "http://127.0.0.1:$AUTH_PORT/" && break
+  curl -s -o /dev/null "http://127.0.0.1:$KLEIS_PORT/" && break
   sleep 0.1
 done
 
-BASE="http://127.0.0.1:$AUTH_PORT/http/127.0.0.1:$ORIGIN_PORT"
+BASE="http://127.0.0.1:$KLEIS_PORT/http/127.0.0.1:$ORIGIN_PORT"
 
 echo
 echo "== the credential"
@@ -220,7 +220,7 @@ if [ $? -ne 0 ]; then ok "push to main is refused"; else bad "push to main is re
 # request id and in the audit log, which is where an operator looks.
 grep -q '403' "$WORK/push-main.log"
 check $? "and git reports the refusal" "$(cat "$WORK/push-main.log")"
-grep -q 'refs/heads/dev/' "$AUTH_HOME/data/audit.log"
+grep -q 'refs/heads/dev/' "$KLEIS_HOME/data/audit.log"
 check $? "and the audit log records the failed check"
 
 # The mixed case: one good ref must not carry a bad one through.
@@ -264,8 +264,8 @@ git config --global http.extraHeader "Proxy-Authorization: Bearer $DEV_TOKEN"
 
 echo
 echo "== revocation"
-REV="$("$AUTH" token list | head -1 | cut -f1)"
-"$AUTH" token revoke "$REV" >/dev/null
+REV="$("$KLEIS" token list | head -1 | cut -f1)"
+"$KLEIS" token revoke "$REV" >/dev/null
 check $? "revoke a token"
 CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Proxy-Authorization: Bearer $DEV_TOKEN" "$BASE/echo")"
 [ "$CODE" = "403" ]; check $? "a revoked token is refused" "got $CODE"
@@ -276,7 +276,7 @@ echo "== interception: real https URLs through CONNECT"
 # verifies it the way it would verify a real one; git verifies the proxy's
 # minted leaf against the local CA.
 TLS_PORT="$(free_port)"
-TLS_AUTH_PORT="$(free_port)"
+TLS_KLEIS_PORT="$(free_port)"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
   -keyout "$WORK/origin.key" -out "$WORK/origin.crt" \
   -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
@@ -288,27 +288,27 @@ python3 "$ROOT/scripts/origin.py" "$TLS_PORT" "$WORK/repos" "$WORK/origin.crt" "
 TLS_ORIGIN_PID=$!
 sleep 1
 
-cat > "$AUTH_HOME/config/config.toml" <<EOF
-listen = "127.0.0.1:$TLS_AUTH_PORT"
+cat > "$KLEIS_HOME/config/config.toml" <<EOF
+listen = "127.0.0.1:$TLS_KLEIS_PORT"
 mode = "connect"
 upstream_ca_file = "$WORK/origin.crt"
 EOF
 
-kill "$AUTHD_PID" 2>/dev/null; wait "$AUTHD_PID" 2>/dev/null
-"$AUTHD" > "$WORK/authd-tls.log" 2>&1 &
-AUTHD_PID=$!
+kill "$KLEISD_PID" 2>/dev/null; wait "$KLEISD_PID" 2>/dev/null
+"$KLEISD" > "$WORK/kleisd-tls.log" 2>&1 &
+KLEISD_PID=$!
 for _ in $(seq 50); do
-  curl -s -o /dev/null "http://127.0.0.1:$TLS_AUTH_PORT/" && break
+  curl -s -o /dev/null "http://127.0.0.1:$TLS_KLEIS_PORT/" && break
   sleep 0.1
 done
 
-CA="$("$AUTH" ca)"
+CA="$("$KLEIS" ca)"
 check $? "the local CA is available"
-TLS_TOKEN="$("$AUTH" token issue --grant dev-only --bearer ci@tls --ttl 1h)"
-TLS_ECHO_TOKEN="$("$AUTH" token issue --grant echo-only --bearer ci@tls --ttl 1h)"
+TLS_TOKEN="$("$KLEIS" token issue --grant dev-only --bearer ci@tls --ttl 1h)"
+TLS_ECHO_TOKEN="$("$KLEIS" token issue --grant echo-only --bearer ci@tls --ttl 1h)"
 
 # curl, with real URLs, through the intercepting proxy.
-OUT="$(curl -s --proxy "http://auth:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_AUTH_PORT" \
+OUT="$(curl -s --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
   --proxy-basic --cacert "$CA" "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
 echo "$OUT" | grep -q '"authorization": "Bearer upstream-secret-42"'
 check $? "an intercepted https request carries the credential" "$OUT"
@@ -316,7 +316,7 @@ check $? "an intercepted https request carries the credential" "$OUT"
 # and a real git push, over https, with the URL git was given untouched.
 git config --global --unset-all "url.$BASE/.insteadOf" 2>/dev/null
 git config --global --unset-all http.extraHeader 2>/dev/null
-git config --global http.proxy "http://auth:$TLS_TOKEN@127.0.0.1:$TLS_AUTH_PORT"
+git config --global http.proxy "http://kleis:$TLS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT"
 git config --global http.proxyAuthMethod basic
 git config --global http.sslCAInfo "$CA"
 
@@ -337,11 +337,11 @@ enter "$ROOT"
 
 echo
 echo "== the audit log"
-"$AUTH" audit verify | grep -q 'chain intact'
-check $? "the audit chain is intact" "$("$AUTH" audit verify)"
-LINES="$(wc -l < "$AUTH_HOME/data/audit.log")"
+"$KLEIS" audit verify | grep -q 'chain intact'
+check $? "the audit chain is intact" "$("$KLEIS" audit verify)"
+LINES="$(wc -l < "$KLEIS_HOME/data/audit.log")"
 [ "$LINES" -ge 6 ]; check $? "every decision was recorded" "got $LINES lines"
-grep -q 'upstream-secret-42' "$AUTH_HOME/data/audit.log"
+grep -q 'upstream-secret-42' "$KLEIS_HOME/data/audit.log"
 if [ $? -eq 0 ]; then bad "the log never contains the secret"; else ok "the log never contains the secret"; fi
 
 echo
@@ -350,6 +350,6 @@ if [ "$FAIL" -eq 0 ]; then
   exit 0
 else
   echo "$PASS passed, $FAIL FAILED"
-  echo "--- authd log ---"; tail -30 "$WORK/authd.log"
+  echo "--- kleisd log ---"; tail -30 "$WORK/kleisd.log"
   exit 1
 fi

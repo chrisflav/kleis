@@ -1,4 +1,7 @@
-# auth
+# kleis
+
+*κλείς, the key; κλειδοῦχος, the one who holds it.*  In a Greek temple the
+kleidouchos held the key and opened the door for you; you never held the key.
 
 A credential proxy. Somebody installs an access token for an external service
 once; everybody else gets a *biscuit* that says, in datalog, what they may do
@@ -22,7 +25,7 @@ handful of things on the code side of it are.
   about any of this.
 
 ```
- bearer                    authd                        upstream
+ bearer                    kleisd                        upstream
    │                         │                             │
    │ git push (real URL,     │                             │
    │ proxy + biscuit)        │                             │
@@ -126,9 +129,9 @@ Emitted by the proxy for every request, with no manifest involvement:
 ```
 request_method("POST");
 request_host("github.com");
-request_path("/chrisflav/auth.git/git-receive-pack");
+request_path("/chrisflav/kleis.git/git-receive-pack");
 request_segment(0, "chrisflav");
-request_segment(1, "auth.git");
+request_segment(1, "kleis.git");
 request_segment(2, "git-receive-pack");
 request_header("content-type", "application/x-git-receive-pack-request");
 request_query("per_page", "10");
@@ -211,7 +214,7 @@ authority to do anything body-dependent.
 
 Datalog can filter but it cannot *compute a new term in a rule head*: externs
 evaluate inside expressions, and expressions only decide whether a rule fires.
-So `auth.git ↦ auth` cannot be a rule. Routes cover exactly that gap, and are
+So `kleis.git ↦ kleis` cannot be a rule. Routes cover exactly that gap, and are
 the only bespoke syntax in the system:
 
 ```toml
@@ -252,7 +255,7 @@ The biscuit rides on the *hop*, never on the request that goes upstream:
   credentials, `http.extraHeader`), `curl`, and anything honouring `HTTPS_PROXY`.
 - a per-session unix socket, bearer identified by peer uid — for a sandbox that
   should not be able to read its own token at all.
-- a per-bearer ephemeral listener port, for tools that cannot set proxy auth.
+- a per-bearer ephemeral listener port, for tools that cannot set proxy kleis.
 
 Whichever it is, `Proxy-Authorization` and any client-supplied `Authorization`
 are stripped before the request is forwarded.
@@ -424,7 +427,7 @@ The signature of the only function that reads a secret:
 def bind (r : AuthorizedRequest) (s : Secret) : Except BindError Model.Request
 ```
 
-`AuthorizedRequest` has one constructor, private to `Auth.Policy.Authorize` and
+`AuthorizedRequest` has one constructor, private to `Kleis.Policy.Authorize` and
 produced only on `allow`; `Secret` has a private field and lives in the same
 module as `bind`, because `private` in Lean is per-module and putting the
 elimination anywhere else would mean exposing the field. Forwarding a
@@ -448,7 +451,7 @@ ones: it depends on client config support, and `gh` needs `GH_HOST` gymnastics.
 
 `HTTPS_PROXY=http://127.0.0.1:8080`. On `CONNECT host:443` we mint a leaf
 certificate for the SNI name from a local CA, terminate TLS, and open a properly
-verified TLS connection upstream. `auth setup` installs the CA where the tools
+verified TLS connection upstream. `kleis setup` installs the CA where the tools
 look — `http.sslCAInfo`, `GIT_SSL_CAINFO`, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`
 — and only there, never in the system store.
 
@@ -457,7 +460,7 @@ Ed25519, secp256r1 and SHA-2, so what is missing is a DER writer and a small
 X.509 profile. That is a contained, testable piece of work and it keeps the
 certificate path inside the library that is already written to be verified.
 
-The *transport* is the part Lean does not have. Plan: a `Auth.Net.Stream`
+The *transport* is the part Lean does not have. Plan: a `Kleis.Net.Stream`
 interface with `read`/`write`/`close`, implemented by plain TCP and by a TLS
 backend behind a small C FFI shim over OpenSSL — the shape `orchestra` already
 uses for `UnixSocket.c` and `Signal.c`. Everything above `Stream` is testable
@@ -480,10 +483,10 @@ it runs.  A statically linked one from a package manager's store is exactly
 that case, and the symptom is every upstream connection failing certificate
 verification, which reads as a network problem rather than a configuration one.
 
-So `Auth.Net.resolveTrustStore` probes the usual distribution locations in
+So `Kleis.Net.resolveTrustStore` probes the usual distribution locations in
 Lean, `upstream_ca_file` overrides it, and the daemon asks the context how many
 certificates it actually loaded and refuses to start at zero.  `$SSL_CERT_FILE`
-is deliberately not consulted: `auth setup` exports it pointing at this proxy's
+is deliberately not consulted: `kleis setup` exports it pointing at this proxy's
 own CA, and a daemon started from such a shell would otherwise trust only
 itself.
 
@@ -495,7 +498,7 @@ grant with no body inspection. The manifest says which modes a service supports.
 
 ## 7. Service manifests
 
-One file per service, in `$AUTH_HOME/config/services`. The complete example is
+One file per service, in `$KLEIS_HOME/config/services`. The complete example is
 `examples/github.toml`; the shape is:
 
 ```toml
@@ -605,38 +608,38 @@ a proof for the formats that deserve one.
 ## 11. Module layout
 
 ```
-Auth/Util/{Bytes,Str,Json,Toml,Base64}   text, bytes, and the two config formats
-Auth/Crypto/{ChaCha20,Poly1305,Aead}     credential encryption at rest
-Auth/Http/{Message,Reader,Writer,Chunked}
-Auth/Model/Request                       the normalized request
-Auth/Wire/{Decoder,Json,Form,Git,Registry,Exec}
-Auth/Facts/{Primitive,Flatten,Route}
-Auth/Service/{Manifest,Registry}
-Auth/Policy/{Externs,Grant,Authorize}
-Auth/Credential/{Secret,Store,Provider}
-Auth/Token/{Issue,Revocation}
-Auth/Net/{Stream,Resolve,Socket,Tls,TlsStream,ClientHello,Client}
-Auth/Ca/{Der,X509,Mint}                  the local certificate authority
-Auth/{Dirs,Store,Config,Audit}
-Auth/Proxy/{Context,Body,Forward,Session,Listener}
-Auth/Cli                                 `auth`
+Kleis/Util/{Bytes,Str,Json,Toml,Base64}   text, bytes, and the two config formats
+Kleis/Crypto/{ChaCha20,Poly1305,Aead}     credential encryption at rest
+Kleis/Http/{Message,Reader,Writer,Chunked}
+Kleis/Model/Request                       the normalized request
+Kleis/Wire/{Decoder,Json,Form,Git,Registry,Exec}
+Kleis/Facts/{Primitive,Flatten,Route}
+Kleis/Service/{Manifest,Registry}
+Kleis/Policy/{Externs,Grant,Authorize}
+Kleis/Credential/{Secret,Store,Provider}
+Kleis/Token/{Issue,Revocation}
+Kleis/Net/{Stream,Resolve,Socket,Tls,TlsStream,ClientHello,Client}
+Kleis/Ca/{Der,X509,Mint}                  the local certificate authority
+Kleis/{Dirs,Store,Config,Audit}
+Kleis/Proxy/{Context,Body,Forward,Session,Listener}
+Kleis/Cli                                 `kleis`
 ffi/{Tls,Net}.c                          OpenSSL, and getaddrinfo
 ```
 
 About eight and a half thousand lines of Lean and three hundred of C, against
 one dependency: `lean-biscuit`.
 
-Everything from `Auth/Util` through `Auth/Policy` is pure and total — no `IO`,
+Everything from `Kleis/Util` through `Kleis/Policy` is pure and total — no `IO`,
 no `partial` — which is what §10.6 rests on. The `partial` definitions are all
-under `Auth/Net` and `Auth/Proxy`, where the loops genuinely do not terminate:
+under `Kleis/Net` and `Kleis/Proxy`, where the loops genuinely do not terminate:
 an accept loop has no measure that decreases.
 
 The binaries are split the way `orchestra` splits `orchestra` and `orchestrad`:
-`authd` holds the credentials and is the only process that ever decrypts one;
-`auth` is everything a person types, and can be run by anybody.
+`kleisd` holds the credentials and is the only process that ever decrypts one;
+`kleis` is everything a person types, and can be run by anybody.
 
 The C is the smallest surface that could work. `Tls.c` is a byte transform over
-two memory BIOs — it never sees a socket, so everything above `Auth.Net.Stream`
+two memory BIOs — it never sees a socket, so everything above `Kleis.Net.Stream`
 is testable over plain buffers, and a TLS implementation in Lean would drop in
 without a line changing elsewhere. `Net.c` is `getaddrinfo`, which Lean's
 networking does not have.
@@ -698,7 +701,7 @@ allowed_operation("discover") <-
   operation("discover"), discover_service("git-receive-pack");
 
 check if allowed_operation($x);
-check if repository("chrisflav", $r), ["auth", "lean-biscuit"].contains($r);
+check if repository("chrisflav", $r), ["kleis", "lean-biscuit"].contains($r);
 
 // `reject if`, not `check all`.  Both catch the mixed push -- one good ref must
 // not carry a bad one through -- but `check all` also requires at least one
@@ -717,7 +720,7 @@ classic hole in this kind of gateway. The first attempt at this file used
 `check all` for it, which is correct about the mixed push and refuses the ref
 advertisement — so the push failed before it began. That is why §4.3 exists.
 
-**Token**, issued by `auth token issue --grant ci-dev --ttl 8h`, authority block:
+**Token**, issued by `kleis token issue --grant ci-dev --ttl 8h`, authority block:
 
 ```
 grant("ci-dev");
@@ -728,7 +731,7 @@ check if time($t), $t < 2026-08-29T05:00:00Z;
 **Attenuation**, by the bearer, offline, with no server involved:
 
 ```
-$ auth token attenuate --check 'check if repository("chrisflav", "auth")'
+$ kleis token attenuate --check 'check if repository("chrisflav", "kleis")'
 ```
 
 **Request.** `git push origin dev/feature`. Git asks for the ref advertisement
@@ -736,7 +739,7 @@ first, which `allowed_operation("discover")` covers. Then it POSTs the pack.
 The proxy emits `request_method("POST")`, `request_host("github.com")`, the
 segments, and — from the first 178 bytes of a request whose packfile follows
 them — `body(["updates", 0, "ref"], "refs/heads/dev/feature")`. The route emits
-`operation("push")` and `repository("chrisflav", "auth")`. Every check passes,
+`operation("push")` and `repository("chrisflav", "kleis")`. Every check passes,
 `allow if grant("ci-dev")` matches, the credential is attached, and the packfile
 streams through without ever being buffered.
 
@@ -744,7 +747,7 @@ streams through without ever being buffered.
 fires, and the bearer gets `403` — the packfile is never relayed. When the
 refusal lands on the ref advertisement, git prints the quoted check as a
 `remote:` message; when it lands on the POST, git prints only the status, and
-the reason is in the response's `X-Auth-Request-Id` and in the audit log.
+the reason is in the response's `X-Kleis-Request-Id` and in the audit log.
 
 All of the above is what `scripts/integration.sh` actually runs, against a real
 `git` and a real daemon, in both interception modes.
@@ -766,7 +769,7 @@ M1 through M4 of the original plan are implemented and exercised by
 | `Secret`, host confinement, injection (§5) | done |
 | Providers: `static`, `exec`, `oauth2`, `github-app` | done |
 | Token issue / attenuate / inspect / revoke (§9) | done |
-| Hash-chained audit log with `auth audit verify` (§9.3) | done |
+| Hash-chained audit log with `kleis audit verify` (§9.3) | done |
 | Streaming request and response relay (§8) | done |
 | Response facts and transforms (§8) | **not implemented**; `response_gated` is parsed and the seam is in place |
 | Connection reuse | not implemented: one request per upstream connection |
@@ -787,8 +790,8 @@ read back by OpenSSL, which is what verifies the hand-written DER.
    load error, and the tests exercise a parent token, an attenuation of it, and
    a request each way — but the general statement is not formalised.
 5. **Extraction is faithful** is tested per decoder, not proved.
-6. **Determinism** holds by construction: everything from `Auth.Model` through
-   `Auth.Policy` is pure and total, with no `IO` and no `partial`. The `partial`
+6. **Determinism** holds by construction: everything from `Kleis.Model` through
+   `Kleis.Policy` is pure and total, with no `IO` and no `partial`. The `partial`
    definitions are all in the daemon layer, where the loops genuinely do not
    terminate.
 
