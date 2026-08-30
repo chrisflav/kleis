@@ -75,14 +75,14 @@ private def render (template : String) (s : Secret) : String :=
 inductive BindError where
   /-- The credential is not bound to the request's host. -/
   | hostNotBound (host : String)
-  /-- The manifest says where the credential goes but not how. -/
+  /-- The manifest declares no injection that applies to this host. -/
   | noInjection
   deriving Repr
 
 /-- Describe a binding failure. -/
 def BindError.toString : BindError → String
   | .hostNotBound h => s!"the credential is not bound to `{h}`"
-  | .noInjection => "the manifest declares no injection for this credential"
+  | .noInjection => "the manifest declares no injection for this credential on this host"
 
 /-- Attach a credential to an authorized request.
 
@@ -95,11 +95,12 @@ def bind (r : AuthorizedRequest) (s : Secret) : Except BindError Model.Request :
   let m := r.manifest
   let req := r.request
   if !m.mayCredentialReach req.host then throw (.hostNotBound req.host)
-  if m.credential.inject.isEmpty then throw .noInjection
+  let applicable := m.credential.inject.filter (·.appliesTo req.host)
+  if applicable.isEmpty then throw .noInjection
   let headers := Http.Headers.removeAll req.headers
     (m.credential.strip ++ ["authorization", "proxy-authorization"])
   let mut out := { req with headers }
-  for inj in m.credential.inject do
+  for inj in applicable do
     let value := render inj.template s
     match inj.kind with
     | .header => out := { out with headers := Http.Headers.set out.headers inj.name value }

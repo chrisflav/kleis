@@ -108,6 +108,24 @@ LEAN_EXPORT lean_obj_res auth_tls_ctx_client(b_lean_obj_arg ca_file, lean_obj_ar
     return lean_io_result_mk_ok(lean_alloc_external(g_ctx_class, ctx));
 }
 
+/* How many certificates a context actually trusts.
+ *
+ * `SSL_CTX_set_default_verify_paths` succeeds even when the directory it was
+ * compiled to look in does not exist, which happens whenever the OpenSSL that
+ * got linked was built somewhere other than where it runs.  The result is a
+ * context that trusts nothing and a confusing verification failure on the
+ * first request; asking the store how big it is turns that into a startup
+ * error naming the problem. */
+LEAN_EXPORT lean_obj_res auth_tls_ctx_size(b_lean_obj_arg ctx_obj, lean_obj_arg w) {
+    (void)w;
+    SSL_CTX *ctx = (SSL_CTX *)lean_get_external_data(ctx_obj);
+    X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+    if (!store) return lean_io_result_mk_ok(lean_box(0));
+    STACK_OF(X509_OBJECT) *objs = X509_STORE_get0_objects(store);
+    int n = objs ? sk_X509_OBJECT_num(objs) : 0;
+    return lean_io_result_mk_ok(lean_box(n < 0 ? 0 : (unsigned)n));
+}
+
 /* A server context from a PEM certificate chain and private key held in
  * memory.  In memory rather than on disk because a leaf certificate here is
  * minted per connection and would otherwise be a temporary file holding a

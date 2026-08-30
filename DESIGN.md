@@ -390,16 +390,29 @@ the fine-grained control, the minted scope is the coarse one.
 
 ```toml
 [credential]
-provider = "github-app"
+provider = "static"
 hosts    = ["github.com", "api.github.com", "codeload.github.com"]
+strip    = ["cookie"]
+
+# The scheme can depend on the host, and for GitHub it does: the git endpoints
+# want HTTP basic authentication with the token as the password, the REST API
+# wants `Authorization: Bearer`.  An injection with no `hosts` applies to all
+# of them.
+[[credential.inject]]
+hosts    = ["github.com", "codeload.github.com"]
+kind     = "basic"
+template = "x-access-token:{{secret}}"
 
 [[credential.inject]]
+hosts    = ["api.github.com"]
 kind     = "header"
 name     = "Authorization"
 template = "Bearer {{secret}}"
-
-strip = ["authorization", "proxy-authorization", "cookie"]
 ```
+
+Sending the wrong one is not a subtle failure but it is an opaque one: GitHub
+answers `invalid credentials` to a `Bearer` on a git endpoint, which reads like
+a bad token.
 
 `hosts` is a hard binding, checked again after every redirect. A redirect to a
 host outside the list is followed, if at all, *without* the credential. This is
@@ -456,7 +469,25 @@ in Lean is a fine future project and this interface is what would make it a drop
 Netfilter redirect plus SNI, for sandboxes that must not be able to opt out.
 Same code path as 6.2 minus the `CONNECT`.
 
-### 6.4 Modes that cannot work
+### 6.4 Verifying the origin
+
+The proxy's own TLS client verifies every origin, and where its trust store
+comes from is not something to leave to the library.
+`SSL_CTX_set_default_verify_paths` looks in the directory OpenSSL was compiled
+with, and reports success whether or not that directory exists — which it does
+not whenever the OpenSSL that got linked was built somewhere other than where
+it runs.  A statically linked one from a package manager's store is exactly
+that case, and the symptom is every upstream connection failing certificate
+verification, which reads as a network problem rather than a configuration one.
+
+So `Auth.Net.resolveTrustStore` probes the usual distribution locations in
+Lean, `upstream_ca_file` overrides it, and the daemon asks the context how many
+certificates it actually loaded and refuses to start at zero.  `$SSL_CERT_FILE`
+is deliberately not consulted: `auth setup` exports it pointing at this proxy's
+own CA, and a daemon started from such a shell would otherwise trust only
+itself.
+
+### 6.5 Modes that cannot work
 
 A client that pins certificates cannot be intercepted, and pretending otherwise
 would be a footgun. Such a client gets mode 6.1 or a coarse, connection-level

@@ -94,6 +94,39 @@ def securityTests : IO Unit := do
   | .error _ => check "a credential cannot be bound outside the manifest's hosts" true
   | .ok _ => check "a credential cannot be bound outside the manifest's hosts" false
 
+  group "injection can differ per host"
+  -- Only the real service tells you this: GitHub's git endpoints want HTTP
+  -- basic authentication and its REST API wants `Authorization: Bearer`, so
+  -- one injection for the whole service sends the wrong scheme to one of them
+  -- and gets `invalid credentials` back, which says nothing about why.
+  let twoSchemes := "name = \"gh\"\nhosts = [\"github.com\", \"api.github.com\"]\n\n\
+    [credential]\nprovider = \"static\"\n\n\
+    [[credential.inject]]\nhosts = [\"github.com\"]\nkind = \"basic\"\n\
+    template = \"x-access-token:{{secret}}\"\n\n\
+    [[credential.inject]]\nhosts = [\"api.github.com\"]\nkind = \"header\"\n\
+    name = \"Authorization\"\ntemplate = \"Bearer {{secret}}\"\n"
+  match Service.Manifest.ofToml twoSchemes with
+  | .error e => check "a manifest with per-host injection loads" false e
+  | .ok m => do
+    check "a manifest with per-host injection loads" true
+    checkEq "two injections" m.credential.inject.length 2
+    let gitOnly := m.credential.inject.filter (·.appliesTo "github.com")
+    let apiOnly := m.credential.inject.filter (·.appliesTo "api.github.com")
+    checkEq "one applies to the git host" gitOnly.length 1
+    checkEq "one applies to the API host" apiOnly.length 1
+    check "and they are not the same one"
+      ((gitOnly.head!).kind != (apiOnly.head!).kind)
+    -- An injection with no hosts applies everywhere, which is the common case.
+    match Service.Manifest.ofToml
+        ("name = \"x\"\nhosts = [\"a.com\", \"b.com\"]\n\n[credential]\n\n\
+          [[credential.inject]]\nkind = \"header\"\nname = \"X\"\ntemplate = \"t\"\n") with
+    | .error e => check "an unrestricted injection loads" false e
+    | .ok m2 => do
+      check "an unrestricted injection loads" true
+      check "and applies to every host"
+        ((m2.credential.inject.head!).appliesTo "a.com" &&
+         (m2.credential.inject.head!).appliesTo "b.com")
+
   group "a secret does not leak into anything printable"
   checkEq "the fingerprint is not the secret"
     (secret.fingerprint == "s3cret-token") false

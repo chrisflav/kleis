@@ -106,6 +106,11 @@ eval "$(auth setup --mode connect --token "$TOKEN")"
 A client that pins certificates cannot be intercepted, and is not pretended
 otherwise: it gets rewrite mode or a host-level grant.
 
+The daemon verifies every origin, and checks at startup that its trust store
+actually loaded rather than finding out on the first request. If your OpenSSL
+was built somewhere other than where it runs, set `upstream_ca_file` in
+`config.toml` to your system bundle.
+
 ## Commands
 
 ```

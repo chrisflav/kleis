@@ -42,12 +42,26 @@ def Context.create (config : Config) : IO Context := do
   let registry ← Service.Registry.load
   let root ← Token.rootPublicKey
   let caRoot ← Ca.loadOrCreateRoot
+  -- The store is resolved and then checked, rather than trusted to have
+  -- loaded: a context that trusts nothing fails on the first request with a
+  -- message about certificates rather than about configuration.
+  let trustStore ← Net.resolveTrustStore config.upstreamCaFile
+  let clientCtx ← Net.Tls.mkClientContext trustStore
+  let trusted ← Net.Tls.contextSize clientCtx
+  if trusted == 0 then
+    throw (IO.userError <|
+      (if trustStore.isEmpty then
+         "no system trust store was found, and the linked OpenSSL's own default is empty"
+       else s!"the trust store `{trustStore}` contains no certificates")
+      ++ "\n  origins could not be verified, so nothing would be proxied."
+      ++ "\n  set `upstream_ca_file` in config.toml to your system CA bundle,"
+      ++ "\n  such as /etc/ssl/certs/ca-certificates.crt")
   return {
     config
     registry := ← IO.mkRef registry
     rootPublic := root
     ca := ← Ca.Cache.create caRoot
-    clientCtx := ← Net.Tls.mkClientContext config.upstreamCaFile
+    clientCtx
     credentials := ← Credential.Cache.create
     revocations := ← IO.mkRef (← Token.loadRevocations)
     counter := ← IO.mkRef 0 }

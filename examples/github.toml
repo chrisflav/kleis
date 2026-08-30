@@ -46,7 +46,17 @@ provider = "static"
 hosts    = ["github.com", "api.github.com", "codeload.github.com"]
 strip    = ["cookie"]
 
+# GitHub wants two different schemes, and which one depends on the host.  The
+# git endpoints speak HTTP basic authentication with the token as the password;
+# the REST API wants `Authorization: Bearer`.  Sending `Bearer` to the git
+# endpoints gets `invalid credentials`, which says nothing about why.
 [[credential.inject]]
+hosts    = ["github.com", "codeload.github.com"]
+kind     = "basic"
+template = "x-access-token:{{secret}}"
+
+[[credential.inject]]
+hosts    = ["api.github.com"]
 kind     = "header"
 name     = "Authorization"
 template = "Bearer {{secret}}"

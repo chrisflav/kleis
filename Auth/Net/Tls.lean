@@ -46,6 +46,17 @@ temporary file holding a private key. -/
 @[extern "auth_tls_ctx_server"]
 opaque mkServerContext (certPem keyPem : @& String) : IO Context
 
+/-- How many certificates a context trusts.
+
+`SSL_CTX_set_default_verify_paths` reports success even when the directory it
+was compiled to look in does not exist — which is what happens whenever the
+OpenSSL that got linked was built somewhere other than where it runs, as a
+statically linked one from a package manager's store generally is.  The context
+then trusts nothing, and the symptom is a certificate verification failure on
+the first upstream request rather than anything about trust stores. -/
+@[extern "auth_tls_ctx_size"]
+opaque contextSize (ctx : @& Context) : IO Nat
+
 /-- A new session.  `hostname` is the SNI to send and the name to verify for a
 client, and is ignored for a server. -/
 @[extern "auth_tls_conn_new"]

@@ -14,6 +14,41 @@ first one is unreachable, is behaviour worth being able to read.
 namespace Auth
 namespace Net
 
+/-! ## The trust store
+
+Where the certificates for verifying an origin come from.
+
+`SSL_CTX_set_default_verify_paths` looks in the directory OpenSSL was compiled
+with, which is only the right place when the library was built where it runs.
+A statically linked OpenSSL from a package manager's store carries that store's
+path, which does not exist on the machine — and the call still reports success,
+so the failure surfaces as an unverifiable certificate on the first request.
+
+So the location is probed here instead, in Lean, where the list can be read.
+`$SSL_CERT_FILE` is deliberately *not* consulted: `auth setup` exports it
+pointing at this proxy's own CA, and a daemon started from such a shell would
+then trust only itself. -/
+
+/-- Where distributions keep the system bundle, in the order they are tried. -/
+def trustStoreCandidates : List String :=
+  [ "/etc/ssl/certs/ca-certificates.crt",     -- Debian, Ubuntu, Arch, Alpine
+    "/etc/pki/tls/certs/ca-bundle.crt",       -- Fedora, RHEL
+    "/etc/ssl/ca-bundle.pem",                 -- openSUSE
+    "/etc/ssl/cert.pem",                      -- macOS ports, some BSDs
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem" ]
+
+/-- The trust store to verify origins against.
+
+An explicit setting wins.  Otherwise the first candidate that exists is used,
+and failing that the empty string, which leaves OpenSSL to its compiled-in
+defaults — right when the library was built where it runs, and checked for
+emptiness at startup either way. -/
+def resolveTrustStore (configured : String) : IO String := do
+  if !configured.isEmpty then return configured
+  for candidate in trustStoreCandidates do
+    if ← System.FilePath.pathExists candidate then return candidate
+  return ""
+
 /-- Every address a name resolves to, in the order the resolver returned them
 — which on a dual-stack host is already sorted by RFC 6724. -/
 @[extern "auth_net_resolve"]

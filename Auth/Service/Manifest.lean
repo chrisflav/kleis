@@ -35,7 +35,12 @@ inductive InjectKind where
   | basic
   deriving Repr, DecidableEq, Inhabited
 
-/-- One place a credential is written into a request. -/
+/-- One place a credential is written into a request.
+
+A service can need more than one, and can need *different* ones per host: a
+GitHub token is `Authorization: Bearer` to the REST API and HTTP basic
+authentication to the git endpoints, which is the sort of thing only the real
+service tells you.  `hosts` is empty for an injection that applies everywhere. -/
 structure Injection where
   /-- Which kind of injection. -/
   kind : InjectKind
@@ -43,7 +48,13 @@ structure Injection where
   name : String
   /-- The value, with `{{secret}}` where the secret goes. -/
   template : String
+  /-- The hosts this applies to; empty means all of the credential's. -/
+  hosts : List String := []
   deriving Repr, Inhabited
+
+/-- Does this injection apply to a request for this host? -/
+def Injection.appliesTo (i : Injection) (host : String) : Bool :=
+  i.hosts.isEmpty || i.hosts.any fun h => Facts.hostMatches h host
 
 /-- How this service's credential is obtained and attached. -/
 structure CredentialSpec where
@@ -96,6 +107,10 @@ structure Manifest where
   version : String
   deriving Inhabited
 
+/-- Read the string elements of an array field. -/
+private def strings (j : Json) (k : String) : List String :=
+  (j.arr? k).filterMap Json.asString?
+
 /-- Read an injection from a table. -/
 private def injectionOf (j : Json) : Except String Injection := do
   let kind ← match j.str? "kind" with
@@ -110,11 +125,8 @@ private def injectionOf (j : Json) : Except String Injection := do
   let template ← match j.str? "template" with
     | some t => pure t
     | none => throw "an injection needs a `template`"
-  pure { kind, name := Str.toLowerAscii name, template }
-
-/-- Read the string elements of an array field. -/
-private def strings (j : Json) (k : String) : List String :=
-  (j.arr? k).filterMap Json.asString?
+  pure { kind, name := Str.toLowerAscii name, template
+         hosts := (strings j "hosts").map Str.toLowerAscii }
 
 /-- Read a route from a table. -/
 private def routeOf (j : Json) : Except String Facts.Route := do
