@@ -40,8 +40,16 @@ structure Grant where
   name : String
   /-- The service whose manifest interprets the request. -/
   service : String
-  /-- The credential this grant spends. -/
-  credential : String
+  /-- The credential this grant spends, or `none` for a grant that forwards
+  without one.
+
+  An anonymous grant is for requests the upstream would serve to anybody — a
+  public clone, a release download — which should not be made on somebody's
+  credential merely because a manifest claims the host.  It has to be asked for
+  (`anonymous = true`): a grant whose `credential` was simply left out is a
+  mistake, and reading it as anonymous would turn a typo into requests that go
+  out unauthenticated without anybody having decided they should. -/
+  credential : Option String
   /-- The longest a token naming this grant may live, in seconds. -/
   maxLifetime : Nat
   /-- Facts the grant asserts. -/
@@ -71,9 +79,11 @@ def Grant.ofToml (source : String) : Except String Grant := do
   let service ← match j.str? "service" with
     | some s => pure s
     | none => throw "a grant needs a `service`"
-  let credential ← match j.str? "credential" with
-    | some c => pure c
-    | none => throw "a grant needs a `credential`"
+  let credential ← match j.str? "credential", (j.bool? "anonymous").getD false with
+    | some c, false => pure (some c)
+    | none, true => pure none
+    | some _, true => throw "a grant is either `anonymous` or names a `credential`, not both"
+    | none, false => throw "a grant needs a `credential`, or `anonymous = true`"
   let maxLifetime ← match j.str? "max_lifetime" with
     | none => pure 86400
     | some d => match parseDuration? d with
@@ -95,6 +105,9 @@ def Grant.ofToml (source : String) : Except String Grant := do
     version := Bytes.toHex (Sha256.hash (Bytes.ofString source))
     source
   }
+
+/-- The credential, as a person reads it in a listing. -/
+def Grant.credentialLabel (g : Grant) : String := g.credential.getD "(anonymous)"
 
 end Policy
 end Kleis

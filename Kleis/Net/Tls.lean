@@ -99,6 +99,12 @@ opaque lastError (s : @& Session) : IO String
 @[extern "kleis_tls_version"]
 opaque version (s : @& Session) : IO String
 
+/-- Sign a message with RS256 under a PEM private key: what a GitHub App signs
+the token it exchanges for an installation token with.  The key is parsed and
+freed within the call. -/
+@[extern "kleis_sign_rs256"]
+opaque signRs256 (keyPem : @& ByteArray) (message : @& ByteArray) : IO ByteArray
+
 /-- How a handshake step ended. -/
 inductive Progress where
   /-- The handshake is complete. -/

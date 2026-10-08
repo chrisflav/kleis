@@ -58,6 +58,19 @@ def listIssued : IO (Array IssuedRecord) := do
           out := out.push r
   return out
 
+/-- Find an issued record by one of its revocation identifiers, exactly.
+
+The record is filed under its first identifier, which is the one an issuer is
+handed back first, so that one is a single file read rather than a scan of
+every token ever issued; any other identifier falls back to the scan. -/
+def findIssuedExactly? (id : String) : IO (Option IssuedRecord) := do
+  if !id.isEmpty && id.all Char.isHexDigit then
+    if let some text ← Store.read? ((← Dirs.issued) / s!"{id}.json") then
+      if let .ok j := Json.parse text then
+        if let .ok r := IssuedRecord.ofJson j then
+          if r.revocationIds.contains id then return some r
+  return (← listIssued).find? (·.revocationIds.contains id)
+
 /-- Find an issued record by any of its revocation identifiers, or by a prefix
 of one — so that a person can revoke by the short form the CLI prints. -/
 def findIssued? (records : Array IssuedRecord) (needle : String) :

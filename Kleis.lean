@@ -15,6 +15,7 @@ import Kleis.Wire.Decoder
 import Kleis.Wire.Json
 import Kleis.Wire.Form
 import Kleis.Wire.Git
+import Kleis.Wire.GraphQL
 import Kleis.Wire.Registry
 import Kleis.Wire.Exec
 import Kleis.Facts.Primitive
@@ -25,11 +26,13 @@ import Kleis.Service.Registry
 import Kleis.Policy.Externs
 import Kleis.Policy.Grant
 import Kleis.Policy.Authorize
+import Kleis.Policy.Select
 import Kleis.Credential.Secret
 import Kleis.Credential.Store
 import Kleis.Credential.Provider
 import Kleis.Token.Issue
 import Kleis.Token.Revocation
+import Kleis.Token.Mint
 import Kleis.Net.Stream
 import Kleis.Net.Resolve
 import Kleis.Net.Socket
@@ -47,5 +50,6 @@ import Kleis.Audit
 import Kleis.Proxy.Context
 import Kleis.Proxy.Body
 import Kleis.Proxy.Forward
+import Kleis.Proxy.Admin
 import Kleis.Proxy.Session
 import Kleis.Proxy.Listener

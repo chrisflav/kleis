@@ -54,6 +54,10 @@ def parseArgs (argv : List String) : Args :=
 def Args.opt? (a : Args) (name : String) : Option String :=
   (a.options.find? fun (k, _) => k == name).map (·.2)
 
+/-- Every value given for an option that may be repeated, in order. -/
+def Args.opts (a : Args) (name : String) : List String :=
+  a.options.filterMap fun (k, v) => if k == name then some v else none
+
 /-- The value of an option, or a default. -/
 def Args.optD (a : Args) (name value : String) : String := (a.opt? name).getD value
 
@@ -197,7 +201,7 @@ def cmdGrant (args : Args) : IO Unit := do
     say g.source
   | _ =>
     for g in registry.grants do
-      say s!"{g.name}\t{g.service}\t{g.credential}\tmax {g.maxLifetime}s"
+      say s!"{g.name}\t{g.service}\t{g.credentialLabel}\tmax {g.maxLifetime}s"
 
 /-- `kleis credential add|list|remove` -/
 def cmdCredential (args : Args) : IO Unit := do
@@ -232,26 +236,21 @@ def cmdToken (args : Args) : IO Unit := do
   match args.at? 1 with
   | some "issue" =>
     let registry ← Service.Registry.load
-    let grantName ← match args.opt? "grant" with
-      | some g => pure g
-      | none => die "issuing a token needs --grant"
-    let some grant := registry.grant? grantName | die s!"no such grant `{grantName}`"
+    -- `--grant a --grant b` and `--grant a,b` both name two, tried in that order.
+    let grants := (args.opts "grant").flatMap fun g =>
+      (g.splitOn ",").map Str.trim |>.filter (!·.isEmpty)
+    if grants.isEmpty then die "issuing a token needs --grant"
     let bearer := args.optD "bearer" "unnamed"
     let ttl ← match Policy.parseDuration? (args.optD "ttl" "8h") with
       | some t => pure t
       | none => die "--ttl is a duration such as `8h`"
-    if ttl > grant.maxLifetime then
-      die s!"the grant `{grantName}` allows at most {grant.maxLifetime}s"
-    let root ← Token.loadOrCreateRootKey
-    let ephemeral ← match PrivateKey.ofBytes .ed25519 (← Store.randomBytes 32) with
-      | .ok k => pure k
-      | .error e => die e.toString
-    let now ← Store.now
-    match Token.issue root { grant := grantName, bearer, lifetime := ttl } now ephemeral with
+    let facts ← (args.opts "fact").mapM fun src =>
+      match Token.factOfSource src with
+      | .ok f => pure f
+      | .error e => die e
+    match ← Token.mint registry { grants, bearer, ttl, facts } with
     | .error e => die e
-    | .ok (token, record) => do
-      Token.recordIssued record
-      say (Token.print token)
+    | .ok (token, _) => say (Token.print token)
   | some "attenuate" =>
     let text ← readValue (args.opt? "token")
     let root ← Token.rootPublicKey
@@ -273,7 +272,8 @@ def cmdToken (args : Args) : IO Unit := do
     match Token.parse text root with
     | .error e => die e
     | .ok token => do
-      say s!"grant   {(Token.grantOf? token).getD "-"}"
+      say s!"grants  {(", ".intercalate (Token.grantsOf token))}"
+      if let some i := Token.issuerOf? token then say s!"issuer  {i}"
       say s!"bearer  {(Token.bearerOf? token).getD "-"}"
       say s!"blocks  {Biscuit.blockCount token}"
       say s!"sealed  {Biscuit.isSealed token}"
@@ -294,7 +294,7 @@ def cmdToken (args : Args) : IO Unit := do
     match Token.findIssued? issued needle with
     | some r => do
       Token.revoke r.revocationIds
-      say s!"revoked the token issued to `{r.bearer}` under `{r.grant}`"
+      say s!"revoked the token issued to `{r.bearer}` under `{r.grantLabel}`"
       say "every attenuation derived from it is revoked with it"
     | none => do
       Token.revoke [needle]
@@ -303,7 +303,32 @@ def cmdToken (args : Args) : IO Unit := do
     let now ← Store.now
     for r in ← Token.listIssued do
       let state := if r.expires < now then "expired" else "live"
-      say s!"{(r.revocationIds.headD "")}\t{r.grant}\t{r.bearer}\t{state}"
+      say s!"{(r.revocationIds.headD "")}\t{r.grantLabel}\t{r.bearer}\t{(r.issuedBy.getD "-")}\t{state}"
+
+/-- `kleis issuer list|token <name>` — the programs that may ask the daemon for
+tokens, and the credential one of them presents when it does.
+
+An issuer is configured in `config.toml`; this only mints its credential, a
+biscuit carrying `issuer(name)` and no grant.  It spends nothing by itself, and
+it is revoked like any other token. -/
+def cmdIssuer (args : Args) : IO Unit := do
+  let config ← loadConfig
+  match args.at? 1 with
+  | some "token" =>
+    let some name := args.at? 2 | die "usage: kleis issuer token <name> [--ttl 90d]"
+    if (config.issuer? name).isNone then
+      die s!"no issuer `{name}` is configured in config.toml"
+    let ttl ← match Policy.parseDuration? (args.optD "ttl" "90d") with
+      | some t => pure t
+      | none => die "--ttl is a duration such as `90d`"
+    let registry ← Service.Registry.load
+    match ← Token.mint registry { grants := [], bearer := s!"issuer:{name}", ttl
+                                  issuer := some name } with
+    | .error e => die e
+    | .ok (token, _) => say (Token.print token)
+  | _ =>
+    for i in config.issuers do
+      say s!"{i.name}\tgrants {", ".intercalate i.grants}\tfacts {", ".intercalate i.facts}\tmax {i.maxTtl}s"
 
 /-- `kleis audit verify|tail` -/
 def cmdAudit (args : Args) : IO Unit := do
@@ -365,26 +390,27 @@ def cmdCheck (args : Args) : IO Unit := do
     | .error e => die e
   let some manifest := registry.forHost? bare.host
     | die s!"no service manifest claims `{bare.host}`"
-  let some grantName := Token.grantOf? token | die "the token names no grant"
-  let some grant := registry.grant? grantName | die s!"no such grant `{grantName}`"
+  let grants ← match Policy.candidates registry token manifest bare.host with
+    | .ok gs => pure gs
+    | .error r => die r.toString
   let decoder := manifest.decoderFor contentType
   let decoded ← Wire.runDecoder decoder body true
   let revocations ← Token.loadRevocations
   let now ← Store.now
-  let outcome := Policy.run {
+  let choice := Policy.choose grants fun grant => {
     request := bare
     body := Policy.Body.classify decoder.configured (body.size != 0) decoded
     manifest, grant, token, revoked := revocations.ids, now
     clientIp := args.optD "client-ip" "127.0.0.1", requestId := "check" }
+  let outcome := choice.outcome
   if args.flag "facts" then
     say "// facts"
     for f in outcome.facts do say f
     say ""
   match outcome.decision with
-  | .allow i => say s!"ALLOW (policy {i})"
-  | .deny reason checks => do
-    say s!"DENY {reason}"
-    for c in checks do say s!"  failed: {c}"
+  | .allow i => say s!"ALLOW (grant {choice.grant.name}, policy {i})"
+  | .deny _ _ => do
+    say s!"DENY {choice.reason}"
     IO.Process.exit 1
 
 /-- Usage text. -/
@@ -404,10 +430,13 @@ usage:
                              [--config <json|@file>] [--secret <value|@file|->]
   kleis credential list | remove <name>
 
-  kleis token issue --grant <g> [--bearer <b>] [--ttl 8h]
+  kleis token issue --grant <g>[,<g>…] [--bearer <b>] [--ttl 8h]
+                    [--fact '<datalog fact>']…
   kleis token attenuate --check '<datalog>' [--token <t|@file|->]
   kleis token inspect [--token <t|@file|->]
   kleis token list | revoke <revocation-id>
+
+  kleis issuer list | token <name> [--ttl 90d]
 
   kleis audit tail [--n 20] | verify
 
@@ -431,6 +460,7 @@ def main (argv : List String) : IO UInt32 := do
       | "grant" => cmdGrant args
       | "credential" => cmdCredential args
       | "token" => cmdToken args
+      | "issuer" => cmdIssuer args
       | "audit" => cmdAudit args
       | "check" => cmdCheck args
       | "help" | "--help" => say usage

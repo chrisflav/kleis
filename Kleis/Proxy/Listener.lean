@@ -44,6 +44,7 @@ partial def acceptLoop (ctx : Context) (server : Std.Internal.UV.TCP.Socket) : I
 def serve (ctx : Context) : IO Unit := do
   let (server, port) ← Net.Tcp.listen ctx.config.listenHost ctx.config.listenPort
   log s!"kleis: listening on {ctx.config.listenHost}:{port}"
+  let _ ← IO.asTask (prio := .dedicated) (ctx.watch log)
   let registry ← ctx.registry.get
   log s!"kleis: {registry.manifests.size} service(s), {registry.grants.size} grant(s)"
   for m in registry.manifests do

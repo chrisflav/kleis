@@ -1,4 +1,4 @@
-import Kleis.Proxy.Forward
+import Kleis.Proxy.Admin
 import Kleis.Net.ClientHello
 import Kleis.Net.TlsStream
 import Kleis.Net.Socket
@@ -95,13 +95,17 @@ def unrewrite? (target : String) : Option (String × String × String) := do
 /-- Handle the requests arriving on one already-identified stream. -/
 partial def serveRequests (ctx : Context) (client : Net.Stream) (token : Biscuit)
     (scheme : String) (tunnel : Option (String × Nat)) (clientIp : String)
-    (pending : Bytes) : IO Unit := do
+    (pending : Bytes) (served : Nat := 0) : IO Unit := do
   let limits : Http.Limits := { maxHeadSize := ctx.config.maxHeadSize }
   match ← readHead client limits pending with
   | none => return ()
   | some (wire, rest) =>
     let more ← forward ctx { client, wire, pipelined := rest, scheme, tunnel, token, clientIp }
-    if more then serveRequests ctx client token scheme tunnel clientIp ByteArray.empty
+    -- Every request on the connection is decided on its own, so carrying many
+    -- costs nothing in authority; the bound is there so one client cannot hold
+    -- a connection, and the TLS session under it, forever.
+    if more && served + 1 < ctx.config.maxRequestsPerConnection then
+      serveRequests ctx client token scheme tunnel clientIp ByteArray.empty (served + 1)
 
 /-- Peek at the ClientHello to find the name the client asked for.
 
@@ -121,6 +125,52 @@ def peekSni (raw : Net.Stream) : IO (Bytes × Option String) := do
         go (buf ++ chunk) fuel
   go ByteArray.empty 64
 
+/-- Copy one direction of a tunnel until its source ends.
+
+No half-close at the end: `Stream.close` also stops reads on that stream, so
+closing the origin when the client finished sending would cut off the answer
+still on its way back. -/
+partial def pump (src dst : Net.Stream) : IO Unit := do
+  let chunk ← src.read 65536
+  if chunk.size == 0 then return
+  dst.write chunk
+  pump src dst
+
+/-- A blind tunnel to a host no manifest claims, for the configuration's
+`passthrough`.  Nothing is intercepted and nothing is spent: the bytes are the
+client's TLS session with the origin, which this proxy cannot read and does not
+try to.  What it does check is the token — revoked or expired, and the tunnel
+is refused — and it writes one audit record per tunnel. -/
+def tunnelBlind (ctx : Context) (client : Net.Stream) (host : String) (port : Nat)
+    (token : Biscuit) (clientIp : String) : IO Unit := do
+  let requestId ← ctx.nextRequestId
+  if let .error e ← tokenHolds ctx token then
+    refuse client 407 requestId s!"the token was not accepted: {e}"
+    return
+  let record : AuditRecord := {
+    time := ← Store.now, requestId, method := "CONNECT", url := s!"{host}:{port}"
+    clientIp, service := "passthrough", manifestVersion := "", grant := ""
+    grantVersion := ""
+    revocationIds := (Biscuit.revocationIdentifiers token).map Bytes.toHex
+    allowed := true, outcome := "passthrough", facts := []
+    credential := none, status := none }
+  let origin ← try Net.Tcp.connect host (UInt16.ofNat port)
+    catch e => do
+      refuse client 502 requestId s!"the origin could not be reached: {e}"
+      if ctx.config.audit then
+        ctx.audit.append { record with outcome := s!"passthrough, upstream failure: {e}" }
+      return
+  if ctx.config.audit then ctx.audit.append record
+  client.write (Bytes.ofString "HTTP/1.1 200 Connection established\r\n\r\n")
+  -- The tunnel lasts as long as the origin keeps its side open.  The upward
+  -- copy is not waited for: it ends when the client connection is closed after
+  -- this returns, and waiting would leave it blocked on a client that is
+  -- itself waiting for that close.
+  let _ ← IO.asTask (prio := .dedicated) do
+    try pump client origin catch _ => pure ()
+  try pump origin client catch _ => pure ()
+  origin.close
+
 /-- Handle a `CONNECT`: intercept, then serve what comes through. -/
 def handleConnect (ctx : Context) (client : Net.Stream) (wire : Http.Request)
     (token : Biscuit) (clientIp : String) : IO Unit := do
@@ -129,12 +179,14 @@ def handleConnect (ctx : Context) (client : Net.Stream) (wire : Http.Request)
     | none => (Str.toLowerAscii wire.target, 443)
   let registry ← ctx.registry.get
   match registry.forHost? host with
-  | none => do
-    -- Refused rather than tunnelled: this is a credential proxy, not an
-    -- anonymous egress path, and a tunnel it cannot inspect is one it cannot
-    -- gate.
-    let requestId ← ctx.nextRequestId
-    refuse client 403 requestId s!"no service manifest claims `{host}`"
+  | none =>
+    -- Refused rather than tunnelled, unless the configuration names the host:
+    -- this is a credential proxy, not an anonymous egress path, and a tunnel it
+    -- cannot inspect is one it cannot gate.
+    if ctx.config.passes host then tunnelBlind ctx client host port token clientIp
+    else do
+      let requestId ← ctx.nextRequestId
+      refuse client 403 requestId s!"no service manifest claims `{host}`"
   | some _ => do
     client.write (Bytes.ofString "HTTP/1.1 200 Connection established\r\n\r\n")
     let (hello, sni) ← peekSni client
@@ -213,7 +265,9 @@ def handleConnection (ctx : Context) (client : Net.Stream) (clientIp : String) :
       match Token.parse text ctx.rootPublic with
       | .error e => refuse client 407 requestId s!"the token was not accepted: {e}"
       | .ok token =>
-        if wire.method == "CONNECT" then
+        if isAdminTarget wire.target then
+          handleAdmin ctx client wire rest token clientIp
+        else if wire.method == "CONNECT" then
           if ctx.config.mode.intercepts then handleConnect ctx client wire token clientIp
           else refuse client 405 requestId "this proxy is not configured to intercept CONNECT"
         else if wire.target.startsWith "http://" || wire.target.startsWith "https://" then

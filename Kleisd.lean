@@ -36,7 +36,7 @@ def main (argv : List String) : IO UInt32 := do
       for m in registry.manifests do
         Proxy.log s!"kleisd:   {m.name} → {String.intercalate ", " m.hosts}"
       for g in registry.grants do
-        Proxy.log s!"kleisd:   grant {g.name} → {g.service} via {g.credential}"
+        Proxy.log s!"kleisd:   grant {g.name} → {g.service} via {g.credentialLabel}"
       Proxy.log "kleisd: configuration is loadable"
       return 0
     Proxy.serve ctx
