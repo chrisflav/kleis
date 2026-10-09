@@ -125,11 +125,7 @@ def peekSni (raw : Net.Stream) : IO (Bytes × Option String) := do
         go (buf ++ chunk) fuel
   go ByteArray.empty 64
 
-/-- Copy one direction of a tunnel until its source ends.
-
-No half-close at the end: `Stream.close` also stops reads on that stream, so
-closing the origin when the client finished sending would cut off the answer
-still on its way back. -/
+/-- Copy one direction of a tunnel until its source ends. -/
 partial def pump (src dst : Net.Stream) : IO Unit := do
   let chunk ← src.read 65536
   if chunk.size == 0 then return
@@ -162,12 +158,15 @@ def tunnelBlind (ctx : Context) (client : Net.Stream) (host : String) (port : Na
       return
   if ctx.config.audit then ctx.audit.append record
   client.write (Bytes.ofString "HTTP/1.1 200 Connection established\r\n\r\n")
-  -- The tunnel lasts as long as the origin keeps its side open.  The upward
-  -- copy is not waited for: it ends when the client connection is closed after
-  -- this returns, and waiting would leave it blocked on a client that is
-  -- itself waiting for that close.
+  -- Whichever side ends first ends the tunnel.  The bytes are a TLS session
+  -- the proxy cannot read, so it cannot tell a half-close from a finished
+  -- exchange; and an origin left waiting after its client went away holds a
+  -- connection open for as long as it cares to, which for a keep-alive server
+  -- is indefinitely.  `Stream.close` also stops reads on that stream, so
+  -- closing one side unblocks the copy reading from it.
   let _ ← IO.asTask (prio := .dedicated) do
     try pump client origin catch _ => pure ()
+    origin.close
   try pump origin client catch _ => pure ()
   origin.close
 

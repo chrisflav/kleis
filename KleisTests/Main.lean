@@ -7,6 +7,7 @@ import KleisTests.Externs
 import KleisTests.Policy
 import KleisTests.Security
 import KleisTests.Ca
+import KleisTests.Orchestra
 
 /-!
 # The test driver
@@ -42,5 +43,6 @@ def main : IO UInt32 := do
   policyTests
   securityTests
   caTests
+  orchestraTests
   tlsTests
   report

@@ -20,12 +20,9 @@ allowed_operation("discover") <-
   operation("discover"), discover_service("git-upload-pack");
 allowed_operation("fetch") <- operation("fetch");
 
-// Reads of the API.  `list_or_open_pr` is one route for two methods, so the
-// method has to be checked here: a route fact and a primitive fact join like
-// any others.
+// Reads of the API, which the manifest marks `read` whatever the endpoint,
+// pull requests and issues included.
 allowed_operation("read") <- operation("read");
-allowed_operation("list_pr") <-
-  operation("list_or_open_pr"), request_method("GET");
 
 check if allowed_operation($x);
 

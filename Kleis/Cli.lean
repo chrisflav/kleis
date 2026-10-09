@@ -393,7 +393,7 @@ def cmdCheck (args : Args) : IO Unit := do
   let grants ← match Policy.candidates registry token manifest bare.host with
     | .ok gs => pure gs
     | .error r => die r.toString
-  let decoder := manifest.decoderFor contentType
+  let decoder := manifest.decoderFor contentType bare
   let decoded ← Wire.runDecoder decoder body true
   let revocations ← Token.loadRevocations
   let now ← Store.now

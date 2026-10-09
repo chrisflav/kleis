@@ -1,0 +1,24 @@
+# kleisd's configuration for an agent orchestrator — orchestra — that hands
+# each job a token of its own and points every program in the job's sandbox at
+# this proxy.  See README.md beside this file.
+
+# Reachable from the sandboxes.  On one host with landrun the loopback is
+# enough; with containers or pods it is an address they can route to, and a
+# firewall that lets only them reach it.
+listen = "127.0.0.1:8080"
+mode   = "connect"
+
+# Every program in a sandbox has HTTPS_PROXY pointed here: the agent's own
+# model API, package managers, toolchain downloads.  Those hosts have no
+# manifest and pass as blind tunnels, still only for a bearer with a valid,
+# unrevoked token.  Narrow this to a list if the sandbox should reach nothing
+# else.
+passthrough = ["*"]
+
+# The orchestrator mints a token per job through /.kleis/v1/tokens.  It may name
+# only the grants below, state only `task_*` facts, and ask for at most a day.
+[[issuer]]
+name    = "orchestra"
+grants  = ["orchestra-*"]
+facts   = ["task_*"]
+max_ttl = "24h"

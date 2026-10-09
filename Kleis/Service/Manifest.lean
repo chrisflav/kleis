@@ -70,12 +70,21 @@ structure CredentialSpec where
   config : Json
   deriving Inhabited
 
-/-- A media type bound to a decoder. -/
+/-- A media type bound to a decoder, optionally only for the requests one
+pattern matches.
+
+The pattern is what lets a service whose API is mostly one format carve out an
+endpoint that is another wearing the same media type: GitHub's GraphQL endpoint
+takes `application/json` like the rest of its API, and only there is the
+`query` field a document worth reading.  The first binding that applies wins,
+so a narrow one is written above a broad one. -/
 structure DecoderBinding where
   /-- The media types this covers. -/
   media : List String
   /-- The decoder's registry name, or `exec:<command>`. -/
   decoder : String
+  /-- The requests it is limited to, if it is. -/
+  when : Option Facts.Pattern := none
   deriving Repr, Inhabited
 
 /-- A service. -/
@@ -172,7 +181,10 @@ private def decoderOf (j : Json) : Except String DecoderBinding := do
   let decoder ← match j.str? "decoder" with
     | some d => pure d
     | none => throw "a decoder binding needs a `decoder`"
-  pure { media := (strings j "media").map (fun m => Str.toLowerAscii (Str.trim m)), decoder }
+  let when ← match j.str? "match" with
+    | some m => some <$> Facts.Pattern.parse m
+    | none => pure none
+  pure { media := (strings j "media").map (fun m => Str.toLowerAscii (Str.trim m)), decoder, when }
 
 /-- Read the manifest's datalog: facts and rules only. -/
 private def datalogOf (source : String) : Except String (List Builder.Fact × List Builder.Rule) :=
@@ -234,9 +246,17 @@ def Manifest.mayCredentialReach (m : Manifest) (host : String) : Bool :=
   m.credential.hosts.any fun h => Facts.hostMatches h host
 
 /-- The decoder to use for a body, from its media type. -/
-def Manifest.decoderFor (m : Manifest) (contentType : Option String) : Wire.Decoder :=
+def Manifest.decoderFor (m : Manifest) (contentType : Option String)
+    (request : Option Model.Request := none) : Wire.Decoder :=
   let bare := (contentType.getD "").splitOn ";" |>.headD "" |> Str.trim |> Str.toLowerAscii
-  let named := (m.decoders.find? fun b => b.media.contains bare).map (·.decoder)
+  -- A binding limited to some requests applies only when the request is known
+  -- and matches; without the request, only the unconditional ones are candidates.
+  let applies (b : DecoderBinding) : Bool :=
+    b.media.contains bare && match b.when, request with
+      | none, _ => true
+      | some p, some r => (p.match? r).isSome
+      | some _, none => false
+  let named := (m.decoders.find? applies).map (·.decoder)
   let name := named.orElse fun _ =>
     (Wire.byMedia? bare).map (·.name) |>.orElse fun _ => m.defaultDecoder
   match name with

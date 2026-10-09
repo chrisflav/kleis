@@ -28,7 +28,7 @@ cleanup() {
   [ -n "${KLEISD_PID:-}" ] && kill "$KLEISD_PID" 2>/dev/null
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
   [ -n "${TLS_ORIGIN_PID:-}" ] && kill "$TLS_ORIGIN_PID" 2>/dev/null
-  rm -rf "$WORK"
+  [ -n "${KEEP_WORK:-}" ] && echo "work kept in $WORK" || rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -335,6 +335,121 @@ git push origin main > "$WORK/push-tls-main.log" 2>&1
 if [ $? -ne 0 ]; then ok "and main is still refused over https"; else bad "and main is still refused over https" "it succeeded"; fi
 enter "$ROOT"
 
+echo
+echo "== connection reuse"
+# Two requests in one curl: the second goes on the same connection to the
+# proxy, through the same tunnel, when the first ended where its framing said.
+OUT="$(curl -s -o /dev/null -o /dev/null --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" -w '%{num_connects}\n' \
+  "https://127.0.0.1:$TLS_PORT/echo" "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
+[ "$(echo "$OUT" | tail -1)" = "0" ]
+check $? "a second request reuses the connection" "$OUT"
+
+# A body sent with `Expect: 100-continue`, as git does for a large push: the
+# origin's interim response must not be taken for the answer.
+head -c 200000 /dev/zero | tr '\0' 'x' > "$WORK/big"
+OUT="$(curl -s --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" -H "Expect: 100-continue" -H "Content-Type: application/octet-stream" \
+  --data-binary @"$WORK/big" \
+  -w '\n%{http_code}' "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
+[ "$(echo "$OUT" | tail -1)" = "200" ] && echo "$OUT" | grep -q '"method": "POST"'
+check $? "a request sent with Expect: 100-continue gets its real response" "$(echo "$OUT" | tail -c 300)"
+
+echo
+echo "== issuers and passthrough"
+cat > "$KLEIS_HOME/config/config.toml" <<EOF2
+listen = "127.0.0.1:$TLS_KLEIS_PORT"
+mode = "connect"
+upstream_ca_file = "$WORK/origin.crt"
+passthrough = ["localhost"]
+
+[[issuer]]
+name = "ci"
+grants = ["echo-*"]
+facts = ["job_*"]
+max_ttl = "2h"
+EOF2
+kill "$KLEISD_PID" 2>/dev/null; wait "$KLEISD_PID" 2>/dev/null
+"$KLEISD" > "$WORK/kleisd-issuer.log" 2>&1 &
+KLEISD_PID=$!
+for _ in $(seq 50); do
+  curl -s -o /dev/null "http://127.0.0.1:$TLS_KLEIS_PORT/" && break
+  sleep 0.1
+done
+ADMIN="http://127.0.0.1:$TLS_KLEIS_PORT/.kleis/v1"
+
+ISSUER="$("$KLEIS" issuer token ci --ttl 1d)"
+check $? "mint an issuer's credential"
+OUT="$(curl -s -H "Authorization: Bearer $ISSUER" -H 'content-type: application/json' \
+  -d '{"grants":["echo-only"],"bearer":"job-1","ttl":"1h","facts":[{"name":"job_id","terms":["1"]}]}' \
+  "$ADMIN/tokens")"
+JOB_TOKEN="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"
+JOB_REV="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["revocation_ids"][0])' 2>/dev/null)"
+[ -n "$JOB_TOKEN" ]; check $? "the issuer mints a token" "$OUT"
+"$KLEIS" token inspect --token "$JOB_TOKEN" | grep -q 'issued_by("ci")'
+check $? "which says who issued it" "$("$KLEIS" token inspect --token "$JOB_TOKEN")"
+OUT="$(curl -s --proxy "http://kleis:$JOB_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
+echo "$OUT" | grep -q '"authorization": "Bearer upstream-secret-42"'
+check $? "and the token spends its grant" "$OUT"
+
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' -d '{"grants":["dev-only"]}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "an issuer cannot name a grant outside its list" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' \
+  -d '{"grants":["echo-only"],"facts":[{"name":"operation","terms":["echo"]}]}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "nor state a fact the proxy gives meaning to" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' -d '{"grants":["echo-only"],"ttl":"3h"}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "nor outlive its maximum" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $JOB_TOKEN" \
+  -H 'content-type: application/json' -d '{"grants":["echo-only"]}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "and a bearer's token is not an issuer's" "got $CODE"
+
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' -d "{\"revocation_id\":\"$JOB_REV\"}" "$ADMIN/revoke")"
+[ "$CODE" = "200" ]; check $? "the issuer revokes what it issued" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' \
+  --proxy "http://kleis:$JOB_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo")"
+[ "$CODE" = "403" ] && grep -q revoked "$WORK/body"
+check $? "and the token stops working at once" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' \
+  -d "{\"revocation_id\":\"$("$KLEIS" token inspect --token "$TLS_TOKEN" | sed -n '/revocation ids:/{n;p}' | tr -d ' ')\"}" \
+  "$ADMIN/revoke")"
+[ "$CODE" = "403" ]; check $? "but not what somebody else issued" "got $CODE: $(cat "$WORK/body")"
+
+# A revocation made at the command line reaches the running daemon too.
+ECHO_REV="$("$KLEIS" token inspect --token "$TLS_ECHO_TOKEN" | sed -n '/revocation ids:/{n;p}' | tr -d ' ')"
+"$KLEIS" token revoke "$ECHO_REV" > /dev/null
+sleep 4
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' \
+  --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo")"
+[ "$CODE" = "403" ] && grep -q revoked "$WORK/body"
+check $? "a revocation at the command line reaches the running daemon" "got $CODE: $(cat "$WORK/body")"
+
+PASS_TOKEN="$("$KLEIS" token issue --grant echo-only --bearer ci@pass --ttl 1h)"
+# `localhost` is no manifest's, and the configuration lets it through: a blind
+# tunnel, with nothing injected.
+OUT="$(curl -s --proxytunnel --proxy "http://kleis:$PASS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic "http://localhost:$ORIGIN_PORT/echo" 2>&1)"
+echo "$OUT" | grep -q '"path": "/echo"' && ! echo "$OUT" | grep -q 'upstream-secret-42'
+check $? "a passthrough host is tunnelled without a credential" "$OUT"
+OUT="$(curl -s --proxy "http://kleis:$PASS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic "http://localhost:$ORIGIN_PORT/echo" 2>&1)"
+echo "$OUT" | grep -q '"path": "/echo"' && ! echo "$OUT" | grep -qi 'proxy-authorization'
+check $? "and forwarded without the proxy's header" "$OUT"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxytunnel \
+  --proxy "http://kleis:$JOB_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic \
+  "http://localhost:$ORIGIN_PORT/echo" 2>&1)"
+[ "$CODE" != "200" ]; check $? "but not for a revoked token" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxytunnel \
+  --proxy "http://kleis:$PASS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic \
+  "http://127.0.0.2:$ORIGIN_PORT/echo" 2>&1)"
+[ "$CODE" != "200" ]; check $? "and not for a host the configuration does not name" "got $CODE"
 echo
 echo "== the audit log"
 "$KLEIS" audit verify | grep -q 'chain intact'

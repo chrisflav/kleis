@@ -291,7 +291,7 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
     | .ok v => pure v
 
   -- Read as much of the body as the decoder wants.
-  let decoder := manifest.decoderFor (Http.Headers.find? job.wire.headers "content-type")
+  let decoder := manifest.decoderFor (Http.Headers.find? job.wire.headers "content-type") bare
   let cap := min manifest.maxDecodePrefix ctx.config.maxDecodePrefix
   let (body, decoded) ← try
       readBodyPrefix job.client job.wire.framing decoder job.pipelined cap

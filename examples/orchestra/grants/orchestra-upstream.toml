@@ -1,0 +1,61 @@
+# What a job may do on the repository it works for, with the operator's
+# personal access token — the one orchestra's comment, pull request and merge
+# tools used to spend on the job's behalf, and which the job never sees.
+#
+#   create_pr   open a pull request whose head is a branch of the job's fork,
+#               and label it with the job's `task_pr_labels`, creating those
+#               labels if the repository lacks them
+#   comment     comment, review (COMMENT only) and reply inline — on the issue
+#               or pull request the job was launched from, and no other
+#   merge_pr    merge a pull request
+#
+# Reads and fetches of the upstream are allowed to every job that has one.
+# Labelling arbitrary issues is `orchestra-triage`.
+
+name         = "orchestra-upstream"
+service      = "github"
+credential   = "github/orchestra-pat"
+max_lifetime = "24h"
+
+datalog = '''
+check if issued_by("orchestra");
+
+upstream($o, $r) <- repository($o, $r), task_upstream($o, $r);
+own_issue($n) <- issue($n), task_issue($n);
+own_issue($n) <- pull_request($n), task_issue($n);
+
+allowed("discover") <-
+  operation("discover"), discover_service("git-upload-pack"), upstream($o, $r);
+allowed("fetch") <- operation("fetch"), upstream($o, $r);
+allowed("read") <- operation("read"), upstream($o, $r);
+allowed("download") <- operation("download"), upstream($o, $r);
+
+// The head of a cross-repository pull request is `owner:branch`, and the owner
+// has to be the job's fork's.
+allowed("open_pr") <-
+  operation("open_pr"), upstream($o, $r), task_tool("create_pr"),
+  task_fork($fo, $fr), pr_head($h), $h.starts_with($fo + ":");
+allowed("create_label") <-
+  operation("create_label"), upstream($o, $r), task_tool("create_pr"),
+  label_created($l), task_pr_labels($s), $s.contains($l);
+allowed("add_labels") <-
+  operation("add_labels"), upstream($o, $r), task_tool("create_pr"), task_pr_labels($s);
+
+allowed("comment") <-
+  operation("comment"), upstream($o, $r), own_issue($n), task_tool("comment");
+allowed("review") <-
+  operation("review_pr"), upstream($o, $r), own_issue($n), task_tool("comment"),
+  review_event("COMMENT");
+allowed("review_comment") <-
+  operation("review_comment"), upstream($o, $r), own_issue($n), task_tool("comment");
+
+allowed("merge_pr") <- operation("merge_pr"), upstream($o, $r), task_tool("merge_pr");
+
+check if allowed($x);
+
+// Labels added under `create_pr` are the job's pull request labels and no
+// others.  A job with `label_issue` is decided by `orchestra-triage` instead.
+reject if label_added($l), task_pr_labels($s), !$s.contains($l);
+
+allow if grant("orchestra-upstream");
+'''

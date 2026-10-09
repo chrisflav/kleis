@@ -1,0 +1,50 @@
+# What a job may do on its own fork, with the GitHub App's installation token:
+# fetch it, push to it, read it through the API, and — given `create_pr` — open
+# a pull request on it.  And GraphQL queries, which `gh` uses for nearly every
+# read; mutations are refused, so nothing is changed through GraphQL at all.
+#
+# The facts a job's token carries, which orchestra states when it mints it:
+#
+#   task_fork(owner, repo)       the fork the job works in
+#   task_upstream(owner, repo)   the repository it works for
+#   task_issue(n)                the issue or pull request it was launched from
+#   task_tool(name)              each tool it was granted: create_pr, merge_pr,
+#                                label_issue, comment, create_repository
+#   task_writable(true)          unless the job is read-only
+#   task_pr_labels([...])        labels its pull requests are to carry
+#   task_push_prefix(prefix)     optional: refs it may push, e.g. refs/heads/orchestra/
+
+name         = "orchestra-fork"
+service      = "github"
+credential   = "github/orchestra-app"
+max_lifetime = "24h"
+
+datalog = '''
+check if issued_by("orchestra");
+
+fork($o, $r) <- repository($o, $r), task_fork($o, $r);
+
+allowed("discover") <-
+  operation("discover"), discover_service("git-upload-pack"), fork($o, $r);
+allowed("discover") <-
+  operation("discover"), discover_service("git-receive-pack"), fork($o, $r),
+  task_writable(true);
+allowed("fetch") <- operation("fetch"), fork($o, $r);
+allowed("push") <- operation("push"), fork($o, $r), task_writable(true);
+allowed("read") <- operation("read"), fork($o, $r);
+allowed("download") <- operation("download"), fork($o, $r);
+allowed("open_pr") <- operation("open_pr"), fork($o, $r), task_tool("create_pr");
+allowed("graphql") <- operation("graphql");
+check if allowed($x);
+
+// Queries only.  The decoder lists every operation in the document, so a
+// mutation hiding behind a query in the same document is caught too.
+reject if graphql_operation($t), $t != "query";
+
+// A job does not delete branches, and when it was given a prefix it pushes
+// under it and nowhere else.
+reject if deletes_ref($ref);
+reject if task_push_prefix($p), ref_update($ref), !$ref.starts_with($p);
+
+allow if grant("orchestra-fork");
+'''

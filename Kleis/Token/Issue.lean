@@ -90,7 +90,11 @@ its configuration names. -/
 def reservedPredicates : List String :=
   ["grant", "bearer", "issuer", "issued_by", "time", "client_ip", "request_id",
    "operation", "repository", "pull_request", "issue", "ref_update", "creates_ref",
-   "deletes_ref", "wants_object", "discover_service", "body", "request_body"]
+   "deletes_ref", "wants_object", "discover_service", "body", "request_body",
+   -- The shipped GitHub manifest's vocabulary, for the same reason.
+   "pr_head", "pr_base", "review_event", "review_comment_id", "label_added",
+   "label_removed", "label_created", "organization", "new_repository",
+   "repository_private", "graphql_operation"]
 
 /-- Is a predicate name one an extra fact may not use?  Every `request_*` and
 `body_*` name is reserved along with the list, since those are what the proxy
