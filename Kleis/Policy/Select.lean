@@ -82,9 +82,11 @@ structure Choice where
   /-- Every grant that was tried and refused, with why, in order. -/
   refusals : List (Grant × Outcome)
 
-/-- The reason for a refusal, naming each grant when there was more than one. -/
+/-- What was decided, for the audit log and the client: the grant that allowed the request, or
+why each grant refused it when there was more than one. -/
 def Choice.reason (c : Choice) : String :=
-  match c.refusals with
+  if c.outcome.allowed then s!"allowed by grant `{c.grant.name}`, " ++ c.outcome.reason
+  else match c.refusals with
   | [] => c.outcome.reason
   | [(_, o)] => o.reason
   | rs =>
