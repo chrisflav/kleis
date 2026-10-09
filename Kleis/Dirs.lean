@@ -57,6 +57,9 @@ def ca : IO System.FilePath := do return (← data) / "ca"
 /-- The audit log. -/
 def auditLog : IO System.FilePath := do return (← data) / "audit.log"
 
+/-- Facts remembered for tokens, one JSON line each. -/
+def remembered : IO System.FilePath := do return (← data) / "remembered.jsonl"
+
 /-- Issued token records, by revocation identifier. -/
 def issued : IO System.FilePath := do return (← data) / "issued"
 

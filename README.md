@@ -139,9 +139,13 @@ kleis check --token "$T" --method POST \
 
 ## Tokens for jobs
 
-A token may name several grants, tried in order until one allows the request,
-so one token can cover a git host and an issue tracker, or one host on two
-credentials.  A grant may be `anonymous`, forwarding with no credential at all.
+A grant may spend several credentials and chooses one per request: by resource
+(`[[credential_route]] resources = ["acme/*"]`), by its own rules
+(`use_credential("…") <- repository($o, $r), task_upstream($o, $r)`), and
+otherwise its fallback — a `credential`, or none for `anonymous = true`.  A
+route can remember what a successful request made (`on_success`), so a token
+that created a repository may then push to it.  A token may also name several
+grants, for a bearer working across services.
 
 A program that hands out work — an orchestrator, a CI runner — is configured as
 an *issuer* and mints a token per job over HTTP, without the root key:

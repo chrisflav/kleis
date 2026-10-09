@@ -363,26 +363,52 @@ revocation list, and the manifests, grants and credentials, and reloads when one
 changes — keeping the configuration it has if the new one does not load.  A
 revocation made through an issuer (§4.7) is applied in memory at once.
 
-### 4.6 Several grants on one token
+### 4.6 Which credential a request is spent on
 
-A token may name more than one grant.  That is how one bearer reaches two
-services on one token, and how one service is reached on two credentials: a
-bot's installation token for its own fork, a person's token for the upstream it
-opens pull requests on.
+Whether a request is allowed and which credential it goes out on are two
+questions, answered in that order and by the same grant.  The grant decides the
+first.  For the second it may name several credentials, and choose among them
+per request:
 
-The grants are tried **one at a time**, in the order the token names them, and
-the first that allows the request decides it and spends its credential
-(`Kleis.Policy.Select`).  They are never merged into one authorizer: a check in
-one would then constrain requests the other was written for, and a rule in one
-could derive a fact that satisfied a check in the other, so a pair of grants
-would allow something neither author wrote.  Kept apart, each grant means what
-its file says, and naming two adds only a second chance.  The token's own blocks
-apply to every attempt — an attenuation narrows the token, not one grant.
+1. **Routes by resource.**  A manifest says what a request is *about* —
+   `resources = ["repository", "organization"]` on GitHub, read as `owner/repo`
+   or `owner`.  A grant's `[[credential_route]]` maps resource patterns
+   (`owner/repo`, `owner/*`, `*`) to a credential, and the most specific match
+   wins.  This is the operator's word on a resource — "the `acme` repositories
+   are reached with acme's token" — so it comes first.
+2. **A credential the grant derives.**  `use_credential("name") <- …` in the
+   grant's datalog, for what a pattern cannot say: "whatever this bearer's
+   upstream is", or "GraphQL, which is about no repository".  Only a name the
+   grant lists as spendable counts, and only a fact derived from the authorizer
+   and the token's authority block: a bearer can append a block holding
+   `use_credential(…)`, and while biscuit keeps it from satisfying the grant's
+   checks it would otherwise reach the evaluated world.  A manifest may not
+   derive it either.
+3. **The fallback**: the grant's `credential`, or none for `anonymous = true` —
+   what the grant allows and nothing routes, such as a public clone, read
+   without spending anybody's token.
 
-A grant may also be **anonymous** (`anonymous = true`, no `credential`): it
-forwards without one, for what the upstream serves to anybody.  Tried last, it
-lets a bearer clone public dependencies without spending anybody's credential
-on them.
+The choice is made once, after a single evaluation, and recorded in the audit
+log.
+
+A token may still name several grants, for a bearer that works across services
+— a git host and an issue tracker on one token.  They are tried one at a time,
+in the token's order, and the first that allows decides (`Kleis.Policy.Select`);
+they are never merged, since a check in one would then constrain requests the
+other was written for.  For one service, one grant with routes is the better
+shape: one decision, and a credential chosen rather than found by trying.
+
+### 4.6a What a bearer made
+
+Some permissions only make sense after the fact: a bearer allowed to create a
+repository should then be allowed to push to *that* repository, whose name
+nobody knew when the token was issued.  A route may say what to remember when
+its request succeeds — `on_success = ['created_repository($org, $name)']` — and
+after a 2xx the proxy keeps those facts for the token, filed under its authority
+block's revocation id (shared by every attenuation of it), and asserts them on
+its later requests.  A grant then allows pushing where `created_repository`
+holds.  The facts come from the manifest's templates and the request's captures,
+never from the bearer, and no issuer may state them.
 
 ### 4.7 Issuers
 
@@ -816,7 +842,9 @@ M1 through M4 of the original plan are implemented and exercised by
 | Grants, checks, policies, externs, revocation (§4) | done |
 | `Secret`, host confinement, injection (§5) | done |
 | Providers: `static`, `exec`, `oauth2`, `github-app` | done; `github-app` signs its own JWT from the App's PEM key |
-| Several grants per token, anonymous grants (§4.6) | done |
+| Credential routing by resource and by grant rules, anonymous fallback (§4.6) | done |
+| Facts remembered from successful requests (§4.6a) | done |
+| Several grants per token | done |
 | Issuers: `/.kleis/v1/tokens` and `/revoke` (§4.7) | done |
 | Passthrough for hosts no manifest claims | done: blind, audited tunnels, opt-in per host pattern |
 | Reload on change | done: revocations, manifests, grants, credentials |

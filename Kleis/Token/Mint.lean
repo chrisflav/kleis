@@ -40,6 +40,14 @@ def mint (registry : Service.Registry) (r : MintRequest) :
     return .error "an issuer's credential names no grants: it asks for tokens, it does not spend credentials"
   if r.issuer.isNone && r.grants.isEmpty then
     return .error "a token needs at least one grant"
+  -- Beyond the fixed list, every name a loaded manifest gives meaning to — what its
+  -- routes emit or remember, what its rules derive — and the one a grant chooses a
+  -- credential with.  A token asserting any of them would be asserting what the
+  -- proxy is meant to work out for itself.
+  for f in r.facts do
+    let n := f.predicate.name
+    if n == "use_credential" || registry.manifests.any (·.vocabulary.contains n) then
+      return .error s!"`{n}` is reserved and cannot be issued as a fact"
   for name in r.grants do
     match registry.grant? name with
     | none => return .error s!"no such grant `{name}`"

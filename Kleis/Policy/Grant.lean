@@ -34,6 +34,24 @@ def parseDuration? (s : String) : Option Nat := do
     let n ← numText.toNat?
     some (n * mult)
 
+/-- A credential to spend on the resources some patterns match. -/
+structure CredentialRoute where
+  /-- `owner/repo`, `owner/*` or `*`. -/
+  resources : List String
+  /-- The credential, or `none` to forward these without one. -/
+  credential : Option String
+  deriving Repr, Inhabited
+
+/-- How specifically a pattern matches a resource: `none` if it does not, and
+higher for a more specific match. -/
+def resourceMatch (pattern resource : String) : Option Nat :=
+  if pattern == "*" then some 1
+  else if pattern.endsWith "/*" then
+    let owner := (pattern.dropEnd 2).toString
+    if resource == owner || resource.startsWith (owner ++ "/") then some 2 else none
+  else if pattern == resource then some 3
+  else none
+
 /-- A grant. -/
 structure Grant where
   /-- The name a token claims. -/
@@ -50,6 +68,18 @@ structure Grant where
   mistake, and reading it as anonymous would turn a typo into requests that go
   out unauthenticated without anybody having decided they should. -/
   credential : Option String
+  /-- Which credential to spend on which resource, before the fallback above.
+
+  A resource is what a request is *about* — `owner/repo` on GitHub, or `owner` for
+  an organisation-level call — as the manifest names it (`Manifest.resources`).
+  Each route lists resource patterns: `owner/repo` exactly, `owner/*` for an
+  owner and everything under it, or `*`.  The most specific pattern that matches
+  decides; between equally specific ones, the route written first.  -/
+  routes : List CredentialRoute := []
+  /-- Every credential this grant may spend: the fallback, the routes', and any
+  named in `credentials`.  A `use_credential(name)` fact the grant's own rules
+  derive is honoured only for a name on this list. -/
+  spendable : List String := []
   /-- The longest a token naming this grant may live, in seconds. -/
   maxLifetime : Nat
   /-- Facts the grant asserts. -/
@@ -95,8 +125,17 @@ def Grant.ofToml (source : String) : Except String Grant := do
     | .error e => throw s!"in the grant's datalog: {e}"
   if parsed.policies.isEmpty then
     throw "a grant with no policy can never allow anything; add `allow if …`"
+  let routes ← (j.arr? "credential_route").mapM fun r => do
+    let resources := (r.arr? "resources").filterMap Json.asString?
+    if resources.isEmpty then throw "a `credential_route` needs `resources`"
+    match r.str? "credential", (r.bool? "anonymous").getD false with
+    | some c, false => pure ({ resources, credential := some c } : CredentialRoute)
+    | none, true => pure { resources, credential := none }
+    | _, _ => throw "a `credential_route` names a `credential`, or is `anonymous = true`"
+  let spendable := (credential.toList ++ routes.filterMap (·.credential)
+    ++ (j.arr? "credentials").filterMap Json.asString?).eraseDups
   pure {
-    name, service, credential, maxLifetime
+    name, service, credential, maxLifetime, routes, spendable
     facts := parsed.facts
     rules := parsed.rules
     checks := parsed.checks
@@ -105,6 +144,32 @@ def Grant.ofToml (source : String) : Except String Grant := do
     version := Bytes.toHex (Sha256.hash (Bytes.ofString source))
     source
   }
+
+/-- Which credential a request is spent on, or `none` for none.  Decided after
+the grant has allowed the request, and by the grant: the route for the most
+specific resource pattern that matches, else a `use_credential` the grant's
+rules derived — the first of them in the order of `spendable` — else the
+fallback.
+
+Routes come first because they are the operator's word on a resource: "the
+`acme` repositories are reached with acme's token" should not be overridden by
+a general rule that does not know about acme.  The derived choice is for what a
+resource pattern cannot say, such as "whatever this job's upstream is". -/
+def Grant.chooseCredential (g : Grant) (resources : List String) (derived : List String) :
+    Option String :=
+  let scored := g.routes.zipIdx.flatMap fun (route, i) =>
+    resources.flatMap fun r => route.resources.filterMap fun p =>
+      (resourceMatch p r).map fun s => (s, i, route.credential)
+  let best := scored.foldl (init := none) fun acc (s, i, c) =>
+    match acc with
+    | none => some (s, i, c)
+    | some (s', i', _) => if s > s' || (s == s' && i < i') then some (s, i, c) else acc
+  match best with
+  | some (_, _, c) => c
+  | none =>
+    match g.spendable.find? derived.contains with
+    | some c => some c
+    | none => g.credential
 
 /-- The credential, as a person reads it in a listing. -/
 def Grant.credentialLabel (g : Grant) : String := g.credential.getD "(anonymous)"

@@ -25,7 +25,8 @@ private def orchestraToken (grants : List String) (facts : List String)
 /-- Decide one request the way the proxy does: the manifest's decoder for the
 request, then each of the token's grants in turn. -/
 def choose (registry : Service.Registry) (token : Biscuit) (method host path : String)
-    (body : String := "") (contentType : Option String := none) :
+    (body : String := "") (contentType : Option String := none)
+    (remembered : List Builder.Fact := []) :
     Except String Policy.Choice := do
   let bytes := Bytes.ofString body
   let headers : Http.Headers :=
@@ -53,12 +54,19 @@ def choose (registry : Service.Registry) (token : Biscuit) (method host path : S
     request
     body := Policy.Body.classify decoder.configured (bytes.size != 0) decoded
     manifest, grant, token, revoked := [], now := 1700000100
-    clientIp := "127.0.0.1", requestId := "test" }
+    clientIp := "127.0.0.1", requestId := "test", remembered }
 
 /-- Which grant allowed a request, or `none` if none did. -/
 def allowedBy (c : Except String Policy.Choice) : Option String :=
   match c with
   | .ok c => if c.outcome.allowed then some c.grant.name else none
+  | .error _ => none
+
+/-- What a request went out on: `none` if it was refused, `some "-"` if it was
+allowed with no credential, and `some name` for a credential. -/
+def spentOn (c : Except String Policy.Choice) : Option String :=
+  match c with
+  | .ok c => c.outcome.authorized.map fun a => a.credential.getD "-"
   | .error _ => none
 
 def orchestraTests : IO Unit := do
@@ -116,165 +124,203 @@ def orchestraTests : IO Unit := do
   check "an issuer may not be allowed every fact"
     (Config.ofToml "[[issuer]]\nname = \"x\"\nfacts = [\"*\"]\n").toOption.isNone
 
-  group "the orchestra grants"
+  group "the orchestra grant"
   let manifest ← match Service.Manifest.ofToml (← example? "examples/github.toml") with
     | .ok m => pure m
     | .error e => do check "the GitHub manifest loads" false e; return ()
   check "the GitHub manifest loads" true
-  let mut grants : Array Policy.Grant := #[]
-  for name in ["orchestra-fork", "orchestra-upstream", "orchestra-triage", "orchestra-public"] do
-    match Policy.Grant.ofToml (← example? s!"examples/orchestra/grants/{name}.toml") with
-    | .ok g => grants := grants.push g
-    | .error e => check s!"{name} loads" false e
-  checkEq "every grant loads" grants.size 4
-  check "the public grant is anonymous"
-    ((grants.find? (·.name == "orchestra-public")).bind (·.credential) |>.isNone)
-  let registry : Service.Registry := { manifests := #[manifest], grants }
-  let order := ["orchestra-fork", "orchestra-upstream", "orchestra-triage", "orchestra-public"]
+  let grant ← match Policy.Grant.ofToml (← example? "examples/orchestra/grants/orchestra-github.toml") with
+    | .ok g => pure g
+    | .error e => do check "the orchestra grant loads" false e; return ()
+  check "the orchestra grant loads" true
+  checkEq "it may spend both credentials" grant.spendable
+    ["github/orchestra-app", "github/orchestra-pat"]
+  let registry : Service.Registry := { manifests := #[manifest], grants := #[grant] }
   let base := ["task_fork(\"bot\", \"proj\")", "task_upstream(\"up\", \"proj\")",
-    "task_issue(7)", "task_writable(true)", "task_pr_labels([\"orchestra\"])"]
-  let token ← match orchestraToken order
+    "task_issue(7)", "task_writable(true)", "task_pr_labels([\"orchestra\"])",
+    "task_label_any(false)"]
+  let token ← match orchestraToken ["orchestra-github"]
       (base ++ ["task_tool(\"create_pr\")", "task_tool(\"comment\")"]) with
     | .ok t => pure t
     | .error e => do check "a job's token can be issued" false e; return ()
-  let push (repo ref : String) (old := String.ofList (List.replicate 40 'a'))
-      (t := token) :=
-    allowedBy (choose registry t "POST" "github.com" s!"/{repo}.git/git-receive-pack"
-      (Bytes.toStringLossy (pushBody [(old, ref)]))
-      (some "application/x-git-receive-pack-request"))
+  let oid := String.ofList (List.replicate 40 'a')
+  let push (repo ref : String) (t := token) (remembered : List Builder.Fact := []) :=
+    spentOn (choose registry t "POST" "github.com" s!"/{repo}.git/git-receive-pack"
+      (Bytes.toStringLossy (pushBody [(oid, ref)]))
+      (some "application/x-git-receive-pack-request") remembered)
+  let git (path : String) (t := token) := spentOn (choose registry t "GET" "github.com" path)
+  let api (method path : String) (body : String := "") (t := token)
+      (remembered : List Builder.Fact := []) :=
+    spentOn (choose registry t method "api.github.com" path body
+      (if body.isEmpty then none else some "application/json") remembered)
+  let app := some "github/orchestra-app"
+  let pat := some "github/orchestra-pat"
+  let anonymous := some "-"
 
   checkEq "a push to the fork goes out on the App's token"
-    (push "bot/proj" "refs/heads/feature") (some "orchestra-fork")
+    (push "bot/proj" "refs/heads/feature") app
   checkEq "a push to the upstream is refused" (push "up/proj" "refs/heads/feature") none
   checkEq "a push anywhere else is refused" (push "bot/other" "refs/heads/feature") none
+  checkEq "deleting a branch is refused"
+    (spentOn (choose registry token "POST" "github.com" "/bot/proj.git/git-receive-pack"
+      (Bytes.toStringLossy (deleteBody ["refs/heads/x"]))
+      (some "application/x-git-receive-pack-request"))) none
   checkEq "the ref advertisement for a push to the fork"
-    (allowedBy (choose registry token "GET" "github.com"
-      "/bot/proj.git/info/refs?service=git-receive-pack")) (some "orchestra-fork")
+    (git "/bot/proj.git/info/refs?service=git-receive-pack") app
   checkEq "a fetch of the fork uses the App's token"
-    (allowedBy (choose registry token "GET" "github.com"
-      "/bot/proj.git/info/refs?service=git-upload-pack")) (some "orchestra-fork")
-  checkEq "a fetch of the upstream uses the person's token"
-    (allowedBy (choose registry token "GET" "github.com"
-      "/up/proj.git/info/refs?service=git-upload-pack")) (some "orchestra-upstream")
+    (git "/bot/proj.git/info/refs?service=git-upload-pack") app
+  checkEq "a fetch of the upstream uses the operator's token"
+    (git "/up/proj.git/info/refs?service=git-upload-pack") pat
   checkEq "a fetch of anything else uses no token"
-    (allowedBy (choose registry token "GET" "github.com"
-      "/leanprover-community/mathlib4.git/info/refs?service=git-upload-pack"))
-    (some "orchestra-public")
-  checkEq "a push there is refused by every grant"
-    (push "leanprover-community/mathlib4" "refs/heads/master") none
-  match choose registry token "POST" "github.com" "/up/proj.git/git-receive-pack"
-      (Bytes.toStringLossy (pushBody [(String.ofList (List.replicate 40 'a'), "refs/heads/x")]))
-      (some "application/x-git-receive-pack-request") with
-  | .ok c =>
-    check "a refusal names every grant it tried" ((c.reason.splitOn "grant `").length == 5) c.reason
-  | .error e => check "a refusal names every grant it tried" false e
+    (git "/leanprover-community/mathlib4.git/info/refs?service=git-upload-pack") anonymous
+  checkEq "a push there is refused" (push "leanprover-community/mathlib4" "refs/heads/master") none
 
-  let readOnly ← match orchestraToken order
+  let readOnly ← match orchestraToken ["orchestra-github"]
       ["task_fork(\"bot\", \"proj\")", "task_upstream(\"up\", \"proj\")"] with
     | .ok t => pure t
     | .error e => do check "a read-only token can be issued" false e; return ()
   checkEq "a read-only job cannot push" (push "bot/proj" "refs/heads/x" (t := readOnly)) none
-  checkEq "nor start one"
-    (allowedBy (choose registry readOnly "GET" "github.com"
-      "/bot/proj.git/info/refs?service=git-receive-pack")) none
+  checkEq "nor start one" (git "/bot/proj.git/info/refs?service=git-receive-pack" (t := readOnly)) none
 
-  let prefixed ← match orchestraToken order
+  let prefixed ← match orchestraToken ["orchestra-github"]
       (base ++ ["task_push_prefix(\"refs/heads/orchestra/\")"]) with
     | .ok t => pure t
     | .error e => do check "a token with a push prefix can be issued" false e; return ()
-  checkEq "a push under the prefix"
-    (push "bot/proj" "refs/heads/orchestra/x" (t := prefixed)) (some "orchestra-fork")
+  checkEq "a push under the prefix" (push "bot/proj" "refs/heads/orchestra/x" (t := prefixed)) app
   checkEq "a push outside it" (push "bot/proj" "refs/heads/main" (t := prefixed)) none
 
-  let api (method path : String) (body : String := "") (t := token) :=
-    allowedBy (choose registry t method "api.github.com" path body
-      (if body.isEmpty then none else some "application/json"))
-  checkEq "a pull request from the fork to the upstream"
-    (api "POST" "/repos/up/proj/pulls" "{\"head\":\"bot:feature\",\"base\":\"main\",\"title\":\"t\"}")
-    (some "orchestra-upstream")
+  checkEq "a pull request from the fork to the upstream, on the operator's token"
+    (api "POST" "/repos/up/proj/pulls" "{\"head\":\"bot:feature\",\"base\":\"main\",\"title\":\"t\"}") pat
   checkEq "not from somebody else's fork"
     (api "POST" "/repos/up/proj/pulls" "{\"head\":\"evil:feature\",\"base\":\"main\"}") none
-  checkEq "a pull request on the fork"
-    (api "POST" "/repos/bot/proj/pulls" "{\"head\":\"feature\",\"base\":\"main\"}")
-    (some "orchestra-fork")
+  checkEq "a pull request on the fork, on the App's"
+    (api "POST" "/repos/bot/proj/pulls" "{\"head\":\"feature\",\"base\":\"main\"}") app
   checkEq "a comment on the job's own issue"
-    (api "POST" "/repos/up/proj/issues/7/comments" "{\"body\":\"hi\"}") (some "orchestra-upstream")
-  checkEq "not on another"
-    (api "POST" "/repos/up/proj/issues/8/comments" "{\"body\":\"hi\"}") none
+    (api "POST" "/repos/up/proj/issues/7/comments" "{\"body\":\"hi\"}") pat
+  checkEq "not on another" (api "POST" "/repos/up/proj/issues/8/comments" "{\"body\":\"hi\"}") none
   checkEq "a review that comments"
-    (api "POST" "/repos/up/proj/pulls/7/reviews" "{\"event\":\"COMMENT\",\"body\":\"x\"}")
-    (some "orchestra-upstream")
+    (api "POST" "/repos/up/proj/pulls/7/reviews" "{\"event\":\"COMMENT\",\"body\":\"x\"}") pat
   checkEq "not one that approves"
     (api "POST" "/repos/up/proj/pulls/7/reviews" "{\"event\":\"APPROVE\"}") none
   checkEq "a reply to an inline comment"
-    (api "POST" "/repos/up/proj/pulls/7/comments/99/replies" "{\"body\":\"x\"}")
-    (some "orchestra-upstream")
+    (api "POST" "/repos/up/proj/pulls/7/comments/99/replies" "{\"body\":\"x\"}") pat
   checkEq "a merge without merge_pr" (api "PUT" "/repos/up/proj/pulls/7/merge" "{}") none
   checkEq "the job's pull request labels"
-    (api "POST" "/repos/up/proj/issues/12/labels" "{\"labels\":[\"orchestra\"]}")
-    (some "orchestra-upstream")
+    (api "POST" "/repos/up/proj/issues/12/labels" "{\"labels\":[\"orchestra\"]}") pat
   checkEq "and no others"
     (api "POST" "/repos/up/proj/issues/12/labels" "{\"labels\":[\"orchestra\",\"p-high\"]}") none
   checkEq "creating the job's label"
-    (api "POST" "/repos/up/proj/labels" "{\"name\":\"orchestra\",\"color\":\"ffffff\"}")
-    (some "orchestra-upstream")
+    (api "POST" "/repos/up/proj/labels" "{\"name\":\"orchestra\",\"color\":\"ffffff\"}") pat
   checkEq "not another" (api "POST" "/repos/up/proj/labels" "{\"name\":\"x\"}") none
-  checkEq "editing an issue is nobody's" (api "PATCH" "/repos/up/proj/issues/7" "{\"state\":\"closed\"}") none
+  checkEq "editing an issue is nobody's"
+    (api "PATCH" "/repos/up/proj/issues/7" "{\"state\":\"closed\"}") none
 
-  let triage ← match orchestraToken order (base ++ ["task_tool(\"label_issue\")"]) with
+  let unlabelled ← match orchestraToken ["orchestra-github"]
+      (["task_fork(\"bot\", \"proj\")", "task_upstream(\"up\", \"proj\")",
+        "task_tool(\"create_pr\")"]) with
+    | .ok t => pure t
+    | .error e => do check "a token without label facts can be issued" false e; return ()
+  checkEq "without the label facts no label is allowed at all"
+    (api "POST" "/repos/up/proj/issues/12/labels" "{\"labels\":[\"anything\"]}" (t := unlabelled)) none
+
+  let triage ← match orchestraToken ["orchestra-github"]
+      (["task_fork(\"bot\", \"proj\")", "task_upstream(\"up\", \"proj\")",
+        "task_pr_labels([])", "task_label_any(true)", "task_tool(\"label_issue\")"]) with
     | .ok t => pure t
     | .error e => do check "a triage token can be issued" false e; return ()
   checkEq "with label_issue any label on any issue"
-    (api "POST" "/repos/up/proj/issues/12/labels" "{\"labels\":[\"p-high\"]}" (t := triage))
-    (some "orchestra-triage")
-  checkEq "and removing one"
-    (api "DELETE" "/repos/up/proj/issues/12/labels/p-high" (t := triage)) (some "orchestra-triage")
+    (api "POST" "/repos/up/proj/issues/12/labels" "{\"labels\":[\"p-high\"]}" (t := triage)) pat
+  checkEq "and removing one" (api "DELETE" "/repos/up/proj/issues/12/labels/p-high" (t := triage)) pat
   checkEq "but on the upstream only"
     (api "POST" "/repos/other/proj/issues/12/labels" "{\"labels\":[\"x\"]}" (t := triage)) none
 
-  let merger ← match orchestraToken order (base ++ ["task_tool(\"merge_pr\")"]) with
+  let merger ← match orchestraToken ["orchestra-github"] (base ++ ["task_tool(\"merge_pr\")"]) with
     | .ok t => pure t
     | .error e => do check "a merging token can be issued" false e; return ()
   checkEq "a merge with merge_pr"
-    (api "PUT" "/repos/up/proj/pulls/3/merge" "{\"merge_method\":\"squash\"}" (t := merger))
-    (some "orchestra-upstream")
+    (api "PUT" "/repos/up/proj/pulls/3/merge" "{\"merge_method\":\"squash\"}" (t := merger)) pat
 
-  checkEq "a GraphQL query"
-    (api "POST" "/graphql" "{\"query\":\"query { viewer { login } }\"}") (some "orchestra-fork")
+  checkEq "a GraphQL query, on the App's token"
+    (api "POST" "/graphql" "{\"query\":\"query { viewer { login } }\"}") app
   checkEq "a GraphQL mutation"
-    (api "POST" "/graphql" "{\"query\":\"mutation { addComment(input: {}) { clientMutationId } }\"}")
-    none
+    (api "POST" "/graphql" "{\"query\":\"mutation { addComment(input: {}) { clientMutationId } }\"}") none
   checkEq "a mutation behind a query"
-    (api "POST" "/graphql" "{\"query\":\"query A { a } mutation B { b }\",\"operationName\":\"A\"}")
-    none
-  checkEq "a document nobody can read"
-    (api "POST" "/graphql" "{\"query\":\"mutation\"}") none
-  checkEq "a client's own `$operations` is replaced"
-    (api "POST" "/graphql"
-      "{\"query\":\"mutation { x }\",\"$operations\":[{\"type\":\"query\",\"name\":\"\"}]}") none
-  checkEq "reading the upstream through the API"
-    (api "GET" "/repos/up/proj/pulls/7/comments") (some "orchestra-upstream")
-  checkEq "reading anything else anonymously"
-    (api "GET" "/repos/torvalds/linux") (some "orchestra-public")
-  checkEq "and reads about no repository" (api "GET" "/rate_limit") (some "orchestra-public")
+    (api "POST" "/graphql" "{\"query\":\"query A { a } mutation B { b }\",\"operationName\":\"A\"}") none
+  checkEq "a document nobody can read" (api "POST" "/graphql" "{\"query\":\"mutation\"}") none
+  checkEq "reading the upstream through the API" (api "GET" "/repos/up/proj/pulls/7/comments") pat
+  checkEq "reading anything else anonymously" (api "GET" "/repos/torvalds/linux") anonymous
+  checkEq "and reads about no repository" (api "GET" "/rate_limit") anonymous
   checkEq "an endpoint no route knows" (api "POST" "/user/repos" "{\"name\":\"x\"}") none
 
-  let foreign ← match orchestraToken order base (issuedBy := none) with
+  group "creating a repository"
+  let creator ← match orchestraToken ["orchestra-github"]
+      (base ++ ["task_tool(\"create_repository\")", "task_org(\"bot\")"]) with
     | .ok t => pure t
-    | .error e => do check "a token from elsewhere can be issued" false e; return ()
-  checkEq "a token orchestra did not issue reaches nothing"
-    (allowedBy (choose registry foreign "GET" "github.com"
-      "/leanprover-community/mathlib4.git/info/refs?service=git-upload-pack")) none
+    | .error e => do check "a creating token can be issued" false e; return ()
+  checkEq "creating one in the job's organisation, on the App's token"
+    (api "POST" "/orgs/bot/repos" "{\"name\":\"new-thing\",\"private\":true}" (t := creator)) app
+  checkEq "not elsewhere"
+    (api "POST" "/orgs/up/repos" "{\"name\":\"new-thing\"}" (t := creator)) none
+  checkEq "not with a name GitHub would change"
+    (api "POST" "/orgs/bot/repos" "{\"name\":\"new thing\"}" (t := creator)) none
+  checkEq "not without the tool" (api "POST" "/orgs/bot/repos" "{\"name\":\"new-thing\"}") none
+  checkEq "and before it exists, it cannot be pushed to"
+    (push "bot/new-thing" "refs/heads/main" (t := creator)) none
+  let created := [Facts.fact "created_repository" [.str "bot", .str "new-thing"]]
+  checkEq "once created, the token that made it may push to it"
+    (push "bot/new-thing" "refs/heads/main" (t := creator) (remembered := created)) app
+  let rememberedFacts := manifest.remember
+    { method := "POST", scheme := "https", host := "api.github.com", port := 443
+      path := "/orgs/bot/repos", segments := #["orgs", "bot", "repos"], query := #[]
+      headers := #[], bodyPrefix := ByteArray.empty, bodyComplete := true, bodySize := none }
+    (some (Json.obj [("name", .str "new-thing")]).toValue)
+  checkEq "and what a creation is remembered as"
+    (rememberedFacts.map (·.predicate.name)) ["created_repository"]
+  check "a token cannot claim to have created one"
+    (orchestraToken ["orchestra-github"] ["created_repository(\"bot\", \"x\")"]).toOption.isNone
 
-  group "attenuation applies to every grant"
+  group "credential routes"
+  let routed ← match Policy.Grant.ofToml ((← example? "examples/orchestra/grants/orchestra-github.toml")
+      ++ "\n[[credential_route]]\nresources = [\"up/*\"]\ncredential = \"github/pat-up\"\n\n\
+          [[credential_route]]\nresources = [\"up/special\"]\nanonymous = true\n") with
+    | .ok g => pure g
+    | .error e => do check "a grant with routes loads" false e; return ()
+  checkEq "a route's credential is spendable" (routed.spendable.contains "github/pat-up") true
+  checkEq "an owner route beats the rules"
+    (routed.chooseCredential ["up/proj"] ["github/orchestra-pat"]) (some "github/pat-up")
+  checkEq "an exact route beats an owner route" (routed.chooseCredential ["up/special"] []) none
+  checkEq "the rules choose where no route matches"
+    (routed.chooseCredential ["bot/proj"] ["github/orchestra-app"]) (some "github/orchestra-app")
+  checkEq "a derived credential the grant may not spend is ignored"
+    (routed.chooseCredential ["x/y"] ["github/root"]) none
+  checkEq "and the fallback is the grant's own" (routed.chooseCredential [] []) none
+  check "an organisation is matched by its owner pattern"
+    (Policy.resourceMatch "acme/*" "acme" == some 2)
+
+  group "a credential cannot be chosen from an appended block"
+  -- A bearer can append a block of their own by hand, with facts in it.  Biscuit
+  -- keeps those from satisfying the grant, but they reach the evaluated world, and
+  -- a `use_credential` among them must not pick the credential.
+  let forged ← match orchestraToken ["orchestra-github"] base with
+    | .error e => do check "a token to forge on can be issued" false e; return ()
+    | .ok t =>
+      match BlockBuilder.code {} "use_credential(\"github/orchestra-pat\");" with
+      | .error e => do check "a forged block can be built" false e.toString; return ()
+      | .ok b =>
+        match Biscuit.append t (fixedKey 13) b with
+        | .ok f => pure f
+        | .error e => do check "a forged block can be appended" false e.toString; return ()
+  checkEq "an anonymous read stays anonymous"
+    (api "GET" "/repos/torvalds/linux" (t := forged)) anonymous
+
+  group "attenuation narrows the token"
   let attenuation := "check if operation(\"fetch\") or operation(\"discover\");"
-  let narrowed ← match orchestraToken order (base ++ ["task_tool(\"comment\")"]) |>.bind
+  let narrowed ← match orchestraToken ["orchestra-github"] (base ++ ["task_tool(\"comment\")"]) |>.bind
       (Token.attenuate · attenuation (fixedKey 11)) with
     | .ok n => pure n
     | .error e => do check "a job's token can be attenuated" false e; return ()
   checkEq "a narrowed token may still fetch"
-    (allowedBy (choose registry narrowed "GET" "github.com"
-      "/up/proj.git/info/refs?service=git-upload-pack")) (some "orchestra-upstream")
+    (git "/up/proj.git/info/refs?service=git-upload-pack" (t := narrowed)) pat
   checkEq "and may not comment"
     (api "POST" "/repos/up/proj/issues/7/comments" "{\"body\":\"hi\"}" (t := narrowed)) none
 

@@ -95,6 +95,15 @@ emit  = ['operation("fetch")', 'repository($repo)']
 [[route]]
 match = "GET|POST 127.0.0.1 /echo"
 emit  = ['operation("echo")']
+
+[[route]]
+match = "POST 127.0.0.1 /echo/make/{name}"
+emit  = ['operation("make")', 'thing($name)']
+on_success = ['made($name)']
+
+[[route]]
+match = "GET 127.0.0.1 /echo/thing/{name}"
+emit  = ['operation("get_thing")', 'thing($name)']
 EOF
 
 cat > "$KLEIS_HOME/config/grants/dev.toml" <<'EOF'
@@ -357,6 +366,19 @@ check $? "a request sent with Expect: 100-continue gets its real response" "$(ec
 
 echo
 echo "== issuers and passthrough"
+cat > "$KLEIS_HOME/config/grants/maker.toml" <<'EOF2'
+name         = "maker"
+service      = "demo"
+credential   = "demo/token"
+max_lifetime = "1h"
+
+datalog = '''
+allowed("make") <- operation("make");
+allowed("get") <- operation("get_thing"), thing($n), made($n);
+check if allowed($x);
+allow if grant("maker");
+'''
+EOF2
 cat > "$KLEIS_HOME/config/config.toml" <<EOF2
 listen = "127.0.0.1:$TLS_KLEIS_PORT"
 mode = "connect"
@@ -450,6 +472,24 @@ CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxytunnel \
   --proxy "http://kleis:$PASS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic \
   "http://127.0.0.2:$ORIGIN_PORT/echo" 2>&1)"
 [ "$CODE" != "200" ]; check $? "and not for a host the configuration does not name" "got $CODE"
+
+echo
+echo "== what a token made, it may use"
+MAKER_TOKEN="$("$KLEIS" token issue --grant maker --bearer ci@maker --ttl 1h)"
+MP="http://kleis:$MAKER_TOKEN@127.0.0.1:$TLS_KLEIS_PORT"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "$MP" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo/thing/widget")"
+[ "$CODE" = "403" ]; check $? "a thing the token has not made is refused" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "$MP" --proxy-basic --cacert "$CA" \
+  -X POST "https://127.0.0.1:$TLS_PORT/echo/make/widget")"
+[ "$CODE" = "200" ]; check $? "making it succeeds" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "$MP" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo/thing/widget")"
+[ "$CODE" = "200" ]; check $? "and then the token that made it may use it" "got $CODE"
+OTHER_MAKER="$("$KLEIS" token issue --grant maker --bearer ci@other --ttl 1h)"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "http://kleis:$OTHER_MAKER@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" "https://127.0.0.1:$TLS_PORT/echo/thing/widget")"
+[ "$CODE" = "403" ]; check $? "while another token may not" "got $CODE"
 echo
 echo "== the audit log"
 "$KLEIS" audit verify | grep -q 'chain intact'

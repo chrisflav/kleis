@@ -94,7 +94,9 @@ def reservedPredicates : List String :=
    -- The shipped GitHub manifest's vocabulary, for the same reason.
    "pr_head", "pr_base", "review_event", "review_comment_id", "label_added",
    "label_removed", "label_created", "organization", "new_repository",
-   "repository_private", "graphql_operation"]
+   "repository_private", "graphql_operation", "created_repository",
+   -- How a grant chooses which credential a request is spent on.
+   "use_credential"]
 
 /-- Is a predicate name one an extra fact may not use?  Every `request_*` and
 `body_*` name is reserved along with the list, since those are what the proxy
@@ -196,6 +198,16 @@ partial def termOfJson : Json → Except String Builder.Term
     pure (.set (Builder.mkSet terms))
   | .null => throw "a fact cannot hold null"
   | .obj _ => throw "a fact cannot hold an object"
+
+/-- Write a fact the way `factOfJson` reads it, for the terms a remembered fact
+can hold: strings, integers and booleans.  `none` for anything else. -/
+def factToJson? (f : Builder.Fact) : Option Json := do
+  let terms ← f.predicate.terms.mapM fun t => match t with
+    | .str s => some (Json.str s)
+    | .integer i => some (Json.num (toString i))
+    | .bool b => some (Json.bool b)
+    | _ => none
+  pure (.obj [("name", .str f.predicate.name), ("terms", .arr terms)])
 
 /-- Read a fact from `{"name": "task_repo", "terms": ["o", "r"]}`. -/
 def factOfJson (j : Json) : Except String Builder.Fact := do

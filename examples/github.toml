@@ -19,6 +19,10 @@ modes = ["rewrite", "connect"]
 max_body_facts   = 512
 max_decode_prefix = 1048576
 
+# What a request is about, for routing credentials (a grant's `credential_route`):
+# `owner/repo`, the repository being created, or the organisation.
+resources = ["repository", "new_repository", "organization"]
+
 # Rules deriving what a request means from the primitive and body facts.
 # A manifest may add facts and rules; it may never add a check or a policy.
 datalog = '''
@@ -246,3 +250,6 @@ match = "POST api.github.com /orgs/{org}/repos"
 capture = { name = "body:name", private = "body:private" }
 emit  = ['operation("create_repository")', 'organization($org)',
          'new_repository($org, $name)', 'repository_private($private)']
+# Once GitHub has created it, the token that asked may be let at it: grants
+# read `created_repository` to allow pushing to what a bearer made.
+on_success = ['created_repository($org, $name)']

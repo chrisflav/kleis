@@ -305,11 +305,12 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
 
   -- Decide, one grant at a time.
   let revocations ← ctx.revocations.get
+  let remembered ← ctx.memory.factsFor job.token
   let choice := Policy.choose grants fun grant => {
     request
     body := Policy.Body.classify decoder.configured (job.wire.framing != .empty) decoded
     manifest, grant, token := job.token, revoked := revocations.ids
-    now, clientIp := job.clientIp, requestId }
+    now, clientIp := job.clientIp, requestId, remembered }
   let grant := choice.grant
   let outcome := choice.outcome
 
@@ -337,7 +338,7 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
     -- Attach the credential.  This is the only place a secret is read, and it
     -- needs the value the authorizer produced.
     let outgoing ← try
-        match grant.credential with
+        match authorized.credential with
         | some credentialName =>
           if manifest.mayCredentialReach request.host then do
             let some credentialRecord ← Credential.load? credentialName
@@ -354,8 +355,9 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
             -- proxied without it, rather than refused: the request is still the
             -- client's to make, it just does not get to spend anything.
             pure (Credential.stripOnly authorized)
-        -- An anonymous grant forwards what the client sent, minus anything
-        -- that could carry a credential of its own.
+        -- A grant that chose no credential for this request — an anonymous
+        -- grant, or a route to none — forwards what the client sent, minus
+        -- anything that could carry a credential of its own.
         | none => pure (Credential.stripOnly authorized)
       catch e => do
         refuse job.client 502 requestId s!"the credential could not be obtained: {e}"
@@ -372,6 +374,13 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
           ctx.audit.append { auditRecord with outcome := s!"upstream failure: {e}" }
         return false
 
+    -- What a route asked to be remembered once this succeeded: the repository a
+    -- token created, so that the same token may push to it next.  Only on a 2xx,
+    -- so a creation GitHub refused leaves nothing behind.
+    if let some s := status then
+      if 200 ≤ s && s < 300 then
+        let facts := manifest.remember request decoded
+        if !facts.isEmpty then ctx.memory.add job.token facts
     if ctx.config.audit then ctx.audit.append { auditRecord with status }
     -- The client's connection carries another request when this one ended
     -- where its framing said; a refusal always closes it (`Http.simpleResponse`).
