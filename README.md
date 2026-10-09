@@ -76,8 +76,8 @@ whose decoder is four lines of Python.
 
 ```sh
 lake build          # the library, `kleis` and `kleisd`
-lake test           # 213 checks: crypto vectors, decoders, policy, TLS
-./scripts/integration.sh   # 32 checks: a real git push and clone through a daemon
+lake test           # 291 checks: crypto vectors, decoders, policy, TLS
+./scripts/integration.sh   # 50 checks: real git and curl through a daemon
 ```
 
 Needs OpenSSL headers (`libssl-dev`) for the TLS shim, and `git`, `curl` and
@@ -122,6 +122,7 @@ kleis service          list and inspect manifests
 kleis grant            list and inspect grants
 kleis credential       install, list and remove credentials
 kleis token            issue, attenuate, inspect, list and revoke
+kleis issuer           list issuers, and mint an issuer's credential
 kleis audit            tail the log, or verify its hash chain
 kleis check            run a request against a policy without a proxy
 kleisd                 the daemon
@@ -135,6 +136,25 @@ kleis check --token "$T" --method POST \
   --url https://api.github.com/repos/chrisflav/kleis/pulls/7/reviews \
   --content-type application/json --body '{"event":"APPROVE"}' --facts
 ```
+
+## Tokens for jobs
+
+A token may name several grants, tried in order until one allows the request,
+so one token can cover a git host and an issue tracker, or one host on two
+credentials.  A grant may be `anonymous`, forwarding with no credential at all.
+
+A program that hands out work — an orchestrator, a CI runner — is configured as
+an *issuer* and mints a token per job over HTTP, without the root key:
+
+```sh
+curl -H "Authorization: Bearer $ISSUER" -d '{"grants": ["orchestra-fork"], "ttl": "8h",
+  "facts": [{"name": "task_fork", "terms": ["bot", "proj"]}]}' \
+  http://127.0.0.1:8080/.kleis/v1/tokens
+```
+
+It may name only the grants and state only the facts its configuration allows,
+and revoke only what it issued; a revocation takes effect at once.
+`examples/orchestra/` is a complete setup for an agent orchestrator.
 
 ## What is guaranteed, and how
 
