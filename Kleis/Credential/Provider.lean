@@ -200,6 +200,12 @@ def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : 
     IO Secret := do
   let now ← Store.now
   let key := cacheKey record.name narrow
+  -- A static secret read from a file is read again each time: the file is the secret's
+  -- home, and a rotation there should take effect on the next request rather than after
+  -- a restart.  What a provider mints from it is still cached — an installation token
+  -- lasts an hour whatever happens to the key it was minted with.
+  if record.secretFile.isSome && record.provider == "static" then
+    return staticSecret (← unlock record)
   let entries ← cache.entries.get
   if let some (_, live) := Array.find? (fun (k, _) => k == key) entries then
     if live.fresh now then return live.secret

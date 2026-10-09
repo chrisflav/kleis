@@ -209,6 +209,7 @@ partial def Context.watch (ctx : Context) (log : String → IO Unit)
     return (← Store.listFiles (← Dirs.services) "toml")
       ++ (← Store.listFiles (← Dirs.grants) "toml")
       ++ (← Store.listFiles (← Dirs.credentials) "json")
+      ++ (← Store.listFiles ((← Dirs.config) / "credentials") "toml")
   let snapshot : IO (List (String × String) × List (String × String)) := do
     return (← reloadSnapshot (← configFiles), ← reloadSnapshot #[← Dirs.revocations])
   let rec loop (last : List (String × String) × List (String × String)) : IO Unit := do

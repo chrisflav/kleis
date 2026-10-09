@@ -490,6 +490,90 @@ OTHER_MAKER="$("$KLEIS" token issue --grant maker --bearer ci@other --ttl 1h)"
 CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "http://kleis:$OTHER_MAKER@127.0.0.1:$TLS_KLEIS_PORT" \
   --proxy-basic --cacert "$CA" "https://127.0.0.1:$TLS_PORT/echo/thing/widget")"
 [ "$CODE" = "403" ]; check $? "while another token may not" "got $CODE"
+
+echo
+echo "== a daemon configured from files, as a NixOS module runs it"
+DECL="$WORK/declared"
+DECL_PORT="$(free_port)"
+mkdir -p "$DECL/home/config/services" "$DECL/home/config/grants" "$DECL/home/config/credentials" "$DECL/secrets" "$DECL/issuers"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DECL/secrets/root_key"
+printf 'file-secret-77' > "$DECL/secrets/demo_token"
+cp "$KLEIS_HOME/config/services/demo.toml" "$DECL/home/config/services/"
+cp "$KLEIS_HOME/config/grants/echo.toml" "$DECL/home/config/grants/"
+sed -i 's|credential   = "demo/token"|credential   = "demo/from-file"|' "$DECL/home/config/grants/echo.toml"
+cat > "$DECL/home/config/credentials/demo.toml" <<EOF2
+name        = "demo/from-file"
+service     = "demo"
+secret_file = "$DECL/secrets/demo_token"
+EOF2
+cat > "$DECL/home/config/config.toml" <<EOF2
+listen = "127.0.0.1:$DECL_PORT"
+mode = "rewrite"
+
+[[issuer]]
+name = "ci"
+grants = ["echo-*"]
+facts = ["job_*"]
+max_ttl = "2h"
+token_file = "$DECL/issuers/ci.token"
+EOF2
+(
+  export KLEIS_HOME="$DECL/home" KLEIS_ROOT_KEY_FILE="$DECL/secrets/root_key"
+  unset KLEIS_STORE_KEY
+  CHECK_OUT="$("$KLEISD" --check 2>&1)"
+  echo "$CHECK_OUT" | grep -q "credential demo/from-file ← $DECL/secrets/demo_token$"
+  check $? "the declared credential is found, and its file"
+  "$KLEISD" > "$DECL/kleisd.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DECL_PORT/" && break
+    sleep 0.1
+  done
+  [ -s "$DECL/issuers/ci.token" ]; check $? "the issuer's credential is written to its file"
+  MODE="$(stat -c %a "$DECL/issuers/ci.token")"
+  [ "$MODE" = "640" ]; check $? "readable by its group and nobody else" "mode $MODE"
+  FIRST="$(cat "$DECL/issuers/ci.token")"
+  OUT="$(curl -s -H "Authorization: Bearer $FIRST" -H 'content-type: application/json' \
+    -d '{"grants":["echo-only"],"ttl":"1h"}' "http://127.0.0.1:$DECL_PORT/.kleis/v1/tokens")"
+  JOB="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"
+  [ -n "$JOB" ]; check $? "and it mints tokens" "$OUT"
+  OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo")"
+  echo "$OUT" | grep -q '"authorization": "Bearer file-secret-77"'
+  check $? "a request spends the credential read from its file" "$OUT"
+  printf 'file-secret-88' > "$DECL/secrets/demo_token"
+  OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo")"
+  echo "$OUT" | grep -q '"authorization": "Bearer file-secret-88"'
+  check $? "and a rotated file is used without a restart" "$OUT"
+  ! grep -rq 'file-secret' "$DECL/home/data" 2>/dev/null
+  check $? "the secret is never copied into kleis's own files"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  "$KLEISD" > "$DECL/kleisd2.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DECL_PORT/" && break
+    sleep 0.1
+  done
+  [ "$(cat "$DECL/issuers/ci.token")" = "$FIRST" ]
+  check $? "a restart keeps a credential that is still good"
+  rm -rf "$DECL/home/data"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  "$KLEISD" > "$DECL/kleisd3.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DECL_PORT/" && break
+    sleep 0.1
+  done
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo")"
+  [ "$CODE" = "200" ]; check $? "with the root key in a file, a token outlives the data directory" "got $CODE"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  # The subshell's counts do not reach the parent; report through a file.
+  echo "$PASS $FAIL" > "$DECL/counts"
+)
+read -r SUB_PASS SUB_FAIL < "$DECL/counts" 2>/dev/null || { SUB_PASS=0; SUB_FAIL=1; }
+PASS=$SUB_PASS; FAIL=$SUB_FAIL
 echo
 echo "== the audit log"
 "$KLEIS" audit verify | grep -q 'chain intact'

@@ -178,6 +178,20 @@ attenuation derived from it.
 The audit log is hash-chained and replayable: authorization is a pure function
 of the facts, and the facts are in the record.
 
+## Running it as a service
+
+`docker/Dockerfile` builds an image with `kleisd` and `kleis` in it, published as
+`ghcr.io/chrisflav/kleis:<commit>` from master.  Configuration is read from
+`/kleis/config` and state kept in `/kleis/data`.  For a deployment whose secrets
+already live somewhere — sops, a Kubernetes secret — nothing needs to be
+installed into kleis's own encrypted store:
+
+- a credential declared in `config/credentials/*.toml` names a `secret_file`, read
+  when the credential is spent, so a rotation needs no restart;
+- `KLEIS_ROOT_KEY_FILE` names the root key, so tokens survive the data directory;
+- an `[[issuer]]` with a `token_file` has kleisd keep that issuer's credential
+  there, renewed at startup before it expires, for an issuer running beside it.
+
 ## Licence
 
 Apache 2.0. See [LICENSE](LICENSE).

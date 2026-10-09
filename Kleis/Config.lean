@@ -58,6 +58,14 @@ structure Issuer where
   /-- The longest a token it issues may live, in seconds.  A grant's own
   `max_lifetime` still applies. -/
   maxTtl : Nat
+  /-- Where kleisd keeps this issuer's own credential, if it should: minted at
+  startup when the file is missing, unreadable, revoked or within a quarter of its
+  lifetime of expiring, and left alone otherwise.  For a deployment where the
+  issuer runs beside kleisd and is handed the file, rather than a person running
+  `kleis issuer token` and pasting the result somewhere. -/
+  tokenFile : Option String := none
+  /-- How long a credential written to `tokenFile` lives, in seconds. -/
+  tokenTtl : Nat := 365 * 86400
   deriving Repr, Inhabited
 
 /-- Does a name match a list of names and `prefix*` patterns? -/
@@ -134,7 +142,12 @@ private def issuerOf (j : Json) : Except String Issuer := do
   for p in facts do
     if p == "*" || p.isEmpty then
       throw s!"the issuer `{name}` may not be allowed every fact; name a prefix such as `task_*`"
-  pure { name, grants := strings "grants", facts, maxTtl }
+  let tokenTtl ← match j.str? "token_ttl" with
+    | none => pure (365 * 86400)
+    | some d => match Policy.parseDuration? d with
+      | some n => pure n
+      | none => throw s!"`{d}` is not a duration"
+  pure { name, grants := strings "grants", facts, maxTtl, tokenFile := j.str? "token_file", tokenTtl }
 
 /-- Read a configuration from TOML. -/
 def Config.ofToml (source : String) : Except String Config := do

@@ -37,8 +37,19 @@ def main (argv : List String) : IO UInt32 := do
         Proxy.log s!"kleisd:   {m.name} → {String.intercalate ", " m.hosts}"
       for g in registry.grants do
         Proxy.log s!"kleisd:   grant {g.name} → {g.service} via {g.credentialLabel}"
+      -- A declared credential whose file is missing is reported now rather than when a
+      -- request first needs it.
+      for r in ← Credential.list do
+        if let some file := r.secretFile then
+          let present ← System.FilePath.pathExists file
+          Proxy.log s!"kleisd:   credential {r.name} ← {file}{if present then "" else " (MISSING)"}"
       Proxy.log "kleisd: configuration is loadable"
       return 0
+    -- The issuers whose credentials this daemon keeps for them; see `Issuer.tokenFile`.
+    let registry ← ctx.registry.get
+    for issuer in config.issuers do
+      if let some path ← Token.ensureIssuerToken registry issuer then
+        Proxy.log s!"kleisd: minted the credential of issuer `{issuer.name}` into {path}"
     Proxy.serve ctx
     return 0
   catch e => fail (toString e)

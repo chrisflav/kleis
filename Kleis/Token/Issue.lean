@@ -31,8 +31,27 @@ open LeanBiscuit.Token
 /-- Where the root private key lives. -/
 def rootKeyPath : IO System.FilePath := do return (← Dirs.data) / "root.key"
 
-/-- Load the root key, generating one on first use. -/
+/-- Load the root key, generating one on first use.
+
+Or from `$KLEIS_ROOT_KEY_FILE`, for a deployment that keeps it with its other
+secrets — 32 bytes, raw or as 64 hex characters — so that it survives the data
+directory being lost, and every token issued before a reinstall still verifies
+after it.  A file named there that is missing or malformed is an error rather
+than a reason to generate a new key: a fresh root key would silently invalidate
+every token in circulation. -/
 def loadOrCreateRootKey : IO PrivateKey := do
+  if let some file ← IO.getEnv "KLEIS_ROOT_KEY_FILE" then
+    let some raw ← Store.readBin? file
+      | throw (IO.userError s!"KLEIS_ROOT_KEY_FILE names `{file}`, which is not there")
+    let text := (Bytes.toStringLossy raw).trimAscii.toString
+    let bytes ← match Bytes.ofHex? text with
+      | some b => if b.size == 32 then pure b
+                  else throw (IO.userError s!"`{file}` is not a 32 byte key")
+      | none => if raw.size == 32 then pure raw
+                else throw (IO.userError s!"`{file}` is neither 32 bytes nor 64 hex characters")
+    return ← match PrivateKey.ofBytes .ed25519 bytes with
+      | .ok k => pure k
+      | .error e => throw (IO.userError s!"the root key is unusable: {e.toString}")
   let path ← rootKeyPath
   let bytes ← match ← Store.readBin? path with
     | some b => pure b

@@ -46,6 +46,9 @@ structure Record where
   nonce : String
   /-- The encrypted material, hex. -/
   ciphertext : String
+  /-- For a credential declared in the configuration rather than installed: the file its
+  material is read from, each time it is needed.  Empty `nonce` and `ciphertext`. -/
+  secretFile : Option String := none
   deriving Inhabited
 
 /-- Render a record as JSON. -/
@@ -114,8 +117,43 @@ def save (name service provider : String) (config : Json) (material : Secret) : 
   let record := { skeleton with ciphertext := Bytes.toHex sealed }
   Store.writeSecret (← pathOf name) (Bytes.ofString (Json.render record.toJson))
 
+/-- Credentials declared in `$KLEIS_HOME/config/credentials/*.toml`, whose material
+is a file kleis reads rather than ciphertext it holds:
+
+```toml
+name        = "github/orchestra-pat"
+service     = "github"
+provider    = "static"
+secret_file = "/run/secrets/kleis_github_pat"
+[config]                  # provider settings, as for `kleis credential add --config`
+```
+
+This is for a deployment whose secrets already have a home — sops on NixOS, a
+Kubernetes secret, a systemd credential — where a second, encrypted copy in
+kleis's own store would be one more thing to rotate and one more place for the
+two to disagree.  The file is read when the credential is spent, so a rotation
+needs no restart; it is never copied anywhere kleis writes. -/
+def declared : IO (Array Record) := do
+  let dir := (← Dirs.config) / "credentials"
+  let mut out : Array Record := #[]
+  for f in ← Store.listFiles dir "toml" do
+    let text ← IO.FS.readFile f
+    match Toml.parse text with
+    | .error e => throw (IO.userError s!"{f}: {e}")
+    | .ok j =>
+      let some name := j.str? "name" | throw (IO.userError s!"{f}: a credential needs a `name`")
+      let some service := j.str? "service"
+        | throw (IO.userError s!"{f}: a credential needs a `service`")
+      let some secretFile := j.str? "secret_file"
+        | throw (IO.userError s!"{f}: a declared credential needs a `secret_file`")
+      out := out.push { name, service, provider := (j.str? "provider").getD "static"
+                        config := (j.field? "config").getD (.obj []), created := 0
+                        nonce := "", ciphertext := "", secretFile := some secretFile }
+  return out
+
 /-- Read a record without decrypting it. -/
 def load? (name : String) : IO (Option Record) := do
+  if let some r := (← declared).find? (·.name == name) then return some r
   match ← Store.read? (← pathOf name) with
   | none => return none
   | some text =>
@@ -123,10 +161,10 @@ def load? (name : String) : IO (Option Record) := do
     | .ok r => return some r
     | .error e => throw (IO.userError s!"the credential `{name}` is corrupt: {e}")
 
-/-- Every installed credential. -/
+/-- Every credential, declared and installed. -/
 def list : IO (Array Record) := do
   let files ← Store.listFiles (← Dirs.credentials) "json"
-  let mut out : Array Record := #[]
+  let mut out : Array Record := ← declared
   for f in files do
     if let some text ← Store.read? f then
       if let .ok r := Json.parse text >>= fun j => Record.ofJson j then
@@ -139,6 +177,10 @@ A failure here is reported as a bad master key rather than a bad file: those
 are the same event from the daemon's point of view, and guessing which it was
 would be telling an attacker whether a key was close. -/
 def unlock (r : Record) : IO Secret := do
+  if let some path := r.secretFile then
+    match ← Store.readBin? path with
+    | some bytes => return Secret.ofBytes bytes
+    | none => throw (IO.userError s!"the credential `{r.name}` reads `{path}`, which is not there")
   let key ← masterKey
   let some nonce := Bytes.ofHex? r.nonce
     | throw (IO.userError s!"the credential `{r.name}` has a malformed nonce")

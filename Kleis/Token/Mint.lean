@@ -1,5 +1,6 @@
 import Kleis.Service.Registry
 import Kleis.Token.Revocation
+import Kleis.Config
 
 /-!
 # Minting a token, from a person or from an issuer
@@ -66,6 +67,34 @@ def mint (registry : Service.Registry) (r : MintRequest) :
   | .ok (token, record) =>
     recordIssued record
     return .ok (token, record)
+
+/-- Keep an issuer's credential in its `token_file`: leave a good one alone, mint a
+new one otherwise.  "Good" is a token for this issuer that verifies against the
+current root key, is not revoked, and is further from its expiry than a quarter
+of `token_ttl` — so a long-running deployment renews it at a restart well before
+it lapses, rather than finding out when the issuer is refused.
+
+Written 0640, so that the one other account meant to read it can do so through
+the group of the directory it is in, and nothing else can. -/
+def ensureIssuerToken (registry : Service.Registry) (issuer : Issuer) : IO (Option String) := do
+  let some path := issuer.tokenFile | return none
+  let now ← Store.now
+  let root ← rootPublicKey
+  let revoked := (← loadRevocations).ids
+  if let some text ← Store.read? path then
+    if let .ok t := parse text root then
+      if issuerOf? t == some issuer.name then
+        let ids := (Biscuit.revocationIdentifiers t).map Bytes.toHex
+        if !ids.any revoked.contains then
+          if let some record ← findIssuedExactly? (ids.headD "") then
+            if record.expires > now + issuer.tokenTtl / 4 then return none
+  match ← mint registry { grants := [], bearer := s!"issuer:{issuer.name}"
+                          ttl := issuer.tokenTtl, issuer := some issuer.name } with
+  | .error e => throw (IO.userError s!"could not mint the credential of issuer `{issuer.name}`: {e}")
+  | .ok (token, _) =>
+    if let some parent := (System.FilePath.mk path).parent then IO.FS.createDirAll parent
+    Store.writeWithMode path (Bytes.ofString (print token ++ "\n")) "640"
+    return some path
 
 end Token
 end Kleis

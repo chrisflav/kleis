@@ -42,6 +42,16 @@ def writeSecret (p : System.FilePath) (contents : Bytes) : IO Unit := do
   IO.FS.writeBinFile tmp contents
   IO.FS.rename tmp p
 
+/-- Write a file atomically with the given mode, which it has from the moment it
+is created: for a secret meant to be shared with one other account through a
+group, which `writeSecret`'s owner-only mode would keep from it. -/
+def writeWithMode (p : System.FilePath) (contents : Bytes) (mode : String) : IO Unit := do
+  let tmp := System.FilePath.mk (p.toString ++ ".tmp")
+  IO.FS.writeBinFile tmp ByteArray.empty
+  restrict tmp mode
+  IO.FS.writeBinFile tmp contents
+  IO.FS.rename tmp p
+
 /-- Write a file atomically, without restricting it: for things that are not
 secret and that other tools may want to read, such as the CA certificate. -/
 def writePublic (p : System.FilePath) (contents : String) : IO Unit := do
