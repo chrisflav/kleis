@@ -91,6 +91,9 @@ structure Input where
   clientIp : String
   /-- This request's identifier, for the audit log. -/
   requestId : String
+  /-- Facts remembered for this token from earlier requests that succeeded — a
+  repository it created — asserted as the authorizer's own. -/
+  remembered : List Facts.Fact := []
   deriving Inhabited
 
 /-- The outcome of a decision. -/
@@ -120,6 +123,9 @@ structure AuthorizedRequest where
   policy : Nat
   /-- Whether a matching route asked for the response to be checked. -/
   responseGated : Bool
+  /-- The credential to spend, or `none` to forward without one, as the grant
+  chose it (`Grant.chooseCredential`). -/
+  credential : Option String
 
 /-- Everything a decision produced, for the audit log and for the client. -/
 structure Outcome where
@@ -157,6 +163,7 @@ def assemble (i : Input) : AuthorizerBuilder :=
       ++ Facts.ambient i.now i.clientIp i.requestId
       ++ bodyFacts i.body i.manifest.maxBodyFacts
       ++ i.manifest.contribute i.request bodyValue
+      ++ i.remembered
       ++ i.grant.facts
   -- Two guards the authorizer imposes rather than leaving to the grant.  Both
   -- are checks rather than policies, because a check is order-independent: it
@@ -185,6 +192,23 @@ def assemble (i : Input) : AuthorizerBuilder :=
     externs := standard
     limits := {} }
 
+/-- The credentials the evaluation derived with `use_credential(name)`, from
+facts whose every origin is trusted: the authorizer — grant and manifest — and
+the token's authority block.
+
+The origin matters.  A bearer can append blocks of their own, and while biscuit
+keeps the facts and rules in them from satisfying the authorizer's checks, they
+still appear in the evaluated world: a block saying `use_credential("admin")`
+would otherwise pick the credential its request went out on. -/
+def derivedCredentials (dump : LeanBiscuit.Token.Authorizer.WorldDump) : List String :=
+  dump.facts.flatMap fun (origins, facts) =>
+    if !origins.all (fun o => o == none || o == some 0) then []
+    else facts.filterMap fun f =>
+      let pre := "use_credential(\""
+      if f.startsWith pre && f.endsWith "\")" then
+        some ((f.drop pre.length).dropEnd 2).toString
+      else none
+
 /-- Decide.
 
 The revocation check comes first and does not involve datalog: a revoked token
@@ -211,10 +235,13 @@ def run (i : Input) : Outcome :=
         { decision := .deny (TokenError.toString e) (failedChecks e)
           facts, revocationIds, authorized := none }
       | .ok policy =>
+        let resources := i.manifest.resourcesOf
+          (i.manifest.contribute i.request i.body.value? ++ i.remembered)
+        let credential := i.grant.chooseCredential resources (derivedCredentials dump)
         { decision := .allow policy
           facts, revocationIds
           authorized := some (AuthorizedRequest.mk i.request i.manifest i.grant policy
-            (i.manifest.gatesResponse i.request i.body.value?)) }
+            (i.manifest.gatesResponse i.request i.body.value?) credential) }
 
 /-- Was this allowed? -/
 def Outcome.allowed (o : Outcome) : Bool :=

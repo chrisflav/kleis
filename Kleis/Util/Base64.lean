@@ -47,6 +47,12 @@ private def valueOf? (c : Char) : Option Nat :=
   else if c == '/' then some 63
   else none
 
+/-- Encode as base64url without padding, as a JSON Web Token wants. -/
+def encodeUrl (b : Bytes) : String :=
+  String.ofList ((encode b).toList.filterMap fun c =>
+    if c == '+' then some '-' else if c == '/' then some '_'
+    else if c == '=' then none else some c)
+
 /-- Decode, tolerating missing padding and whitespace. -/
 def decode? (s : String) : Option Bytes := do
   let digits := s.toList.filter fun c => c != '=' && c != '\n' && c != '\r' && c != ' '

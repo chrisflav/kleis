@@ -40,7 +40,10 @@ handful of things on the code side of it are.
 ## Non-goals
 
 - Not a general egress firewall. It gates requests that spend *a credential it
-  holds*; traffic it has no credential for is refused, not proxied anonymously.
+  holds*; a host no manifest claims is refused, unless the configuration names
+  it for `passthrough`, in which case it is a blind tunnel and nothing more.
+  An anonymous grant (§4.6) is the one way a claimed host is reached without a
+  credential, and it is still a grant: something somebody wrote down.
 - Not a secret manager for humans. Secrets go in, they do not come out.
 - No attempt to defeat certificate pinning. A client that pins cannot be
   intercepted, and the answer is to use the non-intercepting mode for it.
@@ -354,6 +357,77 @@ attenuation of it, which is the behaviour you want when a laptop is lost.
 Grants carry a maximum token lifetime, enforced as an authority-block check
 (`check if time($t), $t < <expiry>`) rather than trusted to the server clock
 alone.
+
+A revocation reaches the running daemon without a restart: it watches the
+revocation list, and the manifests, grants and credentials, and reloads when one
+changes — keeping the configuration it has if the new one does not load.  A
+revocation made through an issuer (§4.7) is applied in memory at once.
+
+### 4.6 Which credential a request is spent on
+
+Whether a request is allowed and which credential it goes out on are two
+questions, answered in that order and by the same grant.  The grant decides the
+first.  For the second it may name several credentials, and choose among them
+per request:
+
+1. **Routes by resource.**  A manifest says what a request is *about* —
+   `resources = ["repository", "organization"]` on GitHub, read as `owner/repo`
+   or `owner`.  A grant's `[[credential_route]]` maps resource patterns
+   (`owner/repo`, `owner/*`, `*`) to a credential, and the most specific match
+   wins.  This is the operator's word on a resource — "the `acme` repositories
+   are reached with acme's token" — so it comes first.
+2. **A credential the grant derives.**  `use_credential("name") <- …` in the
+   grant's datalog, for what a pattern cannot say: "whatever this bearer's
+   upstream is", or "GraphQL, which is about no repository".  Only a name the
+   grant lists as spendable counts, and only a fact derived from the authorizer
+   and the token's authority block: a bearer can append a block holding
+   `use_credential(…)`, and while biscuit keeps it from satisfying the grant's
+   checks it would otherwise reach the evaluated world.  A manifest may not
+   derive it either.
+3. **The fallback**: the grant's `credential`, or none for `anonymous = true` —
+   what the grant allows and nothing routes, such as a public clone, read
+   without spending anybody's token.
+
+The choice is made once, after a single evaluation, and recorded in the audit
+log.
+
+A token may still name several grants, for a bearer that works across services
+— a git host and an issue tracker on one token.  They are tried one at a time,
+in the token's order, and the first that allows decides (`Kleis.Policy.Select`);
+they are never merged, since a check in one would then constrain requests the
+other was written for.  For one service, one grant with routes is the better
+shape: one decision, and a credential chosen rather than found by trying.
+
+### 4.6a What a bearer made
+
+Some permissions only make sense after the fact: a bearer allowed to create a
+repository should then be allowed to push to *that* repository, whose name
+nobody knew when the token was issued.  A route may say what to remember when
+its request succeeds — `on_success = ['created_repository($org, $name)']` — and
+after a 2xx the proxy keeps those facts for the token, filed under its authority
+block's revocation id (shared by every attenuation of it), and asserts them on
+its later requests.  A grant then allows pushing where `created_repository`
+holds.  The facts come from the manifest's templates and the request's captures,
+never from the bearer, and no issuer may state them.
+
+### 4.7 Issuers
+
+A system that hands out work — an agent orchestrator, a CI runner — needs a
+token per job, and should not hold the root key to make one.  An **issuer** is
+configured in `config.toml` with the grants it may name, the fact predicates it
+may state, and the longest a token may live.  Its credential is a biscuit with
+`issuer(name)` and no grant; it presents that to `POST /.kleis/v1/tokens` and
+gets back a token carrying `issued_by(name)` and the facts it asked for, and it
+may revoke what it issued through `POST /.kleis/v1/revoke`.
+
+The facts are the dangerous part.  A fact in the authority block is believed by
+every grant, so a token stating `repository("o", "r")` would satisfy every
+repository check.  An issuer may therefore only use the predicate names its
+configuration lists — `task_*`, say — and the names the proxy and the shipped
+manifests give meaning to are refused whatever it lists
+(`Token.reservedPredicates`).  The grants are then written over those facts:
+`check if repository($o, $r), task_fork($o, $r)` means "the job's own fork" for
+every job, and a job's token says only which job it is.
 
 ## 5. Credentials
 
@@ -762,17 +836,23 @@ M1 through M4 of the original plan are implemented and exercised by
 | Rewrite mode (§6.1) | done |
 | `CONNECT` interception (§6.2) | done — local CA, per-SNI leaves, TLS both sides |
 | Transparent mode (§6.3) | not implemented; the same code path minus `CONNECT` |
-| Decoders: `json`, `form`, `multipart`, `git-receive-pack`, `git-upload-pack` | done |
+| Decoders: `json`, `graphql`, `form`, `multipart`, `git-receive-pack`, `git-upload-pack` | done; a binding may be limited to a route |
 | `exec` decoder | done — a CSV service with a four-line Python decoder is in the tests |
 | Primitive facts, body flattening, routes, manifest rules (§3) | done |
 | Grants, checks, policies, externs, revocation (§4) | done |
 | `Secret`, host confinement, injection (§5) | done |
-| Providers: `static`, `exec`, `oauth2`, `github-app` | done |
+| Providers: `static`, `exec`, `oauth2`, `github-app` | done; `github-app` signs its own JWT from the App's PEM key |
+| Credential routing by resource and by grant rules, anonymous fallback (§4.6) | done |
+| Facts remembered from successful requests (§4.6a) | done |
+| Several grants per token | done |
+| Issuers: `/.kleis/v1/tokens` and `/revoke` (§4.7) | done |
+| Passthrough for hosts no manifest claims | done: blind, audited tunnels, opt-in per host pattern |
+| Reload on change | done: revocations, manifests, grants, credentials |
 | Token issue / attenuate / inspect / revoke (§9) | done |
 | Hash-chained audit log with `kleis audit verify` (§9.3) | done |
 | Streaming request and response relay (§8) | done |
 | Response facts and transforms (§8) | **not implemented**; `response_gated` is parsed and the seam is in place |
-| Connection reuse | not implemented: one request per upstream connection |
+| Connection reuse | done: client keep-alive, pooled origin connections retried once if dead |
 | The proofs (§10.3, §10.4, §10.5) | **not attempted**; see below |
 
 The cryptography is checked against published vectors — RFC 8439 for
@@ -805,9 +885,6 @@ arranged for it: the decision is a pure function of its inputs.
 it yet. This is what "you may fetch, but only see branch X" needs, and it means
 rewriting the ref advertisement of `GET /info/refs`.
 
-**Connection reuse.** Each request opens a connection to the origin and closes
-it. Correct, and slower than it should be for a clone.
-
 **Transparent interception.** Netfilter redirect plus SNI, for sandboxes that
 must not be able to opt out. The open question below about identity is the
 reason it is not done rather than the plumbing.
@@ -826,9 +903,6 @@ is deliberately neutral enough to accept it later.
   bounded world. A large JSON body that is *mostly* irrelevant will truncate;
   manifests may need to declare which body paths to flatten, at the cost of one
   more thing in the manifest.
-- **Grant composition.** Two grants over one credential: union of policies, or
-  must the bearer pick one per request? Union is friendlier and much harder to
-  reason about. Leaning towards one grant per token.
 - **Third-party blocks.** Biscuit supports blocks signed by another key, so a
   service could attest facts about the bearer (a CI system vouching for the
   commit being pushed). Attractive and entirely out of scope for v1, but the

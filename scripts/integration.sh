@@ -25,10 +25,11 @@ bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '  
 check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
 
 cleanup() {
+  [ -n "${DECL_PID:-}" ] && kill "$DECL_PID" 2>/dev/null
   [ -n "${KLEISD_PID:-}" ] && kill "$KLEISD_PID" 2>/dev/null
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
   [ -n "${TLS_ORIGIN_PID:-}" ] && kill "$TLS_ORIGIN_PID" 2>/dev/null
-  rm -rf "$WORK"
+  [ -n "${KEEP_WORK:-}" ] && echo "work kept in $WORK" || rm -rf "$WORK"
 }
 trap cleanup EXIT
 
@@ -68,6 +69,8 @@ ref_update($ref) <-
 [credential]
 provider = "static"
 hosts    = ["127.0.0.1"]
+# The test origin speaks plain HTTP; a real service's credential never would.
+allow_plaintext = true
 strip    = ["cookie"]
 
 [[credential.inject]]
@@ -95,6 +98,15 @@ emit  = ['operation("fetch")', 'repository($repo)']
 [[route]]
 match = "GET|POST 127.0.0.1 /echo"
 emit  = ['operation("echo")']
+
+[[route]]
+match = "POST 127.0.0.1 /echo/make/{name}"
+emit  = ['operation("make")', 'thing($name)']
+on_success = ['made($name)']
+
+[[route]]
+match = "GET 127.0.0.1 /echo/thing/{name}"
+emit  = ['operation("get_thing")', 'thing($name)']
 EOF
 
 cat > "$KLEIS_HOME/config/grants/dev.toml" <<'EOF'
@@ -264,11 +276,19 @@ git config --global http.extraHeader "Proxy-Authorization: Bearer $DEV_TOKEN"
 
 echo
 echo "== revocation"
-REV="$("$KLEIS" token list | head -1 | cut -f1)"
+REVOKE_TOKEN="$("$KLEIS" token issue --grant echo-only --bearer ci@revoke --ttl 1h)"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $REVOKE_TOKEN" "$BASE/echo")"
+[ "$CODE" = "200" ]; check $? "a token that will be revoked works first" "got $CODE"
+REV="$("$KLEIS" token inspect --token "$REVOKE_TOKEN" | sed -n '/revocation ids:/{n;p}' | tr -d ' ')"
 "$KLEIS" token revoke "$REV" >/dev/null
 check $? "revoke a token"
-CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Proxy-Authorization: Bearer $DEV_TOKEN" "$BASE/echo")"
-[ "$CODE" = "403" ]; check $? "a revoked token is refused" "got $CODE"
+# The daemon notices the revocation list changed within its few-second poll.
+for _ in $(seq 20); do
+  CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Proxy-Authorization: Bearer $REVOKE_TOKEN" "$BASE/echo")"
+  [ "$CODE" = "403" ] && break
+  sleep 0.5
+done
+[ "$CODE" = "403" ] && grep -q revoked "$WORK/body"; check $? "a revoked token is refused" "got $CODE: $(cat "$WORK/body")"
 
 echo
 echo "== interception: real https URLs through CONNECT"
@@ -335,6 +355,283 @@ git push origin main > "$WORK/push-tls-main.log" 2>&1
 if [ $? -ne 0 ]; then ok "and main is still refused over https"; else bad "and main is still refused over https" "it succeeded"; fi
 enter "$ROOT"
 
+echo
+echo "== connection reuse"
+# Two requests in one curl: the second goes on the same connection to the
+# proxy, through the same tunnel, when the first ended where its framing said.
+OUT="$(curl -s -o /dev/null -o /dev/null --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" -w '%{num_connects}\n' \
+  "https://127.0.0.1:$TLS_PORT/echo" "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
+[ "$(echo "$OUT" | tail -1)" = "0" ]
+check $? "a second request reuses the connection" "$OUT"
+
+# A body sent with `Expect: 100-continue`, as git does for a large push: the
+# origin's interim response must not be taken for the answer.
+head -c 200000 /dev/zero | tr '\0' 'x' > "$WORK/big"
+OUT="$(curl -s --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" -H "Expect: 100-continue" -H "Content-Type: application/octet-stream" \
+  --data-binary @"$WORK/big" \
+  -w '\n%{http_code}' "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
+[ "$(echo "$OUT" | tail -1)" = "200" ] && echo "$OUT" | grep -q '"method": "POST"'
+check $? "a request sent with Expect: 100-continue gets its real response" "$(echo "$OUT" | tail -c 300)"
+
+echo
+echo "== issuers and passthrough"
+cat > "$KLEIS_HOME/config/grants/maker.toml" <<'EOF2'
+name         = "maker"
+service      = "demo"
+credential   = "demo/token"
+max_lifetime = "1h"
+
+datalog = '''
+allowed("make") <- operation("make");
+allowed("get") <- operation("get_thing"), thing($n), made($n);
+check if allowed($x);
+allow if grant("maker");
+'''
+EOF2
+cat > "$KLEIS_HOME/config/config.toml" <<EOF2
+listen = "127.0.0.1:$TLS_KLEIS_PORT"
+mode = "connect"
+upstream_ca_file = "$WORK/origin.crt"
+passthrough = ["localhost"]
+# The test origin is on the loopback and an arbitrary port, which passthrough
+# refuses unless told otherwise.
+passthrough_ports = [$ORIGIN_PORT]
+passthrough_internal = true
+
+[[issuer]]
+name = "ci"
+grants = ["echo-*"]
+facts = ["job_*"]
+max_ttl = "2h"
+EOF2
+kill "$KLEISD_PID" 2>/dev/null; wait "$KLEISD_PID" 2>/dev/null
+"$KLEISD" > "$WORK/kleisd-issuer.log" 2>&1 &
+KLEISD_PID=$!
+for _ in $(seq 50); do
+  curl -s -o /dev/null "http://127.0.0.1:$TLS_KLEIS_PORT/" && break
+  sleep 0.1
+done
+ADMIN="http://127.0.0.1:$TLS_KLEIS_PORT/.kleis/v1"
+
+ISSUER="$("$KLEIS" issuer token ci --ttl 1d)"
+check $? "mint an issuer's credential"
+OUT="$(curl -s -H "Authorization: Bearer $ISSUER" -H 'content-type: application/json' \
+  -d '{"grants":["echo-only"],"bearer":"job-1","ttl":"1h","facts":[{"name":"job_id","terms":["1"]}]}' \
+  "$ADMIN/tokens")"
+JOB_TOKEN="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"
+JOB_REV="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["revocation_ids"][0])' 2>/dev/null)"
+[ -n "$JOB_TOKEN" ]; check $? "the issuer mints a token" "$OUT"
+"$KLEIS" token inspect --token "$JOB_TOKEN" | grep -q 'issued_by("ci")'
+check $? "which says who issued it" "$("$KLEIS" token inspect --token "$JOB_TOKEN")"
+OUT="$(curl -s --proxy "http://kleis:$JOB_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
+echo "$OUT" | grep -q '"authorization": "Bearer upstream-secret-42"'
+check $? "and the token spends its grant" "$OUT"
+
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' -d '{"grants":["dev-only"]}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "an issuer cannot name a grant outside its list" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' \
+  -d '{"grants":["echo-only"],"facts":[{"name":"operation","terms":["echo"]}]}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "nor state a fact the proxy gives meaning to" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' -d '{"grants":["echo-only"],"ttl":"3h"}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "nor outlive its maximum" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $JOB_TOKEN" \
+  -H 'content-type: application/json' -d '{"grants":["echo-only"]}' "$ADMIN/tokens")"
+[ "$CODE" = "403" ]; check $? "and a bearer's token is not an issuer's" "got $CODE"
+
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' -d "{\"revocation_id\":\"$JOB_REV\"}" "$ADMIN/revoke")"
+[ "$CODE" = "200" ]; check $? "the issuer revokes what it issued" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' \
+  --proxy "http://kleis:$JOB_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo")"
+[ "$CODE" = "403" ] && grep -q revoked "$WORK/body"
+check $? "and the token stops working at once" "got $CODE: $(cat "$WORK/body")"
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Authorization: Bearer $ISSUER" \
+  -H 'content-type: application/json' \
+  -d "{\"revocation_id\":\"$("$KLEIS" token inspect --token "$TLS_TOKEN" | sed -n '/revocation ids:/{n;p}' | tr -d ' ')\"}" \
+  "$ADMIN/revoke")"
+[ "$CODE" = "403" ]; check $? "but not what somebody else issued" "got $CODE: $(cat "$WORK/body")"
+
+# A revocation made at the command line reaches the running daemon too.
+ECHO_REV="$("$KLEIS" token inspect --token "$TLS_ECHO_TOKEN" | sed -n '/revocation ids:/{n;p}' | tr -d ' ')"
+"$KLEIS" token revoke "$ECHO_REV" > /dev/null
+sleep 4
+CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' \
+  --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo")"
+[ "$CODE" = "403" ] && grep -q revoked "$WORK/body"
+check $? "a revocation at the command line reaches the running daemon" "got $CODE: $(cat "$WORK/body")"
+
+PASS_TOKEN="$("$KLEIS" token issue --grant echo-only --bearer ci@pass --ttl 1h)"
+# `localhost` is no manifest's, and the configuration lets it through: a blind
+# tunnel, with nothing injected.
+OUT="$(curl -s --proxytunnel --proxy "http://kleis:$PASS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic "http://localhost:$ORIGIN_PORT/echo" 2>&1)"
+echo "$OUT" | grep -q '"path": "/echo"' && ! echo "$OUT" | grep -q 'upstream-secret-42'
+check $? "a passthrough host is tunnelled without a credential" "$OUT"
+OUT="$(curl -s --proxy "http://kleis:$PASS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic "http://localhost:$ORIGIN_PORT/echo" 2>&1)"
+echo "$OUT" | grep -q '"path": "/echo"' && ! echo "$OUT" | grep -qi 'proxy-authorization'
+check $? "and forwarded without the proxy's header" "$OUT"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxytunnel \
+  --proxy "http://kleis:$JOB_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic \
+  "http://localhost:$ORIGIN_PORT/echo" 2>&1)"
+[ "$CODE" != "200" ]; check $? "but not for a revoked token" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxytunnel \
+  --proxy "http://kleis:$PASS_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic \
+  "http://127.0.0.2:$ORIGIN_PORT/echo" 2>&1)"
+[ "$CODE" != "200" ]; check $? "and not for a host the configuration does not name" "got $CODE"
+
+echo
+echo "== what a token made, it may use"
+MAKER_TOKEN="$("$KLEIS" token issue --grant maker --bearer ci@maker --ttl 1h)"
+MP="http://kleis:$MAKER_TOKEN@127.0.0.1:$TLS_KLEIS_PORT"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "$MP" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo/thing/widget")"
+[ "$CODE" = "403" ]; check $? "a thing the token has not made is refused" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "$MP" --proxy-basic --cacert "$CA" \
+  -X POST "https://127.0.0.1:$TLS_PORT/echo/make/widget")"
+[ "$CODE" = "200" ]; check $? "making it succeeds" "got $CODE"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "$MP" --proxy-basic --cacert "$CA" \
+  "https://127.0.0.1:$TLS_PORT/echo/thing/widget")"
+[ "$CODE" = "200" ]; check $? "and then the token that made it may use it" "got $CODE"
+OTHER_MAKER="$("$KLEIS" token issue --grant maker --bearer ci@other --ttl 1h)"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' --proxy "http://kleis:$OTHER_MAKER@127.0.0.1:$TLS_KLEIS_PORT" \
+  --proxy-basic --cacert "$CA" "https://127.0.0.1:$TLS_PORT/echo/thing/widget")"
+[ "$CODE" = "403" ]; check $? "while another token may not" "got $CODE"
+
+echo
+echo "== a daemon configured from files, as a NixOS module runs it"
+DECL="$WORK/declared"
+DECL_PORT="$(free_port)"
+mkdir -p "$DECL/home/config/services" "$DECL/home/config/grants" "$DECL/home/config/credentials" "$DECL/secrets" "$DECL/issuers"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DECL/secrets/root_key"
+printf 'file-secret-77' > "$DECL/secrets/demo_token"
+cp "$KLEIS_HOME/config/services/demo.toml" "$DECL/home/config/services/"
+cp "$KLEIS_HOME/config/grants/echo.toml" "$DECL/home/config/grants/"
+sed -i 's|credential   = "demo/token"|credential   = "demo/from-file"|' "$DECL/home/config/grants/echo.toml"
+cat > "$DECL/home/config/credentials/demo.toml" <<EOF2
+name        = "demo/from-file"
+service     = "demo"
+secret_file = "$DECL/secrets/demo_token"
+EOF2
+cat > "$DECL/home/config/config.toml" <<EOF2
+listen = "127.0.0.1:$DECL_PORT"
+mode = "rewrite"
+passthrough = ["localhost"]
+
+[[issuer]]
+name = "ci"
+grants = ["echo-*"]
+facts = ["job_*"]
+max_ttl = "2h"
+token_file = "$DECL/issuers/ci.token"
+EOF2
+(
+  export KLEIS_HOME="$DECL/home" KLEIS_ROOT_KEY_FILE="$DECL/secrets/root_key"
+  unset KLEIS_STORE_KEY
+  CHECK_OUT="$("$KLEISD" --check 2>&1)"
+  echo "$CHECK_OUT" | grep -q "credential demo/from-file ← $DECL/secrets/demo_token$"
+  check $? "the declared credential is found, and its file"
+  "$KLEISD" > "$DECL/kleisd.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DECL_PORT/" && break
+    sleep 0.1
+  done
+  [ -s "$DECL/issuers/ci.token" ]; check $? "the issuer's credential is written to its file"
+  MODE="$(stat -c %a "$DECL/issuers/ci.token")"
+  [ "$MODE" = "640" ]; check $? "readable by its group and nobody else" "mode $MODE"
+  FIRST="$(cat "$DECL/issuers/ci.token")"
+  OUT="$(curl -s -H "Authorization: Bearer $FIRST" -H 'content-type: application/json' \
+    -d '{"grants":["echo-only"],"ttl":"1h"}' "http://127.0.0.1:$DECL_PORT/.kleis/v1/tokens")"
+  JOB="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"
+  [ -n "$JOB" ]; check $? "and it mints tokens" "$OUT"
+  OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo")"
+  echo "$OUT" | grep -q '"authorization": "Bearer file-secret-77"'
+  check $? "a request spends the credential read from its file" "$OUT"
+  printf 'file-secret-88' > "$DECL/secrets/demo_token"
+  OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo")"
+  echo "$OUT" | grep -q '"authorization": "Bearer file-secret-88"'
+  check $? "and a rotated file is used without a restart" "$OUT"
+  ! grep -rq 'file-secret' "$DECL/home/data" 2>/dev/null
+  check $? "the secret is never copied into kleis's own files"
+  # Passthrough is confined to public addresses and port 443 unless told otherwise.
+  CODE="$(curl -s -o "$DECL/pt" -w '%{http_code}' --proxy "http://kleis:$JOB@127.0.0.1:$DECL_PORT" \
+    --proxy-basic "http://localhost:443/")"
+  [ "$CODE" != "200" ] && grep -q "does not tunnel to\|could not be reached" "$DECL/pt"
+  check $? "passthrough does not reach the loopback by default" "got $CODE: $(cat "$DECL/pt")"
+  CODE="$(curl -s -o "$DECL/pt" -w '%{http_code}' --proxy "http://kleis:$JOB@127.0.0.1:$DECL_PORT" \
+    --proxy-basic "http://localhost:$ORIGIN_PORT/echo")"
+  [ "$CODE" = "403" ]; check $? "nor a port it was not given" "got $CODE: $(cat "$DECL/pt")"
+  # A request smuggled behind a body: the bytes after it are not relayed, and the
+  # connection is closed rather than left with an answer nobody asked for.
+  python3 - "$DECL_PORT" "$ORIGIN_PORT" "$JOB" > "$DECL/smuggle" <<'PY'
+import socket, sys
+port, origin, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+s = socket.create_connection(("127.0.0.1", port))
+smuggled = f"GET /echo/SMUGGLED HTTP/1.1\r\nHost: 127.0.0.1:{origin}\r\n\r\n"
+s.sendall((f"POST /http/127.0.0.1:{origin}/echo HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Proxy-Authorization: Bearer {token}\r\nContent-Length: 2\r\n\r\nhi" + smuggled).encode())
+s.settimeout(5)
+data = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout:
+    pass
+print(data.decode("latin1"))
+PY
+  [ "$(grep -c '^HTTP/1.1 ' "$DECL/smuggle")" = "1" ] && ! grep -q SMUGGLED "$DECL/smuggle"
+  check $? "bytes behind a body are not relayed as a request" "$(head -c 400 "$DECL/smuggle")"
+  # The next request — another connection, which may be given the pooled one to the
+  # origin — gets its own answer, not one the smuggled request left there.
+  OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo?n=second")"
+  echo "$OUT" | grep -q '"path": "/echo?n=second"' && ! echo "$OUT" | grep -q SMUGGLED
+  check $? "and the next request gets its own answer" "$OUT"
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo%0d%0aX-Injected:%20yes")"
+  [ "$CODE" = "400" ]; check $? "a CR LF in the path is refused" "got $CODE"
+  CODE="$(curl -s --path-as-is -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo/../x")"
+  [ "$CODE" = "400" ]; check $? "and so is a dot segment" "got $CODE"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  "$KLEISD" > "$DECL/kleisd2.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DECL_PORT/" && break
+    sleep 0.1
+  done
+  [ "$(cat "$DECL/issuers/ci.token")" = "$FIRST" ]
+  check $? "a restart keeps a credential that is still good"
+  rm -rf "$DECL/home/data"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  "$KLEISD" > "$DECL/kleisd3.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DECL_PORT/" && break
+    sleep 0.1
+  done
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo")"
+  [ "$CODE" = "200" ]; check $? "with the root key in a file, a token outlives the data directory" "got $CODE"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  # The subshell's counts do not reach the parent; report through a file.
+  echo "$PASS $FAIL" > "$DECL/counts"
+)
+read -r SUB_PASS SUB_FAIL < "$DECL/counts" 2>/dev/null || { SUB_PASS=0; SUB_FAIL=1; }
+PASS=$SUB_PASS; FAIL=$SUB_FAIL
 echo
 echo "== the audit log"
 "$KLEIS" audit verify | grep -q 'chain intact'

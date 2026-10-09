@@ -26,7 +26,7 @@ def jsonDecoder : PureDecoder where
   step := fun buf complete =>
     if !complete then .need (buf.size + 1)
     else match Json.parse (Bytes.toStringLossy buf) with
-      | .ok j => .done j.toValue buf.size
+      | .ok j => if j.hasDuplicateKeys then .opaque else .done j.toValue buf.size
       | .error _ => .opaque
 
 end Wire

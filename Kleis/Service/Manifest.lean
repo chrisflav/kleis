@@ -68,14 +68,34 @@ structure CredentialSpec where
   strip : List String
   /-- Provider-specific settings, passed through untouched. -/
   config : Json
+  /-- Whether the credential may go over plain HTTP.  No by default: a credential
+  sent in the clear to `http://api.github.com` is a credential anyone on the path
+  can read, and the request that asked for that is the bearer's to make, not the
+  credential owner's.  For a local test origin, and little else. -/
+  allowPlaintext : Bool := false
   deriving Inhabited
 
-/-- A media type bound to a decoder. -/
+/-- A media type bound to a decoder, optionally only for the requests one
+pattern matches.
+
+The pattern is what lets a service whose API is mostly one format carve out an
+endpoint that is another wearing the same media type: GitHub's GraphQL endpoint
+takes `application/json` like the rest of its API, and only there is the
+`query` field a document worth reading.  The first binding that applies wins,
+so a narrow one is written above a broad one.
+
+`media = ["*"]` binds a decoder whatever the client says the body is.  That is
+what a route the policy reads the body of needs: a decoder chosen by media type
+is chosen by the client, and a client that labels a JSON body `text/plain` would
+otherwise send it past every check written over the decoded body — when the
+origin parses it as JSON regardless. -/
 structure DecoderBinding where
   /-- The media types this covers. -/
   media : List String
   /-- The decoder's registry name, or `exec:<command>`. -/
   decoder : String
+  /-- The requests it is limited to, if it is. -/
+  when : Option Facts.Pattern := none
   deriving Repr, Inhabited
 
 /-- A service. -/
@@ -102,6 +122,10 @@ structure Manifest where
   maxBodyFacts : Nat
   /-- The largest body prefix a decoder may be given. -/
   maxDecodePrefix : Nat
+  /-- The predicates that say what resource a request is about, in order of
+  preference: `repository` for `repository(owner, repo)`, read as `owner/repo`.
+  A grant routes credentials by these (`Policy.Grant.routes`). -/
+  resourceNames : List String := ["repository"]
   /-- The SHA-256 of the source, hex, recorded in the audit log so a decision
   can be replayed against the manifest that made it. -/
   version : String
@@ -147,7 +171,7 @@ private def routeOf (j : Json) : Except String Facts.Route := do
   -- ground and a template is exactly a fact that is not yet, so the parser
   -- would reject `repository($owner, $repo)` on its own.  A check's query body
   -- is a list of predicates, variables and all, which is what a template is.
-  let emit ← (strings j "emit").mapM fun src =>
+  let template (src : String) : Except String Builder.Fact :=
     let src := Str.stripSuffix (Str.trim src) ";"
     match Parser.parseAuthorizer s!"check if {src};" with
     | .error e => throw s!"in `{src}`: {e}"
@@ -164,7 +188,9 @@ private def routeOf (j : Json) : Except String Facts.Route := do
             | _ => throw s!"`{src}` emits more than one fact; use separate entries"
         | _ => throw s!"`{src}` is not a single fact"
       | _ => throw s!"`{src}` is not a single fact"
-  pure { pattern, captures, emit,
+  let emit ← (strings j "emit").mapM template
+  let onSuccess ← (strings j "on_success").mapM template
+  pure { pattern, captures, emit, onSuccess,
          responseGated := (j.bool? "response_gated").getD false }
 
 /-- Read a decoder binding. -/
@@ -172,7 +198,10 @@ private def decoderOf (j : Json) : Except String DecoderBinding := do
   let decoder ← match j.str? "decoder" with
     | some d => pure d
     | none => throw "a decoder binding needs a `decoder`"
-  pure { media := (strings j "media").map (fun m => Str.toLowerAscii (Str.trim m)), decoder }
+  let when ← match j.str? "match" with
+    | some m => some <$> Facts.Pattern.parse m
+    | none => pure none
+  pure { media := (strings j "media").map (fun m => Str.toLowerAscii (Str.trim m)), decoder, when }
 
 /-- Read the manifest's datalog: facts and rules only. -/
 private def datalogOf (source : String) : Except String (List Builder.Fact × List Builder.Rule) :=
@@ -183,6 +212,11 @@ private def datalogOf (source : String) : Except String (List Builder.Fact × Li
       throw "a manifest may not contain a check; only a grant decides authority"
     else if !r.policies.isEmpty then
       throw "a manifest may not contain a policy; only a grant may allow"
+    -- Which credential a request is spent on is the grant's to say; a manifest
+    -- deriving it would be a manifest choosing whose token goes out.
+    else if r.rules.any (·.head.name == "use_credential")
+         || r.facts.any (·.predicate.name == "use_credential") then
+      throw "a manifest may not derive `use_credential`; only a grant chooses a credential"
     else .ok (r.facts, r.rules)
 
 /-- Read a manifest from TOML source. -/
@@ -202,6 +236,7 @@ def Manifest.ofToml (source : String) : Except String Manifest := do
     inject := ← ((credJson.arr? "inject").mapM injectionOf)
     strip := (strings credJson "strip").map Str.toLowerAscii
     config := credJson
+    allowPlaintext := (credJson.bool? "allow_plaintext").getD false
   }
   for h in credential.hosts do
     if !hosts.contains h then
@@ -218,6 +253,9 @@ def Manifest.ofToml (source : String) : Except String Manifest := do
     defaultDecoder := j.str? "default_decoder"
     maxBodyFacts := ((j.int? "max_body_facts").getD 256).toNat
     maxDecodePrefix := ((j.int? "max_decode_prefix").getD 65536).toNat
+    resourceNames := match (j.arr? "resources").filterMap Json.asString? with
+      | [] => ["repository"]
+      | ns => ns
     version := Bytes.toHex (Sha256.hash (Bytes.ofString source))
   }
 
@@ -234,9 +272,17 @@ def Manifest.mayCredentialReach (m : Manifest) (host : String) : Bool :=
   m.credential.hosts.any fun h => Facts.hostMatches h host
 
 /-- The decoder to use for a body, from its media type. -/
-def Manifest.decoderFor (m : Manifest) (contentType : Option String) : Wire.Decoder :=
+def Manifest.decoderFor (m : Manifest) (contentType : Option String)
+    (request : Option Model.Request := none) : Wire.Decoder :=
   let bare := (contentType.getD "").splitOn ";" |>.headD "" |> Str.trim |> Str.toLowerAscii
-  let named := (m.decoders.find? fun b => b.media.contains bare).map (·.decoder)
+  -- A binding limited to some requests applies only when the request is known
+  -- and matches; without the request, only the unconditional ones are candidates.
+  let applies (b : DecoderBinding) : Bool :=
+    (b.media.contains bare || b.media.contains "*") && match b.when, request with
+      | none, _ => true
+      | some p, some r => (p.match? r).isSome
+      | some _, none => false
+  let named := (m.decoders.find? applies).map (·.decoder)
   let name := named.orElse fun _ =>
     (Wire.byMedia? bare).map (·.name) |>.orElse fun _ => m.defaultDecoder
   match name with
@@ -255,6 +301,30 @@ request and its decoded body. -/
 def Manifest.contribute (m : Manifest) (r : Model.Request) (body : Option LeanBiscuit.Datalog.Value) :
     List Builder.Fact :=
   m.facts ++ (m.routes.flatMap fun rt => (rt.apply r body).getD [])
+
+/-- The resources a set of facts says a request is about: each fact under one of
+the manifest's `resources` predicates, its string terms joined with `/`, in the
+order the predicates are listed. -/
+def Manifest.resourcesOf (m : Manifest) (facts : List Builder.Fact) : List String :=
+  m.resourceNames.flatMap fun n => facts.filterMap fun f =>
+    if f.predicate.name != n then none
+    else
+      let parts := f.predicate.terms.filterMap fun t => match t with
+        | .str s => some s
+        | _ => none
+      if parts.isEmpty then none else some ("/".intercalate parts)
+
+/-- The facts every route matching this request asks to be remembered if it
+succeeds. -/
+def Manifest.remember (m : Manifest) (r : Model.Request)
+    (body : Option LeanBiscuit.Datalog.Value) : List Builder.Fact :=
+  m.routes.flatMap (·.remember r body)
+
+/-- Every predicate name this manifest gives meaning to: what its routes emit or
+remember, and what its datalog asserts or derives.  No issuer may state these. -/
+def Manifest.vocabulary (m : Manifest) : List String :=
+  (m.routes.flatMap fun rt => (rt.emit ++ rt.onSuccess).map (·.predicate.name))
+    ++ m.facts.map (·.predicate.name) ++ m.rules.map (·.head.name)
 
 /-- Does any route matching this request want the response checked? -/
 def Manifest.gatesResponse (m : Manifest) (r : Model.Request)

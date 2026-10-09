@@ -1,6 +1,7 @@
 import Kleis.Wire.Json
 import Kleis.Wire.Form
 import Kleis.Wire.Git
+import Kleis.Wire.GraphQL
 
 /-!
 # The decoder registry
@@ -19,7 +20,7 @@ namespace Wire
 
 /-- Every shipped decoder. -/
 def shipped : List PureDecoder :=
-  [jsonDecoder, formDecoder, multipartDecoder, gitReceivePackDecoder,
+  [jsonDecoder, graphqlDecoder, formDecoder, multipartDecoder, gitReceivePackDecoder,
    gitUploadPackDecoder, opaqueDecoder]
 
 /-- Look up a decoder by the name a manifest uses. -/

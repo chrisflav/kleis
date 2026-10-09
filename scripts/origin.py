@@ -7,7 +7,7 @@ over smart HTTP via `git http-backend`, so the test can prove a real `git push`
 survives the proxy.
 """
 import json, os, ssl, subprocess, sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO_ROOT = sys.argv[2] if len(sys.argv) > 2 else "/tmp"
 
@@ -84,7 +84,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    server = HTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
+    # Threaded: a proxy that keeps connections to its origins alive would
+    # otherwise hold the only thread on an idle one.
+    server = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), Handler)
     # With a certificate and key, serve TLS: that is the case the intercepting
     # mode has to work against, and the proxy verifies this certificate the way
     # it would verify a real origin's.

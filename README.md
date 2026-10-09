@@ -76,8 +76,8 @@ whose decoder is four lines of Python.
 
 ```sh
 lake build          # the library, `kleis` and `kleisd`
-lake test           # 213 checks: crypto vectors, decoders, policy, TLS
-./scripts/integration.sh   # 32 checks: a real git push and clone through a daemon
+lake test           # 291 checks: crypto vectors, decoders, policy, TLS
+./scripts/integration.sh   # 50 checks: real git and curl through a daemon
 ```
 
 Needs OpenSSL headers (`libssl-dev`) for the TLS shim, and `git`, `curl` and
@@ -122,6 +122,7 @@ kleis service          list and inspect manifests
 kleis grant            list and inspect grants
 kleis credential       install, list and remove credentials
 kleis token            issue, attenuate, inspect, list and revoke
+kleis issuer           list issuers, and mint an issuer's credential
 kleis audit            tail the log, or verify its hash chain
 kleis check            run a request against a policy without a proxy
 kleisd                 the daemon
@@ -135,6 +136,29 @@ kleis check --token "$T" --method POST \
   --url https://api.github.com/repos/chrisflav/kleis/pulls/7/reviews \
   --content-type application/json --body '{"event":"APPROVE"}' --facts
 ```
+
+## Tokens for jobs
+
+A grant may spend several credentials and chooses one per request: by resource
+(`[[credential_route]] resources = ["acme/*"]`), by its own rules
+(`use_credential("…") <- repository($o, $r), task_upstream($o, $r)`), and
+otherwise its fallback — a `credential`, or none for `anonymous = true`.  A
+route can remember what a successful request made (`on_success`), so a token
+that created a repository may then push to it.  A token may also name several
+grants, for a bearer working across services.
+
+A program that hands out work — an orchestrator, a CI runner — is configured as
+an *issuer* and mints a token per job over HTTP, without the root key:
+
+```sh
+curl -H "Authorization: Bearer $ISSUER" -d '{"grants": ["orchestra-fork"], "ttl": "8h",
+  "facts": [{"name": "task_fork", "terms": ["bot", "proj"]}]}' \
+  http://127.0.0.1:8080/.kleis/v1/tokens
+```
+
+It may name only the grants and state only the facts its configuration allows,
+and revoke only what it issued; a revocation takes effect at once.
+`examples/orchestra/` is a complete setup for an agent orchestrator.
 
 ## What is guaranteed, and how
 
@@ -153,6 +177,24 @@ attenuation derived from it.
 
 The audit log is hash-chained and replayable: authorization is a pure function
 of the facts, and the facts are in the record.
+
+## Running it as a service
+
+`docker/Dockerfile` builds an image with `kleisd` and `kleis` in it, published as
+`ghcr.io/chrisflav/kleis:<commit>` from master.  Configuration is read from
+`/kleis/config` and state kept in `/kleis/data`.  For a deployment whose secrets
+already live somewhere — sops, a Kubernetes secret — nothing needs to be
+installed into kleis's own encrypted store:
+
+- a credential declared in `config/credentials/*.toml` names a `secret_file`, read
+  when the credential is spent, so a rotation needs no restart;
+- `KLEIS_ROOT_KEY_FILE` names the root key, so tokens survive the data directory;
+- an `[[issuer]]` with a `token_file` has kleisd keep that issuer's credential
+  there, renewed at startup before it expires, for an issuer running beside it.
+
+Passthrough reaches public addresses on port 443 only, unless `passthrough_ports`
+and `passthrough_internal` say otherwise; a credential goes out over https only,
+unless its manifest sets `allow_plaintext` (for a local test origin).
 
 ## Licence
 

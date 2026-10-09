@@ -52,13 +52,21 @@ def Request.authority (r : Request) : String :=
   if (r.scheme == "https" && r.port == 443) || (r.scheme == "http" && r.port == 80)
   then r.host else s!"{r.host}:{r.port}"
 
-/-- The request target to send upstream: origin-form, path and query. -/
+/-- The request target to send upstream: origin-form, path and query.
+
+Rebuilt from the decoded segments, each percent-encoded again, rather than from
+the decoded path.  The segments are what the policy matched on, so this is the
+one way to be sure the origin is sent the same path; and a decoded path sent as
+it is would put whatever `%0d%0a` decoded to into the request line — a second
+request, smuggled onto the connection with the credential's headers after it. -/
 def Request.originTarget (r : Request) : String :=
   let q :=
     if r.query.isEmpty then ""
     else "?" ++ "&".intercalate (r.query.toList.map fun (k, v) =>
       s!"{Str.percentEncode k}={Str.percentEncode v}")
-  (if r.path.isEmpty then "/" else r.path) ++ q
+  let p := "/" ++ "/".intercalate (r.segments.toList.map Str.percentEncode)
+  let p := if r.path.endsWith "/" && r.path != "/" then p ++ "/" else p
+  p ++ q
 
 /-- The absolute URL, for logs and for deciding redirects. -/
 def Request.url (r : Request) : String :=
@@ -96,13 +104,23 @@ def Request.ofWire (w : Http.Request) (scheme : String) (tunnel : Option (String
     | none => (authority, defaultPort)
   let host := Str.toLowerAscii (Str.trim host)
   if host.isEmpty then throw "the request has an empty host"
+  -- Segments a route would match one way and an origin read another are refused
+  -- outright: `..` and `.`, which an origin may resolve against the segments a
+  -- route already matched (`/repos/mine/x/../../theirs`); a `/` or `\\` hidden
+  -- in a segment as `%2F`, which makes one segment two; and control characters,
+  -- which have no business in a path.
+  let segments := Str.pathSegments target
+  for seg in segments do
+    if seg == "." || seg == ".." then throw "the path has a dot segment"
+    if seg.any (fun c => c == '/' || c == '\\' || c.toNat < 0x20 || c.toNat == 0x7f) then
+      throw "the path has an encoded separator or control character"
   pure {
     method := w.method
     scheme
     host
     port
     path := Str.percentDecode (Str.pathOnly target)
-    segments := Str.pathSegments target
+    segments
     query := Str.parseQuery target
     headers := w.headers
     bodyPrefix

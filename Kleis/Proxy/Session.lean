@@ -1,4 +1,5 @@
-import Kleis.Proxy.Forward
+import Std.Internal.UV.Timer
+import Kleis.Proxy.Admin
 import Kleis.Net.ClientHello
 import Kleis.Net.TlsStream
 import Kleis.Net.Socket
@@ -60,9 +61,27 @@ def bearerFrom? (headers : Http.Headers) : Option String :=
 
 /-- Read one request head from a stream, returning it and whatever was read
 past it. -/
-def readHead (s : Net.Stream) (limits : Http.Limits) (already : Bytes) :
-    IO (Option (Http.Request × Bytes)) := do
-  let rec go (buf : Bytes) (fuel : Nat) : IO (Option (Http.Request × Bytes)) := do
+def readHead (s : Net.Stream) (limits : Http.Limits) (already : Bytes)
+    (timeoutSeconds : Nat := 30) : IO (Option (Http.Request × Bytes)) := do
+  -- A client that opens a connection and sends no request — or not all of one —
+  -- would hold a thread and a descriptor for as long as it liked.  A libuv timer
+  -- closes the stream if the head has not arrived in time, which wakes the read
+  -- below.  A timer rather than a sleeping task: it costs no thread while it waits,
+  -- and stopping it when the head arrives drops its hold on the stream at once —
+  -- a sleeping task would keep both for the whole timeout on every connection,
+  -- which anyone able to connect could use to exhaust them.
+  if timeoutSeconds == 0 then return ← go already 4096
+  let timer ← Std.Internal.UV.Timer.mk (UInt64.ofNat (timeoutSeconds * 1000)) false
+  let fired ← timer.next
+  -- The callback may run on libuv's own loop, where waiting for a socket operation —
+  -- which closing does — would wait for itself; so the close is handed to a task of its
+  -- own, which exists only for a connection that actually timed out.
+  let _ ← IO.mapTask (t := fired.result?) fun r => do
+    if r.isSome then
+      let _ ← IO.asTask (prio := .dedicated) s.close
+  try go already 4096 finally timer.stop
+where
+  go (buf : Bytes) (fuel : Nat) : IO (Option (Http.Request × Bytes)) := do
     match Http.readRequest buf limits with
     | .done r consumed => return some (r, Bytes.drop buf consumed)
     | .error e => throw (IO.userError e)
@@ -77,7 +96,6 @@ def readHead (s : Net.Stream) (limits : Http.Limits) (already : Bytes) :
           if buf.size == 0 then return none
           else throw (IO.userError "the client closed mid-request")
         go (buf ++ chunk) fuel
-  go already 4096
 
 /-- Undo rewrite mode's path encoding: `/<scheme>/<host>/<rest>`. -/
 def unrewrite? (target : String) : Option (String × String × String) := do
@@ -95,19 +113,26 @@ def unrewrite? (target : String) : Option (String × String × String) := do
 /-- Handle the requests arriving on one already-identified stream. -/
 partial def serveRequests (ctx : Context) (client : Net.Stream) (token : Biscuit)
     (scheme : String) (tunnel : Option (String × Nat)) (clientIp : String)
-    (pending : Bytes) : IO Unit := do
+    (pending : Bytes) (served : Nat := 0) : IO Unit := do
   let limits : Http.Limits := { maxHeadSize := ctx.config.maxHeadSize }
   match ← readHead client limits pending with
   | none => return ()
   | some (wire, rest) =>
-    let more ← forward ctx { client, wire, pipelined := rest, scheme, tunnel, token, clientIp }
-    if more then serveRequests ctx client token scheme tunnel clientIp ByteArray.empty
+    let last := served + 1 ≥ ctx.config.maxRequestsPerConnection
+    let more ← forward ctx { client, wire, pipelined := rest, scheme, tunnel, token, clientIp
+                             closeAfter := last }
+    -- Every request on the connection is decided on its own, so carrying many
+    -- costs nothing in authority; the bound is there so one client cannot hold
+    -- a connection, and the TLS session under it, forever.
+    if more && served + 1 < ctx.config.maxRequestsPerConnection then
+      serveRequests ctx client token scheme tunnel clientIp ByteArray.empty (served + 1)
 
 /-- Peek at the ClientHello to find the name the client asked for.
 
 The bytes are kept and handed to the session afterwards, so the peek costs
 nothing: they were going to be buffered anyway. -/
-def peekSni (raw : Net.Stream) : IO (Bytes × Option String) := do
+def peekSni (raw : Net.Stream) (already : Bytes := ByteArray.empty) :
+    IO (Bytes × Option String) := do
   let rec go (buf : Bytes) (fuel : Nat) : IO (Bytes × Option String) := do
     match Net.clientHelloSni? buf with
     | some sni => return (buf, some sni)
@@ -119,25 +144,80 @@ def peekSni (raw : Net.Stream) : IO (Bytes × Option String) := do
         let chunk ← raw.read 8192
         if chunk.size == 0 then return (buf, none)
         go (buf ++ chunk) fuel
-  go ByteArray.empty 64
+  go already 64
+
+/-- Copy one direction of a tunnel until its source ends. -/
+partial def pump (src dst : Net.Stream) : IO Unit := do
+  let chunk ← src.read 65536
+  if chunk.size == 0 then return
+  dst.write chunk
+  pump src dst
+
+/-- A blind tunnel to a host no manifest claims, for the configuration's
+`passthrough`.  Nothing is intercepted and nothing is spent: the bytes are the
+client's TLS session with the origin, which this proxy cannot read and does not
+try to.  What it does check is the token — revoked or expired, and the tunnel
+is refused — and it writes one audit record per tunnel. -/
+def tunnelBlind (ctx : Context) (client : Net.Stream) (host : String) (port : Nat)
+    (token : Biscuit) (clientIp : String) (already : Bytes := ByteArray.empty) : IO Unit := do
+  let requestId ← ctx.nextRequestId
+  if let .error e ← tokenHolds ctx token then
+    refuse client 407 requestId s!"the token was not accepted: {e}"
+    return
+  let record : AuditRecord := {
+    time := ← Store.now, requestId, method := "CONNECT", url := s!"{host}:{port}"
+    clientIp, service := "passthrough", manifestVersion := "", grant := ""
+    grantVersion := ""
+    revocationIds := (Biscuit.revocationIdentifiers token).map Bytes.toHex
+    allowed := true, outcome := "passthrough", facts := []
+    credential := none, status := none }
+  if !ctx.config.passesPort port then
+    refuse client 403 requestId s!"passthrough is not allowed to port {port}"
+    return
+  let origin ← try
+      Net.Tcp.connectChecked host (UInt16.ofNat port)
+        fun a => ctx.config.passthroughInternal || !Net.Tcp.isInternal a
+    catch e => do
+      refuse client 502 requestId s!"the origin could not be reached: {e}"
+      if ctx.config.audit then
+        ctx.audit.append { record with outcome := s!"passthrough, upstream failure: {e}" }
+      return
+  if ctx.config.audit then ctx.audit.append record
+  client.write (Bytes.ofString "HTTP/1.1 200 Connection established\r\n\r\n")
+  -- A client that sent its first bytes straight after the CONNECT, without waiting
+  -- for the answer, has them relayed rather than lost.
+  if already.size > 0 then origin.write already
+  -- Whichever side ends first ends the tunnel.  The bytes are a TLS session
+  -- the proxy cannot read, so it cannot tell a half-close from a finished
+  -- exchange; and an origin left waiting after its client went away holds a
+  -- connection open for as long as it cares to, which for a keep-alive server
+  -- is indefinitely.  `Stream.close` also stops reads on that stream, so
+  -- closing one side unblocks the copy reading from it.
+  let _ ← IO.asTask (prio := .dedicated) do
+    try pump client origin catch _ => pure ()
+    origin.close
+  try pump origin client catch _ => pure ()
+  origin.close
 
 /-- Handle a `CONNECT`: intercept, then serve what comes through. -/
 def handleConnect (ctx : Context) (client : Net.Stream) (wire : Http.Request)
-    (token : Biscuit) (clientIp : String) : IO Unit := do
+    (token : Biscuit) (clientIp : String) (already : Bytes := ByteArray.empty) : IO Unit := do
   let (host, port) := match Str.splitOnce? wire.target ":" with
     | some (h, p) => (Str.toLowerAscii h, p.toNat?.getD 443)
     | none => (Str.toLowerAscii wire.target, 443)
   let registry ← ctx.registry.get
   match registry.forHost? host with
-  | none => do
-    -- Refused rather than tunnelled: this is a credential proxy, not an
-    -- anonymous egress path, and a tunnel it cannot inspect is one it cannot
-    -- gate.
-    let requestId ← ctx.nextRequestId
-    refuse client 403 requestId s!"no service manifest claims `{host}`"
+  | none =>
+    -- Refused rather than tunnelled, unless the configuration names the host:
+    -- this is a credential proxy, not an anonymous egress path, and a tunnel it
+    -- cannot inspect is one it cannot gate.
+    if ctx.config.passes host then tunnelBlind ctx client host port token clientIp already
+    else do
+      let requestId ← ctx.nextRequestId
+      refuse client 403 requestId s!"no service manifest claims `{host}`"
   | some _ => do
     client.write (Bytes.ofString "HTTP/1.1 200 Connection established\r\n\r\n")
-    let (hello, sni) ← peekSni client
+    let (hello, sni) ← peekSni client already
     let name := sni.getD host
     let serverCtx ← ctx.ca.contextFor name
     let tls ← Net.tlsServer serverCtx client hello
@@ -186,7 +266,7 @@ def handleRewrite (ctx : Context) (client : Net.Stream) (wire : Http.Request)
     let port := if scheme == "https" then 443 else 80
     let _ ← forward ctx {
       client, wire := { wire with target, headers }
-      pipelined := rest, scheme, tunnel := some (host, port), token, clientIp }
+      pipelined := rest, scheme, tunnel := some (host, port), token, clientIp, closeAfter := true }
     pure ()
 
 /-- Handle one client connection from the moment it is accepted. -/
@@ -213,15 +293,17 @@ def handleConnection (ctx : Context) (client : Net.Stream) (clientIp : String) :
       match Token.parse text ctx.rootPublic with
       | .error e => refuse client 407 requestId s!"the token was not accepted: {e}"
       | .ok token =>
-        if wire.method == "CONNECT" then
-          if ctx.config.mode.intercepts then handleConnect ctx client wire token clientIp
+        if isAdminTarget wire.target then
+          handleAdmin ctx client wire rest token clientIp
+        else if wire.method == "CONNECT" then
+          if ctx.config.mode.intercepts then handleConnect ctx client wire token clientIp rest
           else refuse client 405 requestId "this proxy is not configured to intercept CONNECT"
         else if wire.target.startsWith "http://" || wire.target.startsWith "https://" then
           match addressedToSelf? ctx wire.target with
           | some diagnosis => refuse client 400 requestId diagnosis
           | none =>
             let _ ← forward ctx { client, wire, pipelined := rest, scheme := "http"
-                                  tunnel := none, token, clientIp }
+                                  tunnel := none, token, clientIp, closeAfter := true }
             pure ()
         else if ctx.config.mode.rewrites then
           handleRewrite ctx client wire rest token clientIp requestId

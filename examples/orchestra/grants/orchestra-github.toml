@@ -1,0 +1,139 @@
+# Everything an orchestra job may do on GitHub, in one grant: what it may do is
+# decided once, and which credential a request goes out on is chosen after.
+#
+# The facts a job's token carries, which orchestra states when it mints it:
+#
+#   task_fork(owner, repo)       the fork the job works in
+#   task_upstream(owner, repo)   the repository it works for
+#   task_issue(n)                the issue or pull request it was launched from
+#   task_tool(name)              each tool it was granted: create_pr, merge_pr,
+#                                label_issue, comment, create_repository
+#   task_writable(true)          unless the job is read-only
+#   task_pr_labels([...])        labels its pull requests are to carry
+#   task_label_any(bool)         whether it may apply any label (label_issue)
+#   task_org(org)                where it may create repositories
+#   task_push_prefix(prefix)     optional: refs it may push, e.g. refs/heads/orchestra/
+#
+# Which credential, in order:
+#
+#   1. a `credential_route` below whose resource pattern matches — the
+#      operator's word on an owner or a repository;
+#   2. a `use_credential` the rules below derive — the job's fork and the
+#      repositories it created on the App's token, its upstream on the operator's
+#      token, GraphQL on the App's;
+#   3. none: what the rules allow and nothing routes is read anonymously, so a
+#      public dependency is cloned without spending anybody's token on it.
+#
+# Note on TOML: everything above the first `[[credential_route]]` header belongs
+# to the grant; a key written after it belongs to that route.
+
+name         = "orchestra-github"
+service      = "github"
+max_lifetime = "24h"
+anonymous    = true
+credentials  = ["github/orchestra-app", "github/orchestra-pat"]
+
+datalog = '''
+check if issued_by("orchestra");
+
+// ---------------------------------------------------------------- credentials
+
+use_credential("github/orchestra-app") <- repository($o, $r), task_fork($o, $r);
+use_credential("github/orchestra-app") <- repository($o, $r), created_repository($o, $r);
+use_credential("github/orchestra-app") <- operation("create_repository");
+use_credential("github/orchestra-app") <- operation("graphql");
+use_credential("github/orchestra-pat") <- repository($o, $r), task_upstream($o, $r);
+
+// ---------------------------------------------------------------- what is whose
+
+fork($o, $r) <- repository($o, $r), task_fork($o, $r);
+fork($o, $r) <- repository($o, $r), created_repository($o, $r);
+upstream($o, $r) <- repository($o, $r), task_upstream($o, $r);
+own_issue($n) <- issue($n), task_issue($n);
+own_issue($n) <- pull_request($n), task_issue($n);
+
+// ---------------------------------------------------------------- reading
+
+allowed("discover") <- operation("discover"), discover_service("git-upload-pack");
+allowed("fetch") <- operation("fetch");
+allowed("read") <- operation("read");
+allowed("download") <- operation("download");
+allowed("api_read") <- operation("api_read");
+// Queries only; see the reject below.
+allowed("graphql") <- operation("graphql");
+
+// ---------------------------------------------------------------- the fork
+
+allowed("discover") <-
+  operation("discover"), discover_service("git-receive-pack"), fork($o, $r),
+  task_writable(true);
+allowed("push") <- operation("push"), fork($o, $r), task_writable(true);
+allowed("open_pr") <- operation("open_pr"), fork($o, $r), task_tool("create_pr");
+
+// ---------------------------------------------------------------- the upstream
+
+// The head of a cross-repository pull request is `owner:branch`, and the owner
+// has to be the job's fork's.
+allowed("open_pr") <-
+  operation("open_pr"), upstream($o, $r), task_tool("create_pr"),
+  task_fork($fo, $fr), pr_head($h), $h.starts_with($fo + ":");
+allowed("create_label") <-
+  operation("create_label"), upstream($o, $r), task_tool("create_pr"),
+  label_created($l), task_pr_labels($s), $s.contains($l);
+// Both label facts are required, not only read by the reject below: a token
+// missing them would otherwise have no labels rejected at all.
+allowed("add_labels") <-
+  operation("add_labels"), upstream($o, $r), task_tool("create_pr"),
+  task_pr_labels($s), task_label_any($any);
+allowed("add_labels") <-
+  operation("add_labels"), upstream($o, $r), task_tool("label_issue"),
+  task_pr_labels($s), task_label_any($any);
+allowed("set_labels") <-
+  operation("set_labels"), upstream($o, $r), task_tool("label_issue"),
+  task_pr_labels($s), task_label_any($any);
+allowed("remove_label") <- operation("remove_label"), upstream($o, $r), task_tool("label_issue");
+
+allowed("comment") <-
+  operation("comment"), upstream($o, $r), own_issue($n), task_tool("comment");
+allowed("review") <-
+  operation("review_pr"), upstream($o, $r), own_issue($n), task_tool("comment"),
+  review_event("COMMENT");
+allowed("review_comment") <-
+  operation("review_comment"), upstream($o, $r), own_issue($n), task_tool("comment");
+
+allowed("merge_pr") <- operation("merge_pr"), upstream($o, $r), task_tool("merge_pr");
+
+// ---------------------------------------------------------------- new repositories
+
+// In the job's organisation, and with a name GitHub will not quietly change:
+// the repository the token may then push to is the one it asked for.
+allowed("create_repository") <-
+  operation("create_repository"), organization($org), task_org($org),
+  task_tool("create_repository"),
+  new_repository($org, $name), $name.matches("^[A-Za-z0-9._-]+$");
+
+check if allowed($x);
+
+// ---------------------------------------------------------------- never
+
+// A pull request's head is `owner:branch` on the job's fork; `head_repo` would name
+// some other repository of that owner as the head instead.
+reject if operation("open_pr"), body($p, $v), $p.length() == 1, $p.get(0) == "head_repo";
+
+// Every operation in a GraphQL document is read, so a mutation behind a query
+// is caught too.
+reject if graphql_operation($t), $t != "query";
+reject if deletes_ref($ref);
+reject if task_push_prefix($p), ref_update($ref), !$ref.starts_with($p);
+// Labels are the job's pull request labels, unless it may apply any.
+reject if label_added($l), task_label_any(false), task_pr_labels($s), !$s.contains($l);
+
+allow if grant("orchestra-github");
+'''
+
+# Owners whose repositories are reached with a token of their own, before the
+# rules above choose.  For example:
+#
+# [[credential_route]]
+# resources  = ["acme/*"]
+# credential = "github/pat-acme"

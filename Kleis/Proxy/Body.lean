@@ -25,7 +25,7 @@ open LeanBiscuit (Bytes)
 
 /-- What was read of a body. -/
 structure BodyPrefix where
-  /-- The bytes as they arrived, framing included. -/
+  /-- The bytes as they arrived, framing included, and nothing past its end. -/
   raw : Bytes
   /-- The entity bytes, framing removed. -/
   entity : Bytes
@@ -34,11 +34,31 @@ structure BodyPrefix where
   /-- Whether the framing has been consumed to its end, so that nothing more
   need be relayed. -/
   framingDone : Bool
+  /-- Bytes that arrived after the body ended: the start of a request the client
+  pipelined behind this one.  Never part of `raw`, and so never relayed with it. -/
+  excess : Bytes := ByteArray.empty
   deriving Inhabited
 
 /-- Nothing at all. -/
 def BodyPrefix.empty : BodyPrefix :=
   { raw := ByteArray.empty, entity := ByteArray.empty, complete := true, framingDone := true }
+
+/-- Split bytes at the end of a message body under its framing: what belongs to
+the body, and what came after it.
+
+This is the line between one message and the next on a connection, and getting
+it wrong is request smuggling: bytes past the end of a body, relayed as if they
+were part of it, reach the origin as a second request nobody authorized, and
+leave a response on the connection for whoever uses it next. -/
+def splitAtFraming (framing : Http.Framing) (raw : Bytes) : Bytes × Bytes :=
+  match framing with
+  | .empty => (ByteArray.empty, raw)
+  | .length n => (Bytes.take raw n, Bytes.drop raw n)
+  | .chunked =>
+    match Http.Chunked.scan raw with
+    | .done consumed => (Bytes.take raw consumed, Bytes.drop raw consumed)
+    | _ => (raw, ByteArray.empty)
+  | .untilClose => (raw, ByteArray.empty)
 
 /-- Decode the entity bytes available in `raw` under a framing. -/
 private def entityOf (framing : Http.Framing) (raw : Bytes) (limit : Nat) :
@@ -60,17 +80,19 @@ the cap is reached.
 
 `already` is whatever was read past the head while looking for it — a client
 that pipelines the body into the same packet as the request line, which every
-git client does. -/
+git client does.  Anything past the end of the body is returned as `excess`,
+never as part of the body. -/
 def readBodyPrefix (s : Net.Stream) (framing : Http.Framing) (decoder : Wire.Decoder)
     (already : Bytes) (cap : Nat) :
     IO (BodyPrefix × Option LeanBiscuit.Datalog.Value) := do
-  if framing == .empty then return (BodyPrefix.empty, none)
-  let rec go (raw : Bytes) (fuel : Nat) :
+  if framing == .empty then return ({ BodyPrefix.empty with excess := already }, none)
+  let rec go (received : Bytes) (fuel : Nat) :
       IO (BodyPrefix × Option LeanBiscuit.Datalog.Value) := do
+    let (raw, excess) := splitAtFraming framing received
     let (entity, complete, framingDone) ← match entityOf framing raw cap with
       | .ok r => pure r
       | .error e => throw (IO.userError s!"malformed request body: {e}")
-    let seen : BodyPrefix := { raw, entity, complete, framingDone }
+    let seen : BodyPrefix := { raw, entity, complete, framingDone, excess }
     -- Ask the decoder what it makes of what we have.  An out-of-process
     -- decoder is only worth starting once, so it waits for the whole prefix.
     let verdict : Wire.Decoded := match decoder with
@@ -82,7 +104,10 @@ def readBodyPrefix (s : Net.Stream) (framing : Http.Framing) (decoder : Wire.Dec
     | .done value _ => return (seen, some value)
     | .opaque =>
       match decoder with
-      | .exec command args => return (seen, ← Wire.runExec command args entity)
+      -- Only a whole body: a decoder run on a prefix cut off at the cap would answer for
+      -- bytes it never saw, and nothing would mark the answer as partial.
+      | .exec command args =>
+        if complete then return (seen, ← Wire.runExec command args entity) else return (seen, none)
       | _ => return (seen, none)
     | .need atLeast =>
       if complete then return (seen, none)
@@ -96,54 +121,63 @@ def readBodyPrefix (s : Net.Stream) (framing : Http.Framing) (decoder : Wire.Dec
       | fuel + 1 => do
         let want := max 4096 (atLeast - entity.size)
         let chunk ← s.read (min want 65536)
-        if chunk.size == 0 then
-          return ({ seen with complete := true, framingDone := true }, none)
-        go (raw ++ chunk) fuel
+        -- A client that goes away mid-body has sent a truncated request, which is
+        -- not one to decide on or forward as if it were whole.
+        if chunk.size == 0 then throw (IO.userError "the client closed mid-body")
+        go (received ++ chunk) fuel
   go already 4096
 
-/-- Relay the rest of a body from the client to the origin.
+/-- Relay the rest of a body from one side to the other, returning whatever was
+read past its end.
 
 Nothing is buffered: a chunk is read and written, and the loop ends when the
-framing says the body is over. -/
+framing says the body is over.  A read can carry bytes from beyond that point —
+the next message on the connection — and those are cut off and returned rather
+than relayed, since relaying them is exactly how a second, unauthorized request
+gets onto a connection to the origin. -/
 def relayBody (from_ to : Net.Stream) (framing : Http.Framing) (sent : BodyPrefix) :
-    IO Unit := do
-  if sent.framingDone then return ()
+    IO Bytes := do
+  if sent.framingDone then return ByteArray.empty
   match framing with
-  | .empty => return ()
+  | .empty => return ByteArray.empty
   | .length n => do
-    let rec goLength (remaining : Nat) (fuel : Nat) : IO Unit := do
-      if remaining == 0 then return ()
+    -- Reads are bounded by what remains, so nothing past the end is ever read.
+    let rec goLength (remaining : Nat) (fuel : Nat) : IO Bytes := do
+      if remaining == 0 then return ByteArray.empty
       match fuel with
-      | 0 => throw (IO.userError "the request body did not end")
+      | 0 => throw (IO.userError "the body did not end")
       | fuel + 1 => do
         let chunk ← from_.read (min remaining 65536)
-        if chunk.size == 0 then throw (IO.userError "the client closed mid-body")
+        if chunk.size == 0 then throw (IO.userError "the connection closed mid-body")
         to.write chunk
         goLength (remaining - chunk.size) fuel
     goLength (n - min n sent.raw.size) 1000000
   | .chunked => do
-    let rec goChunked (seen : Bytes) (fuel : Nat) : IO Unit := do
-      match Http.Chunked.scan seen with
-      | .done _ => return ()
-      | .error e => throw (IO.userError s!"malformed chunked body: {e}")
-      | .need =>
-        match fuel with
-        | 0 => throw (IO.userError "the chunked body did not end")
-        | fuel + 1 => do
-          let chunk ← from_.read 65536
-          if chunk.size == 0 then throw (IO.userError "the client closed mid-body")
-          to.write chunk
-          -- Only the framing is retained, and only as far as the scanner
-          -- needs: the payload is written out and dropped.
-          goChunked (seen ++ chunk) fuel
-    goChunked sent.raw 1000000
-  | .untilClose => do
-    let rec goClose (fuel : Nat) : IO Unit := do
+    let rec goChunked (seen : Bytes) (fuel : Nat) : IO Bytes := do
       match fuel with
-      | 0 => return ()
+      | 0 => throw (IO.userError "the chunked body did not end")
       | fuel + 1 => do
         let chunk ← from_.read 65536
-        if chunk.size == 0 then return ()
+        if chunk.size == 0 then throw (IO.userError "the connection closed mid-body")
+        let all := seen ++ chunk
+        match Http.Chunked.scan all with
+        | .done consumed =>
+          -- The body ends inside this read: relay up to the end and no further.
+          let upTo := consumed - seen.size
+          to.write (Bytes.take chunk upTo)
+          return Bytes.drop chunk upTo
+        | .error e => throw (IO.userError s!"malformed chunked body: {e}")
+        | .need =>
+          to.write chunk
+          goChunked all fuel
+    goChunked sent.raw 1000000
+  | .untilClose => do
+    let rec goClose (fuel : Nat) : IO Bytes := do
+      match fuel with
+      | 0 => return ByteArray.empty
+      | fuel + 1 => do
+        let chunk ← from_.read 65536
+        if chunk.size == 0 then return ByteArray.empty
         to.write chunk
         goClose fuel
     goClose 1000000

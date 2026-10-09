@@ -265,20 +265,34 @@ structure Route where
   emit : List Fact
   /-- Whether a match means the response must be buffered and checked. -/
   responseGated : Bool := false
+  /-- Facts to remember for the bearer's token once the upstream has answered
+  this request with success — `created_repository($org, $name)` after a
+  repository is created — and to assert on its later requests. -/
+  onSuccess : List Fact := []
   deriving Inhabited
 
-/-- Apply a route to a request.  Returns the facts it emits, with every capture
-substituted; a fact still holding a free variable is dropped, because a
-capture that did not resolve must not silently become a wildcard. -/
-def Route.apply (rt : Route) (r : Model.Request) (body : Option Value) :
-    Option (List Fact) := do
+/-- Substitute a route's captures into a list of fact templates; `none` if the
+route does not match.  A fact still holding a free variable is dropped, because
+a capture that did not resolve must not silently become a wildcard. -/
+private def Route.substitute (rt : Route) (templates : List Fact) (r : Model.Request)
+    (body : Option Value) : Option (List Fact) := do
   let pathEnv ← rt.pattern.match? r
   let extraEnv := rt.captures.filterMap fun (name, src) =>
     (src.resolve r body).map fun t => (name, t)
   let env := pathEnv ++ extraEnv
-  pure <| rt.emit.filterMap fun f =>
+  pure <| templates.filterMap fun f =>
     let terms := substList env f.predicate.terms
     if isGroundList terms then some (fact f.predicate.name terms) else none
+
+/-- The facts a route asks to be remembered if this request succeeds. -/
+def Route.remember (rt : Route) (r : Model.Request) (body : Option Value) : List Fact :=
+  (rt.substitute rt.onSuccess r body).getD []
+
+/-- Apply a route to a request: the facts it emits, with every capture
+substituted, or `none` if it does not match. -/
+def Route.apply (rt : Route) (r : Model.Request) (body : Option Value) :
+    Option (List Fact) :=
+  rt.substitute rt.emit r body
 
 end Facts
 end Kleis

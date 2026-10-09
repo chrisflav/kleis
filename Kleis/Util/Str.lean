@@ -44,6 +44,21 @@ Invalid escapes are left alone rather than rejected: a path the origin server
 would have accepted must not become a proxy error, and the facts we derive from
 it are compared against manifest patterns that see the same bytes. -/
 def percentDecode (s : String) (plusIsSpace : Bool := false) : String :=
+  -- As bytes first, so that an escaped UTF-8 sequence becomes the one character it
+  -- encodes rather than one character per byte; percentEncode turns it back into the
+  -- same escapes.  Bytes that are not UTF-8 fall back to one character per byte.
+  let rec bytes (cs : List Char) (acc : Array UInt8) : Array UInt8 :=
+    match cs with
+    | [] => acc
+    | '%' :: a :: b :: rest =>
+      match hexVal? a, hexVal? b with
+      | some x, some y => bytes rest (acc.push (UInt8.ofNat (x * 16 + y)))
+      | _, _ => bytes (a :: b :: rest) (acc.push 37)
+    | '+' :: rest => bytes rest (acc.push (if plusIsSpace then 32 else 43))
+    | c :: rest => bytes rest (acc ++ (String.singleton c).toUTF8.data)
+  match String.fromUTF8? (ByteArray.mk (bytes s.toList #[])) with
+  | some decoded => decoded
+  | none =>
   let rec go (cs : List Char) (acc : List Char) : List Char :=
     match cs with
     | [] => acc.reverse

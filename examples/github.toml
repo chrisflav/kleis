@@ -3,6 +3,12 @@
 # Everything GitHub-specific in this system is in this file.  Nothing in the
 # Lean source knows that GitHub exists.
 #
+# What it covers: git over smart HTTP, release and archive downloads, the REST
+# API that `gh api` and `curl` reach — reads, pull requests, reviews, comments,
+# labels, repository creation — and the GraphQL endpoint, whose requests are
+# read for whether they are queries or mutations.  A request no route matches
+# gets no `operation` fact, and a grant that requires one refuses it.
+#
 # Note on TOML: a key written after a `[[route]]` header belongs to *that*
 # table.  Document-level settings therefore go at the top, before any header.
 
@@ -11,7 +17,11 @@ hosts = ["github.com", "api.github.com", "codeload.github.com"]
 modes = ["rewrite", "connect"]
 
 max_body_facts   = 512
-max_decode_prefix = 65536
+max_decode_prefix = 1048576
+
+# What a request is about, for routing credentials (a grant's `credential_route`):
+# `owner/repo`, the repository being created, or the organisation.
+resources = ["repository", "new_repository", "organization"]
 
 # Rules deriving what a request means from the primitive and body facts.
 # A manifest may add facts and rules; it may never add a check or a policy.
@@ -32,6 +42,21 @@ deletes_ref($ref) <-
 // What a fetch or clone is asking for.
 wants_object($oid) <-
   body($p, $oid), $p.length() == 2, $p.get(0) == "wants";
+
+// The labels a request adds.  GitHub takes them in several shapes — `{"labels":
+// ["x"]}`, `{"labels": [{"name": "x"}]}`, a bare array of either, a bare string —
+// so rather than recognise each, every string anywhere in the body counts as a
+// label being added.  Over-counting only refuses; under-counting would let a label
+// past a grant that bounds them.
+label_added($l) <-
+  operation("add_labels"), body($p, $l), $l.type() == "string";
+label_added($l) <-
+  operation("set_labels"), body($p, $l), $l.type() == "string";
+
+// Each operation in a GraphQL document, by type: "query", "mutation" or
+// "subscription".  Read by the `graphql` decoder bound below.
+graphql_operation($t) <-
+  body($p, $t), $p.length() == 3, $p.get(0) == "$operations", $p.get(2) == "type";
 
 // Note what is *not* here: a rule deriving a bare branch name from a ref.
 // Datalog cannot compute a new term in a rule head, so `refs/heads/dev/x` to
@@ -61,13 +86,33 @@ kind     = "header"
 name     = "Authorization"
 template = "Bearer {{secret}}"
 
+# Decoders are bound by route, whatever Content-Type the client sends (`media =
+# ["*"]`).  The type is the client's to choose, and GitHub reads a JSON body as
+# JSON whatever it is labelled — so a binding by media type would let a body
+# labelled `text/plain` past every rule below that reads it.  A body these cannot
+# read is undecodable, and refused.
+#
+# The GraphQL endpoint first: its body is JSON with a document in it.
 [[decoder]]
-media   = ["application/x-git-receive-pack-request"]
-decoder = "git-receive-pack"
+media   = ["*"]
+decoder = "graphql"
+match   = "POST api.github.com /graphql"
 
 [[decoder]]
-media   = ["application/x-git-upload-pack-request"]
+media   = ["*"]
+decoder = "git-receive-pack"
+match   = "POST github.com /{owner}/{repo}/git-receive-pack"
+
+[[decoder]]
+media   = ["*"]
 decoder = "git-upload-pack"
+match   = "POST github.com /{owner}/{repo}/git-upload-pack"
+
+# Every other write to the API is JSON.
+[[decoder]]
+media   = ["*"]
+decoder = "json"
+match   = "POST|PUT|PATCH|DELETE api.github.com /{rest*}"
 
 # ---------------------------------------------------------------- git
 
@@ -88,11 +133,80 @@ capture = { service = "query:service" }
 emit  = ['operation("discover")', 'repository($owner, $repo)',
          'discover_service($service)']
 
-# ---------------------------------------------------------------- api
+# ---------------------------------------------------------------- downloads
+
+# A release asset or a source archive.  Both redirect to a host this manifest
+# does not claim, so the credential stops here either way.
+[[route]]
+match = "GET github.com /{owner}/{repo}/releases/download/{rest*}"
+emit  = ['operation("download")', 'repository($owner, $repo)']
 
 [[route]]
-match = "GET|POST api.github.com /repos/{owner}/{repo}/pulls"
-emit  = ['operation("list_or_open_pr")', 'repository($owner, $repo)']
+match = "GET github.com /{owner}/{repo}/archive/{rest*}"
+emit  = ['operation("download")', 'repository($owner, $repo)']
+
+[[route]]
+match = "GET codeload.github.com /{owner}/{repo}/{rest*}"
+emit  = ['operation("download")', 'repository($owner, $repo)']
+
+# ---------------------------------------------------------------- api: reads
+
+[[route]]
+match = "GET|HEAD api.github.com /repos/{owner}/{repo}"
+emit  = ['operation("read")', 'repository($owner, $repo)']
+
+[[route]]
+match = "GET|HEAD api.github.com /repos/{owner}/{repo}/{rest*}"
+emit  = ['operation("read")', 'repository($owner, $repo)']
+
+# Reads that are about no one repository — the authenticated user, rate limits,
+# search, users and organisations — emit `api_read` and no repository, so a
+# grant decides on its own whether they are fine.  Listed rather than caught by
+# `/{rest*}`: a catch-all would also match `/repos/…`, and a grant allowing
+# `api_read` would then allow reading every repository its credential can see.
+[[route]]
+match = "GET|HEAD api.github.com /user"
+emit  = ['operation("api_read")']
+
+[[route]]
+match = "GET|HEAD api.github.com /user/{rest*}"
+emit  = ['operation("api_read")']
+
+[[route]]
+match = "GET|HEAD api.github.com /users/{rest*}"
+emit  = ['operation("api_read")']
+
+[[route]]
+match = "GET|HEAD api.github.com /orgs/{rest*}"
+emit  = ['operation("api_read")']
+
+[[route]]
+match = "GET|HEAD api.github.com /search/{rest*}"
+emit  = ['operation("api_read")']
+
+[[route]]
+match = "GET|HEAD api.github.com /rate_limit"
+emit  = ['operation("api_read")']
+
+[[route]]
+match = "GET|HEAD api.github.com /meta"
+emit  = ['operation("api_read")']
+
+[[route]]
+match = "POST api.github.com /graphql"
+emit  = ['operation("graphql")']
+
+# ---------------------------------------------------------------- api: pull requests
+
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/pulls"
+capture = { head = "body:head", base = "body:base" }
+emit  = ['operation("open_pr")', 'repository($owner, $repo)',
+         'pr_head($head)', 'pr_base($base)']
+
+[[route]]
+match = "PATCH api.github.com /repos/{owner}/{repo}/pulls/{number:int}"
+emit  = ['operation("edit_pr")', 'repository($owner, $repo)', 'pull_request($number)']
 
 [[route]]
 match = "PUT api.github.com /repos/{owner}/{repo}/pulls/{number:int}/merge"
@@ -100,13 +214,54 @@ emit  = ['operation("merge_pr")', 'repository($owner, $repo)', 'pull_request($nu
 
 [[route]]
 match = "POST api.github.com /repos/{owner}/{repo}/pulls/{number:int}/reviews"
-emit  = ['operation("review_pr")', 'repository($owner, $repo)', 'pull_request($number)']
-capture = { review_event = "body:event", base = "body:base" }
+capture = { review_event = "body:event" }
+emit  = ['operation("review_pr")', 'repository($owner, $repo)', 'pull_request($number)',
+         'review_event($review_event)']
+
+# A new inline comment, or a reply to one when the body has `in_reply_to`.
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/pulls/{number:int}/comments"
+emit  = ['operation("review_comment")', 'repository($owner, $repo)',
+         'pull_request($number)']
 
 [[route]]
-match = "GET api.github.com /repos/{owner}/{repo}/{rest*}"
-emit  = ['operation("read")', 'repository($owner, $repo)']
+match = "POST api.github.com /repos/{owner}/{repo}/pulls/{number:int}/comments/{comment:int}/replies"
+emit  = ['operation("review_comment")', 'repository($owner, $repo)',
+         'pull_request($number)', 'review_comment_id($comment)']
 
+# ---------------------------------------------------------------- api: issues
+
+# Issues and pull requests share a numbering, and a comment on a pull request's
+# conversation is an issue comment.
 [[route]]
 match = "POST api.github.com /repos/{owner}/{repo}/issues/{number:int}/comments"
 emit  = ['operation("comment")', 'repository($owner, $repo)', 'issue($number)']
+
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/issues/{number:int}/labels"
+emit  = ['operation("add_labels")', 'repository($owner, $repo)', 'issue($number)']
+
+[[route]]
+match = "PUT api.github.com /repos/{owner}/{repo}/issues/{number:int}/labels"
+emit  = ['operation("set_labels")', 'repository($owner, $repo)', 'issue($number)']
+
+[[route]]
+match = "DELETE api.github.com /repos/{owner}/{repo}/issues/{number:int}/labels/{label}"
+emit  = ['operation("remove_label")', 'repository($owner, $repo)', 'issue($number)',
+         'label_removed($label)']
+
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/labels"
+capture = { label = "body:name" }
+emit  = ['operation("create_label")', 'repository($owner, $repo)', 'label_created($label)']
+
+# ---------------------------------------------------------------- api: repositories
+
+[[route]]
+match = "POST api.github.com /orgs/{org}/repos"
+capture = { name = "body:name", private = "body:private" }
+emit  = ['operation("create_repository")', 'organization($org)',
+         'new_repository($org, $name)', 'repository_private($private)']
+# Once GitHub has created it, the token that asked may be let at it: grants
+# read `created_repository` to allow pushing to what a bearer made.
+on_success = ['created_repository($org, $name)']

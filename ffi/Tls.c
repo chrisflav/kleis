@@ -25,6 +25,8 @@
 #include <openssl/err.h>
 #include <openssl/bio.h>
 #include <openssl/x509.h>
+#include <openssl/pem.h>
+#include <openssl/evp.h>
 
 /* ------------------------------------------------------------------ */
 /* External classes                                                     */
@@ -344,4 +346,55 @@ LEAN_EXPORT lean_obj_res kleis_tls_version(b_lean_obj_arg conn_obj, lean_obj_arg
     kleis_conn *c = (kleis_conn *)lean_get_external_data(conn_obj);
     const char *v = SSL_get_version(c->ssl);
     return lean_io_result_mk_ok(lean_mk_string(v ? v : ""));
+}
+
+/* ------------------------------------------------------------------ */
+/* Signing                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * RS256 (RSASSA-PKCS1-v1_5 over SHA-256) with a PEM private key: what a GitHub
+ * App signs the JSON Web Token it exchanges for an installation token with.
+ *
+ * Here rather than in Lean because lean-biscuit has Ed25519 and P-256 and no
+ * RSA, and RSA is not something to write by hand when OpenSSL is already
+ * linked.  The key arrives as PEM bytes and is parsed, used and freed within
+ * the call; nothing of it outlives the call on this side.
+ */
+LEAN_EXPORT lean_obj_res kleis_sign_rs256(b_lean_obj_arg key_pem, b_lean_obj_arg message,
+                                          lean_obj_arg w) {
+    (void)w;
+    BIO *bio = BIO_new_mem_buf(lean_sarray_cptr(key_pem), (int)lean_sarray_size(key_pem));
+    if (!bio) return io_error("could not allocate a BIO for the key");
+    EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (!pkey) return io_error_ssl("the private key is not a PEM private key");
+    if (EVP_PKEY_base_id(pkey) != EVP_PKEY_RSA) {
+        EVP_PKEY_free(pkey);
+        return io_error("RS256 needs an RSA key");
+    }
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    if (!md) { EVP_PKEY_free(pkey); return io_error("could not allocate a digest context"); }
+    size_t siglen = 0;
+    lean_obj_res result;
+    if (EVP_DigestSignInit(md, NULL, EVP_sha256(), NULL, pkey) != 1 ||
+        EVP_DigestSign(md, NULL, &siglen, lean_sarray_cptr(message),
+                       lean_sarray_size(message)) != 1) {
+        result = io_error_ssl("signing failed");
+    } else {
+        unsigned char *sig = (unsigned char *)malloc(siglen);
+        if (!sig) {
+            result = io_error("could not allocate the signature");
+        } else if (EVP_DigestSign(md, sig, &siglen, lean_sarray_cptr(message),
+                                  lean_sarray_size(message)) != 1) {
+            free(sig);
+            result = io_error_ssl("signing failed");
+        } else {
+            result = lean_io_result_mk_ok(mk_bytes(sig, siglen));
+            free(sig);
+        }
+    }
+    EVP_MD_CTX_free(md);
+    EVP_PKEY_free(pkey);
+    return result;
 }

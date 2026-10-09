@@ -1,5 +1,6 @@
 import Kleis.Policy.Authorize
 import Kleis.Store
+import Std.Sync.Mutex
 
 /-!
 # The audit log
@@ -101,16 +102,39 @@ def auditTip : IO String := do
       | .ok j => return (j.str? "link").getD auditGenesis
       | .error _ => return auditGenesis
 
-/-- Append a record, linking it to the tip. -/
-def auditAppend (r : AuditRecord) : IO Unit := do
-  let previous ← auditTip
-  let body := Json.render r.toJson
-  let link := auditLink previous body
-  let line := Json.render (.obj [("previous", .str previous), ("link", .str link),
-                                 ("record", ← match Json.parse body with
-                                   | .ok j => pure j
-                                   | .error _ => pure (.str body))])
-  Store.appendLine (← Dirs.auditLog) line
+/-- The log a daemon appends to.
+
+The tip of the chain is held in memory, behind a mutex, rather than re-read
+from the file for every record.  Re-reading was two bugs at once: every request
+read the whole log, and two connections finishing together read the same tip
+and both linked to it — a fork in the chain that `kleis audit verify` then
+reports exactly as it would report a deletion. -/
+structure AuditLog where
+  private mk ::
+  /-- The last link written, once it has been read from disk. -/
+  private tip : Std.Mutex (Option String)
+
+/-- A log whose tip is read from disk on the first append. -/
+def AuditLog.create : IO AuditLog := do
+  return ⟨← Std.Mutex.new none⟩
+
+/-- Append a record, linking it to the tip.
+
+Reading the tip, writing the line and moving the tip happen under one lock, so
+records are linked in the order they are written. -/
+def AuditLog.append (log : AuditLog) (r : AuditRecord) : IO Unit :=
+  log.tip.atomically do
+    let previous ← match ← get with
+      | some t => pure t
+      | none => auditTip
+    let body := Json.render r.toJson
+    let link := auditLink previous body
+    let line := Json.render (.obj [("previous", .str previous), ("link", .str link),
+                                   ("record", ← match Json.parse body with
+                                     | .ok j => pure j
+                                     | .error _ => pure (.str body))])
+    Store.appendLine (← Dirs.auditLog) line
+    set (some link)
 
 /-- Check the chain, returning the number of records and the first line whose
 link does not follow. -/
