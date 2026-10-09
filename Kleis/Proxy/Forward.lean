@@ -31,11 +31,18 @@ namespace Proxy
 open LeanBiscuit
 open LeanBiscuit.Token (Biscuit AuthorizerBuilder Authorizer)
 
-/-- Write a refusal to the client. -/
+/-- Write a refusal to the client.
+
+Never throws: a client that has gone away cannot be told anything, and a refusal
+that failed must not take the audit record written after it down with it — a
+bearer could otherwise make credentialed requests and leave no trace simply by
+closing the connection early. -/
 def refuse (client : Net.Stream) (status : Nat) (requestId reason : String) : IO Unit := do
   let body := s!"kleis: {reason}\n\nrequest {requestId}\n"
-  client.write (Http.simpleResponse status "text/plain; charset=utf-8" body
-    #[("x-kleis-request-id", requestId)])
+  try
+    client.write (Http.simpleResponse status "text/plain; charset=utf-8" body
+      #[("x-kleis-request-id", requestId)])
+  catch _ => pure ()
 
 /-- Does the token still hold — unrevoked, unexpired, its own checks passing?
 
@@ -76,30 +83,40 @@ structure Job where
   token : Biscuit
   /-- The client's address. -/
   clientIp : String
+  /-- Whether this is the last request the connection will carry, so the response
+  says `Connection: close` rather than leaving the client to find out. -/
+  closeAfter : Bool := false
 
 /-- What relaying a response came to. -/
 structure Relayed where
   /-- The origin's status. -/
   status : Nat
-  /-- Whether the response ended where its framing said, so that the
-  connection it came on is in a known state and may carry another request. -/
-  delimited : Bool
+  /-- Whether the response ended where its framing said and nothing followed it,
+  so that the connection it came on is in a known state and may carry another
+  request. -/
+  clean : Bool
   /-- Whether the origin asked to close its connection. -/
   originCloses : Bool
 
 /-- Relay a response from the origin to the client, streaming the body.
 
 `none` when the origin closed before sending a single byte, which is what an
-idle connection the origin has already given up on looks like, and the one
-failure a request may be retried after: nothing has reached the client yet.
+idle connection the origin has already given up on looks like.
 
 Interim responses (`100 Continue`, `103 Early Hints`) are read and dropped.
 The request was already relayed whole, so a `100` tells the client nothing, and
 relaying one *as* the response would end the exchange before the real answer
-arrived — a push large enough for git to send `Expect: 100-continue` would hang. -/
+arrived — a push large enough for git to send `Expect: 100-continue` would hang.
+A `101 Switching Protocols` is relayed and ends the connection: the proxy
+forwards no `Upgrade`, so an origin sending one is not one to keep talking to.
+
+Nothing past the end of the response is relayed.  An origin that sent more than
+one response's worth has a connection in a state nobody can account for, so it
+is not pooled. -/
 private def relayResponse (ctx : Context) (origin client : Net.Stream) (method : String)
-    (requestId : String) (closeClient : Bool) : IO (Option Relayed) := do
-  let first ← try origin.read 65536 catch _ => pure ByteArray.empty
+    (requestId : String) (closeClient : Bool) (started : IO.Ref Bool) :
+    IO (Option Relayed) := do
+  let first ← origin.read 65536
   if first.size == 0 then return none
   let rec readHead (buf : Bytes) (fuel : Nat) : IO (Http.Response × Bytes) := do
     match fuel with
@@ -115,10 +132,11 @@ private def relayResponse (ctx : Context) (origin client : Net.Stream) (method :
         let chunk ← origin.read 65536
         if chunk.size == 0 then throw (IO.userError "the origin closed mid-response")
         readHead (buf ++ chunk) fuel
-  let (response, rest) ← readHead first 4096
-  let delimited := response.framing != .untilClose
+  let (response, received) ← readHead first 4096
+  let switching := response.status == 101
+  let delimited := response.framing != .untilClose && !switching
   let originCloses := (Http.Headers.tokens response.headers "connection").contains "close"
-    || response.version == "HTTP/1.0"
+    || response.version == "HTTP/1.0" || switching
   -- The hop-by-hop fields belong to the connection with the origin, not to the
   -- one with the client, and the request identifier is added so that a bearer
   -- can quote it.
@@ -131,17 +149,24 @@ private def relayResponse (ctx : Context) (origin client : Net.Stream) (method :
   -- another response on it, and the client has to be told.
   let headers := if closeClient || !delimited then Http.Headers.set headers "connection" "close"
     else headers
+  let (body, excess) := splitAtFraming response.framing received
+  started.set true
   client.write (Http.writeResponse { response with headers })
-  client.write rest
+  client.write body
   let sent : BodyPrefix :=
-    { raw := rest, entity := rest
+    { raw := body, entity := body
       complete := false
       framingDone := match response.framing with
         | .empty => true
-        | .length n => rest.size ≥ n
-        | _ => false }
-  relayBody origin client response.framing sent
-  return some { status := response.status, delimited, originCloses }
+        | .length n => body.size ≥ n
+        | .chunked => match Http.Chunked.scan body with
+          | .done _ => true
+          | _ => false
+        | .untilClose => false }
+  let after ← relayBody origin client response.framing sent
+  return some { status := response.status
+                clean := delimited && excess.size == 0 && after.size == 0
+                originCloses }
 
 /-- Send a request on an origin connection, returning `false` if the
 connection turned out to be dead before anything was written. -/
@@ -152,22 +177,34 @@ private def sendHead (origin : Net.Stream) (head : Bytes) (body : BodyPrefix) : 
     return true
   catch _ => return false
 
+/-- Methods that may be sent a second time if the first attempt is in doubt. -/
+private def idempotent (method : String) : Bool :=
+  method == "GET" || method == "HEAD" || method == "OPTIONS"
+
 /-- Send the request upstream and relay the answer.  Returns the status and
 whether the client's connection may carry another request.
 
 A connection to the same origin left idle by an earlier request is reused when
 there is one, which matters for git: a clone is a handful of requests, and each
 one paying for a new TLS handshake with the origin is most of what it costs.  A
-reused connection may have been closed by the origin in the meantime, so a
-request goes on one only when its whole body is in hand and can be sent again on
-a fresh connection if the old one turns out to be dead; a request still
-streaming its body from the client always gets a fresh one. -/
+reused connection may have been closed by the origin in the meantime, so only a
+request that is safe to send twice goes on one — a `GET`, `HEAD` or `OPTIONS`
+whose whole body is in hand — and is sent again on a fresh connection if the old
+one closes before answering.  Everything else gets a fresh connection: a `POST`
+the origin acted on before dropping the connection must not be acted on twice.
+
+`started` is set once any of the response has been written to the client, so a
+caller handling a failure knows whether an error response can still be sent. -/
 private def sendUpstream (ctx : Context) (job : Job) (outgoing : Model.Request)
-    (body : BodyPrefix) (requestId : String) : IO (Option Nat × Bool) := do
+    (body : BodyPrefix) (requestId : String) (started : IO.Ref Bool)
+    (allow : Option (Std.Net.SocketAddress → Bool) := none) :
+    IO (Option Nat × Bool) := do
   let key := s!"{outgoing.scheme}://{outgoing.host}:{outgoing.port}"
-  let pooling := ctx.config.upstreamIdleSeconds > 0
+  -- A connection checked against `allow` is not put in the pool, where a request
+  -- that was not checked could pick it up.
+  let pooling := ctx.config.upstreamIdleSeconds > 0 && allow.isNone
   let clientCloses := (Http.Headers.tokens job.wire.headers "connection").contains "close"
-    || job.wire.version == "HTTP/1.0"
+    || job.wire.version == "HTTP/1.0" || job.closeAfter
   -- `Expect` is dropped as well as the hop-by-hop fields: the proxy already
   -- holds the start of the body and relays the rest unasked, so an origin's
   -- `100 Continue` would only be one more response to throw away.
@@ -179,33 +216,39 @@ private def sendUpstream (ctx : Context) (job : Job) (outgoing : Model.Request)
     method := outgoing.method, target := outgoing.originTarget
     version := "HTTP/1.1", headers, framing := job.wire.framing }
   let openFresh : IO Net.Stream :=
-    Net.openOrigin ctx.clientCtx outgoing.scheme outgoing.host (UInt16.ofNat outgoing.port)
+    Net.openOrigin ctx.clientCtx outgoing.scheme outgoing.host (UInt16.ofNat outgoing.port) allow
+  -- What the client sent past the end of this request's body, if anything: a
+  -- pipelined request.  It is not relayed, and the client's connection is closed
+  -- after this response so that it sends it again rather than have it lost.
+  let clientExcess ← IO.mkRef body.excess
   -- One attempt on one connection: `none` if it was dead before answering.
   let attempt (origin : Net.Stream) : IO (Option Relayed) := do
     if !(← sendHead origin head body) then return none
-    relayBody job.client origin job.wire.framing body
-    relayResponse ctx origin job.client outgoing.method requestId clientCloses
-  let pooled ← if pooling && body.framingDone then ctx.pool.take? key
-    else pure none
+    let after ← relayBody job.client origin job.wire.framing body
+    if after.size > 0 then clientExcess.set after
+    relayResponse ctx origin job.client outgoing.method requestId clientCloses started
+  let retryable := idempotent outgoing.method && body.framingDone
+  let pooled ← if pooling && retryable then ctx.pool.take? key else pure none
+  let viaFresh : IO (Net.Stream × Relayed) := do
+    let fresh ← openFresh
+    match ← (try attempt fresh catch e => do fresh.close; throw e) with
+    | some r => pure (fresh, r)
+    | none => do fresh.close; throw (IO.userError "the origin closed before responding")
   let (origin, relayed) ← match pooled with
     | some origin => do
-      match ← (try attempt origin catch e => do origin.close; throw e) with
+      -- Only a clean end before any answer counts as a dead idle connection; a
+      -- read error after the request went out is not evidence the origin did not
+      -- act on it.
+      let r ← try attempt origin catch e => do origin.close; throw e
+      match r with
       | some r => pure (origin, r)
-      | none =>
-        origin.close
-        let fresh ← openFresh
-        match ← (try attempt fresh catch e => do fresh.close; throw e) with
-        | some r => pure (fresh, r)
-        | none => do fresh.close; throw (IO.userError "the origin closed before responding")
-    | none => do
-      let fresh ← openFresh
-      match ← (try attempt fresh catch e => do fresh.close; throw e) with
-      | some r => pure (fresh, r)
-      | none => do fresh.close; throw (IO.userError "the origin closed before responding")
-  if pooling && relayed.delimited && !relayed.originCloses then
+      | none => do origin.close; viaFresh
+    | none => viaFresh
+  if pooling && relayed.clean && !relayed.originCloses then
     ctx.pool.put key origin
   else origin.close
-  return (some relayed.status, relayed.delimited && !clientCloses)
+  let more := relayed.clean && !clientCloses && (← clientExcess.get).size == 0
+  return (some relayed.status, more)
 
 /-- Forward a request for a host no manifest claims, which the configuration's
 `passthrough` lets through: no policy, no credential, nothing stripped but the
@@ -218,6 +261,9 @@ private def forwardBlind (ctx : Context) (job : Job) (bare : Model.Request)
     (requestId : String) (now : Nat) : IO Bool := do
   if let .error e ← tokenHolds ctx job.token then
     refuse job.client 407 requestId s!"the token was not accepted: {e}"
+    return false
+  if !ctx.config.passesPort bare.port then
+    refuse job.client 403 requestId s!"passthrough is not allowed to port {bare.port}"
     return false
   let (body, _) ← try
       readBodyPrefix job.client job.wire.framing .opaque job.pipelined 0
@@ -233,12 +279,15 @@ private def forwardBlind (ctx : Context) (job : Job) (bare : Model.Request)
     revocationIds := (Biscuit.revocationIdentifiers job.token).map Bytes.toHex
     allowed := true, outcome := "passthrough", facts := []
     credential := none, status := none }
+  let started ← IO.mkRef false
   let (status, more) ← try
-      sendUpstream ctx job outgoing body requestId
+      sendUpstream ctx job outgoing body requestId started
+        (allow := some fun a => ctx.config.passthroughInternal || !Net.Tcp.isInternal a)
     catch e => do
-      refuse job.client 502 requestId s!"the origin could not be reached: {e}"
       if ctx.config.audit then
         ctx.audit.append { record with outcome := s!"passthrough, upstream failure: {e}" }
+      if !(← started.get) then
+        refuse job.client 502 requestId s!"the origin could not be reached: {e}"
       return false
   if ctx.config.audit then ctx.audit.append { record with status }
   return more
@@ -340,9 +389,18 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
     let outgoing ← try
         match authorized.credential with
         | some credentialName =>
+          if request.scheme != "https" && !manifest.credential.allowPlaintext then
+            throw (IO.userError s!"the credential `{credentialName}` is only sent over https")
           if manifest.mayCredentialReach request.host then do
-            let some credentialRecord ← Credential.load? credentialName
+            let declared ← ctx.declared.get
+            let some credentialRecord ← match declared.find? (·.name == credentialName) with
+                | some r => pure (some r)
+                | none => Credential.load? credentialName
               | throw (IO.userError (Policy.Rejection.noCredential credentialName).toString)
+            -- A grant naming a credential of another service — a typo in a route — must
+            -- not send, say, a cloud key to GitHub.
+            if credentialRecord.service != manifest.name then
+              throw (IO.userError s!"the credential `{credentialName}` is for `{credentialRecord.service}`, not `{manifest.name}`")
             let secret ← Credential.resolve ctx.credentials ctx.clientCtx credentialRecord
               grant.narrow
             auditRecord := { auditRecord with
@@ -366,12 +424,18 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
         return false
 
     -- Forward.
+    -- The audit record first: the request has gone upstream on a credential, and
+    -- that is recorded whatever happens to the client.  An error response only if
+    -- the client has seen none of a response yet; otherwise it would be written
+    -- into the middle of a body.
+    let started ← IO.mkRef false
     let (status, more) ← try
-        sendUpstream ctx job outgoing body requestId
+        sendUpstream ctx job outgoing body requestId started
       catch e => do
-        refuse job.client 502 requestId s!"the origin could not be reached: {e}"
         if ctx.config.audit then
           ctx.audit.append { auditRecord with outcome := s!"upstream failure: {e}" }
+        if !(← started.get) then
+          refuse job.client 502 requestId s!"the origin could not be reached: {e}"
         return false
 
     -- What a route asked to be remembered once this succeeded: the repository a

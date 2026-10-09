@@ -35,6 +35,22 @@ def mkdir (p : System.FilePath) : IO Unit := do
   IO.FS.createDirAll p
   restrict p "700"
 
+/-- Write `contents` to a fresh temporary file beside `p`, with `mode` from the
+start, and rename it into place.
+
+The temporary name is random and the file is created exclusively, so nothing
+already at that path — a symlink planted by whoever else can write to the
+directory — is followed, truncated or chmodded on the way. -/
+private def writeAtomically (p : System.FilePath) (contents : Bytes) (mode : String) :
+    IO Unit := do
+  let suffix ← IO.FS.withFile "/dev/urandom" .read fun h => h.read 8
+  let tmp := System.FilePath.mk s!"{p.toString}.tmp.{Bytes.toHex suffix}"
+  let h ← IO.FS.Handle.mk tmp .writeNew
+  restrict tmp mode
+  h.write contents
+  h.flush
+  IO.FS.rename tmp p
+
 /-- Write a file atomically, owner-only.
 
 The order matters: the temporary file is created empty, restricted, and only
@@ -42,21 +58,13 @@ then written, so a secret is never present in a file that anybody else could
 still open. -/
 def writeSecret (p : System.FilePath) (contents : Bytes) : IO Unit := do
   if let some parent := p.parent then mkdir parent
-  let tmp := System.FilePath.mk (p.toString ++ ".tmp")
-  IO.FS.writeBinFile tmp ByteArray.empty
-  restrict tmp
-  IO.FS.writeBinFile tmp contents
-  IO.FS.rename tmp p
+  writeAtomically p contents "600"
 
 /-- Write a file atomically with the given mode, which it has from the moment it
 is created: for a secret meant to be shared with one other account through a
 group, which `writeSecret`'s owner-only mode would keep from it. -/
-def writeWithMode (p : System.FilePath) (contents : Bytes) (mode : String) : IO Unit := do
-  let tmp := System.FilePath.mk (p.toString ++ ".tmp")
-  IO.FS.writeBinFile tmp ByteArray.empty
-  restrict tmp mode
-  IO.FS.writeBinFile tmp contents
-  IO.FS.rename tmp p
+def writeWithMode (p : System.FilePath) (contents : Bytes) (mode : String) : IO Unit :=
+  writeAtomically p contents mode
 
 /-- Write a file atomically, without restricting it: for things that are not
 secret and that other tools may want to read, such as the CA certificate. -/

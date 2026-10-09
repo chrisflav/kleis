@@ -68,6 +68,11 @@ structure CredentialSpec where
   strip : List String
   /-- Provider-specific settings, passed through untouched. -/
   config : Json
+  /-- Whether the credential may go over plain HTTP.  No by default: a credential
+  sent in the clear to `http://api.github.com` is a credential anyone on the path
+  can read, and the request that asked for that is the bearer's to make, not the
+  credential owner's.  For a local test origin, and little else. -/
+  allowPlaintext : Bool := false
   deriving Inhabited
 
 /-- A media type bound to a decoder, optionally only for the requests one
@@ -77,7 +82,13 @@ The pattern is what lets a service whose API is mostly one format carve out an
 endpoint that is another wearing the same media type: GitHub's GraphQL endpoint
 takes `application/json` like the rest of its API, and only there is the
 `query` field a document worth reading.  The first binding that applies wins,
-so a narrow one is written above a broad one. -/
+so a narrow one is written above a broad one.
+
+`media = ["*"]` binds a decoder whatever the client says the body is.  That is
+what a route the policy reads the body of needs: a decoder chosen by media type
+is chosen by the client, and a client that labels a JSON body `text/plain` would
+otherwise send it past every check written over the decoded body — when the
+origin parses it as JSON regardless. -/
 structure DecoderBinding where
   /-- The media types this covers. -/
   media : List String
@@ -225,6 +236,7 @@ def Manifest.ofToml (source : String) : Except String Manifest := do
     inject := ← ((credJson.arr? "inject").mapM injectionOf)
     strip := (strings credJson "strip").map Str.toLowerAscii
     config := credJson
+    allowPlaintext := (credJson.bool? "allow_plaintext").getD false
   }
   for h in credential.hosts do
     if !hosts.contains h then
@@ -266,7 +278,7 @@ def Manifest.decoderFor (m : Manifest) (contentType : Option String)
   -- A binding limited to some requests applies only when the request is known
   -- and matches; without the request, only the unconditional ones are candidates.
   let applies (b : DecoderBinding) : Bool :=
-    b.media.contains bare && match b.when, request with
+    (b.media.contains bare || b.media.contains "*") && match b.when, request with
       | none, _ => true
       | some p, some r => (p.match? r).isSome
       | some _, none => false

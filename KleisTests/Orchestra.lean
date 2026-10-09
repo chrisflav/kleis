@@ -252,6 +252,47 @@ def orchestraTests : IO Unit := do
   checkEq "and reads about no repository" (api "GET" "/rate_limit") anonymous
   checkEq "an endpoint no route knows" (api "POST" "/user/repos" "{\"name\":\"x\"}") none
 
+
+  group "what the reviews found"
+  let wireOf (target : String) : Http.Request :=
+    { method := "GET", target, version := "HTTP/1.1", headers := #[("host", "api.github.com")]
+      framing := .empty }
+  let parsed (target : String) := Model.Request.ofWire (wireOf target) "https" none ByteArray.empty true
+  check "a CR LF in the path is refused" (parsed "/repos/up/proj/x%0d%0aHost:%20y").toOption.isNone
+  check "so is an encoded slash" (parsed "/repos/a%2Fb/proj").toOption.isNone
+  check "and a dot segment" (parsed "/repos/bot/proj/../../up/secret").toOption.isNone
+  let sentAs (t : String) := (parsed t).toOption.map (·.originTarget)
+  checkEq "the target sent upstream is the segments, re-encoded"
+    (sentAs "/repos/up/proj/issues/1/labels/p%20high") (some "/repos/up/proj/issues/1/labels/p%20high")
+  checkEq "and UTF-8 survives the round trip"
+    (sentAs "/repos/up/proj/contents/caf%C3%A9.md") (some "/repos/up/proj/contents/caf%C3%A9.md")
+  checkEq "a comment ends at a carriage return"
+    (ops "query A { a } #\rmutation B { b }") (some [("query", "A"), ("mutation", "B")])
+  let mutation := "{\"query\":\"mutation { addStar(input: {}) { clientMutationId } }\"}"
+  for ct in ["text/plain", "application/x-www-form-urlencoded", "application/graphql+json"] do
+    checkEq s!"a mutation labelled {ct} is still read, and refused"
+      (spentOn (choose registry token "POST" "api.github.com" "/graphql" mutation (some ct))) none
+  checkEq "a duplicated query key is refused"
+    (api "POST" "/graphql" "{\"query\":\"query { a }\",\"query\":\"mutation { b }\"}") none
+  checkEq "a duplicated head is refused"
+    (api "POST" "/repos/up/proj/pulls" "{\"head\":\"bot:x\",\"head\":\"evil:x\",\"base\":\"main\"}") none
+  checkEq "a duplicated review event is refused"
+    (api "POST" "/repos/up/proj/pulls/7/reviews" "{\"event\":\"COMMENT\",\"event\":\"APPROVE\"}") none
+  checkEq "labels as objects are labels"
+    (api "POST" "/repos/up/proj/issues/12/labels" "{\"labels\":[{\"name\":\"p-high\"}]}") none
+  checkEq "a label as a bare string is a label"
+    (api "POST" "/repos/up/proj/issues/12/labels" "\"p-high\"") none
+  checkEq "labels sent as text are still read"
+    (spentOn (choose registry token "POST" "api.github.com" "/repos/up/proj/issues/12/labels"
+      "{\"labels\":[\"p-high\"]}" (some "text/plain"))) none
+  checkEq "a pull request naming a head_repo is refused"
+    (api "POST" "/repos/up/proj/pulls" "{\"head\":\"bot:x\",\"head_repo\":\"other\",\"base\":\"main\"}") none
+  checkEq "a push sent without its content type is still read"
+    (spentOn (choose registry token "POST" "github.com" "/bot/proj.git/git-receive-pack"
+      (Bytes.toStringLossy (deleteBody ["refs/heads/main"])) none)) none
+  let plainBody : Bytes := Bytes.ofString "x"
+  checkEq "nothing past a body\x27s length is part of it"
+    ((Proxy.splitAtFraming (.length 1) (plainBody ++ Bytes.ofString "GET / HTTP/1.1\r\n\r\n")).2.size) 18
   group "creating a repository"
   let creator ← match orchestraToken ["orchestra-github"]
       (base ++ ["task_tool(\"create_repository\")", "task_org(\"bot\")"]) with

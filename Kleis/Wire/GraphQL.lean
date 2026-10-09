@@ -55,6 +55,11 @@ structure Operation where
 private def isNameStart (c : Char) : Bool := c.isAlpha || c == '_'
 private def isNameChar (c : Char) : Bool := c.isAlphanum || c == '_'
 
+/-- A comment runs to the end of its line, and a line ends at a carriage return as
+well as a line feed (the spec's LineTerminator) — ending it only at `\n` would let
+`# …\rmutation { … }` hide an operation from this reader that a server runs. -/
+private def notLineEnd (c : Char) : Bool := c != '\n' && c != '\r'
+
 /-- Skip whitespace, commas, the byte-order mark and `#` comments. -/
 private def skipIgnored (s : List Char) : List Char :=
   let rec go (s : List Char) (fuel : Nat) : List Char :=
@@ -64,7 +69,7 @@ private def skipIgnored (s : List Char) : List Char :=
     | fuel + 1, c :: rest =>
       if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ',' || c == '\uFEFF' then
         go rest fuel
-      else if c == '#' then go (rest.dropWhile (· != '\n')) fuel
+      else if c == '#' then go (rest.dropWhile notLineEnd) fuel
       else s
   go s (s.length + 1)
 
@@ -98,7 +103,7 @@ private def skipBalanced (s : List Char) (depth : Nat) : Option (List Char) :=
       | [] => none
       | '"' :: '"' :: '"' :: rest => (skipBlockString rest).bind (go · depth fuel)
       | '"' :: rest => (skipString rest).bind (go · depth fuel)
-      | '#' :: rest => go (rest.dropWhile (· != '\n')) depth fuel
+      | '#' :: rest => go (rest.dropWhile notLineEnd) depth fuel
       | c :: rest =>
         if c == '{' || c == '(' || c == '[' then go rest (depth + 1) fuel
         else if c == '}' || c == ')' || c == ']' then go rest (depth - 1) fuel
@@ -183,6 +188,7 @@ def graphqlDecoder : PureDecoder where
     if !complete then .need (buf.size + 1)
     else match Json.parse (Bytes.toStringLossy buf) with
       | .ok (.obj fields) =>
+        if (Json.obj fields).hasDuplicateKeys then .opaque else
         match fields.find? (·.1 == "query") with
         | some (_, .str document) =>
           match GraphQL.operations document with

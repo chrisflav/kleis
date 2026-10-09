@@ -25,6 +25,7 @@ bad()  { FAIL=$((FAIL+1)); printf '  FAIL %s\n' "$1"; [ $# -gt 1 ] && printf '  
 check(){ if [ "$1" = "0" ]; then ok "$2"; else bad "$2" "${3:-}"; fi; }
 
 cleanup() {
+  [ -n "${DECL_PID:-}" ] && kill "$DECL_PID" 2>/dev/null
   [ -n "${KLEISD_PID:-}" ] && kill "$KLEISD_PID" 2>/dev/null
   [ -n "${ORIGIN_PID:-}" ] && kill "$ORIGIN_PID" 2>/dev/null
   [ -n "${TLS_ORIGIN_PID:-}" ] && kill "$TLS_ORIGIN_PID" 2>/dev/null
@@ -68,6 +69,8 @@ ref_update($ref) <-
 [credential]
 provider = "static"
 hosts    = ["127.0.0.1"]
+# The test origin speaks plain HTTP; a real service's credential never would.
+allow_plaintext = true
 strip    = ["cookie"]
 
 [[credential.inject]]
@@ -273,11 +276,19 @@ git config --global http.extraHeader "Proxy-Authorization: Bearer $DEV_TOKEN"
 
 echo
 echo "== revocation"
-REV="$("$KLEIS" token list | head -1 | cut -f1)"
+REVOKE_TOKEN="$("$KLEIS" token issue --grant echo-only --bearer ci@revoke --ttl 1h)"
+CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $REVOKE_TOKEN" "$BASE/echo")"
+[ "$CODE" = "200" ]; check $? "a token that will be revoked works first" "got $CODE"
+REV="$("$KLEIS" token inspect --token "$REVOKE_TOKEN" | sed -n '/revocation ids:/{n;p}' | tr -d ' ')"
 "$KLEIS" token revoke "$REV" >/dev/null
 check $? "revoke a token"
-CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Proxy-Authorization: Bearer $DEV_TOKEN" "$BASE/echo")"
-[ "$CODE" = "403" ]; check $? "a revoked token is refused" "got $CODE"
+# The daemon notices the revocation list changed within its few-second poll.
+for _ in $(seq 20); do
+  CODE="$(curl -s -o "$WORK/body" -w '%{http_code}' -H "Proxy-Authorization: Bearer $REVOKE_TOKEN" "$BASE/echo")"
+  [ "$CODE" = "403" ] && break
+  sleep 0.5
+done
+[ "$CODE" = "403" ] && grep -q revoked "$WORK/body"; check $? "a revoked token is refused" "got $CODE: $(cat "$WORK/body")"
 
 echo
 echo "== interception: real https URLs through CONNECT"
@@ -384,6 +395,10 @@ listen = "127.0.0.1:$TLS_KLEIS_PORT"
 mode = "connect"
 upstream_ca_file = "$WORK/origin.crt"
 passthrough = ["localhost"]
+# The test origin is on the loopback and an arbitrary port, which passthrough
+# refuses unless told otherwise.
+passthrough_ports = [$ORIGIN_PORT]
+passthrough_internal = true
 
 [[issuer]]
 name = "ci"
@@ -509,6 +524,7 @@ EOF2
 cat > "$DECL/home/config/config.toml" <<EOF2
 listen = "127.0.0.1:$DECL_PORT"
 mode = "rewrite"
+passthrough = ["localhost"]
 
 [[issuer]]
 name = "ci"
@@ -548,6 +564,48 @@ EOF2
   check $? "and a rotated file is used without a restart" "$OUT"
   ! grep -rq 'file-secret' "$DECL/home/data" 2>/dev/null
   check $? "the secret is never copied into kleis's own files"
+  # Passthrough is confined to public addresses and port 443 unless told otherwise.
+  CODE="$(curl -s -o "$DECL/pt" -w '%{http_code}' --proxy "http://kleis:$JOB@127.0.0.1:$DECL_PORT" \
+    --proxy-basic "http://localhost:443/")"
+  [ "$CODE" != "200" ] && grep -q "does not tunnel to\|could not be reached" "$DECL/pt"
+  check $? "passthrough does not reach the loopback by default" "got $CODE: $(cat "$DECL/pt")"
+  CODE="$(curl -s -o "$DECL/pt" -w '%{http_code}' --proxy "http://kleis:$JOB@127.0.0.1:$DECL_PORT" \
+    --proxy-basic "http://localhost:$ORIGIN_PORT/echo")"
+  [ "$CODE" = "403" ]; check $? "nor a port it was not given" "got $CODE: $(cat "$DECL/pt")"
+  # A request smuggled behind a body: the bytes after it are not relayed, and the
+  # connection is closed rather than left with an answer nobody asked for.
+  python3 - "$DECL_PORT" "$ORIGIN_PORT" "$JOB" > "$DECL/smuggle" <<'PY'
+import socket, sys
+port, origin, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+s = socket.create_connection(("127.0.0.1", port))
+smuggled = f"GET /echo/SMUGGLED HTTP/1.1\r\nHost: 127.0.0.1:{origin}\r\n\r\n"
+s.sendall((f"POST /http/127.0.0.1:{origin}/echo HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Proxy-Authorization: Bearer {token}\r\nContent-Length: 2\r\n\r\nhi" + smuggled).encode())
+s.settimeout(5)
+data = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout:
+    pass
+print(data.decode("latin1"))
+PY
+  [ "$(grep -c '^HTTP/1.1 ' "$DECL/smuggle")" = "1" ] && ! grep -q SMUGGLED "$DECL/smuggle"
+  check $? "bytes behind a body are not relayed as a request" "$(head -c 400 "$DECL/smuggle")"
+  # The next request — another connection, which may be given the pooled one to the
+  # origin — gets its own answer, not one the smuggled request left there.
+  OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo?n=second")"
+  echo "$OUT" | grep -q '"path": "/echo?n=second"' && ! echo "$OUT" | grep -q SMUGGLED
+  check $? "and the next request gets its own answer" "$OUT"
+  CODE="$(curl -s -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo%0d%0aX-Injected:%20yes")"
+  [ "$CODE" = "400" ]; check $? "a CR LF in the path is refused" "got $CODE"
+  CODE="$(curl -s --path-as-is -o /dev/null -w '%{http_code}' -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo/../x")"
+  [ "$CODE" = "400" ]; check $? "and so is a dot segment" "got $CODE"
   kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
   "$KLEISD" > "$DECL/kleisd2.log" 2>&1 &
   DECL_PID=$!

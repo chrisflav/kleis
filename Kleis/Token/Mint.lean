@@ -47,7 +47,12 @@ def mint (registry : Service.Registry) (r : MintRequest) :
   -- proxy is meant to work out for itself.
   for f in r.facts do
     let n := f.predicate.name
-    if n == "use_credential" || registry.manifests.any (·.vocabulary.contains n) then
+    -- And what the grants derive or assert: an issuer allowed `a*` could otherwise
+    -- state `allowed("push")` and satisfy a grant's own bookkeeping.
+    let grantVocabulary := registry.grants.toList.flatMap fun g =>
+      g.rules.map (·.head.name) ++ g.facts.map (·.predicate.name)
+    if n == "use_credential" || registry.manifests.any (·.vocabulary.contains n)
+        || grantVocabulary.contains n then
       return .error s!"`{n}` is reserved and cannot be issued as a fact"
   for name in r.grants do
     match registry.grant? name with

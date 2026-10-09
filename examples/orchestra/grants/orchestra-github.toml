@@ -116,6 +116,10 @@ check if allowed($x);
 
 // ---------------------------------------------------------------- never
 
+// A pull request's head is `owner:branch` on the job's fork; `head_repo` would name
+// some other repository of that owner as the head instead.
+reject if operation("open_pr"), body($p, $v), $p.length() == 1, $p.get(0) == "head_repo";
+
 // Every operation in a GraphQL document is read, so a mutation behind a query
 // is caught too.
 reject if graphql_operation($t), $t != "query";

@@ -43,16 +43,15 @@ deletes_ref($ref) <-
 wants_object($oid) <-
   body($p, $oid), $p.length() == 2, $p.get(0) == "wants";
 
-// The labels a request adds.  GitHub takes `{"labels": [...]}` or a bare
-// array, and `gh api -f 'labels[]=x'` sends the first.
+// The labels a request adds.  GitHub takes them in several shapes — `{"labels":
+// ["x"]}`, `{"labels": [{"name": "x"}]}`, a bare array of either, a bare string —
+// so rather than recognise each, every string anywhere in the body counts as a
+// label being added.  Over-counting only refuses; under-counting would let a label
+// past a grant that bounds them.
 label_added($l) <-
-  operation("add_labels"), body($p, $l), $p.length() == 2, $p.get(0) == "labels";
+  operation("add_labels"), body($p, $l), $l.type() == "string";
 label_added($l) <-
-  operation("add_labels"), body($p, $l), $p.length() == 1, $p.get(0).type() == "integer";
-label_added($l) <-
-  operation("set_labels"), body($p, $l), $p.length() == 2, $p.get(0) == "labels";
-label_added($l) <-
-  operation("set_labels"), body($p, $l), $p.length() == 1, $p.get(0).type() == "integer";
+  operation("set_labels"), body($p, $l), $l.type() == "string";
 
 // Each operation in a GraphQL document, by type: "query", "mutation" or
 // "subscription".  Read by the `graphql` decoder bound below.
@@ -87,20 +86,33 @@ kind     = "header"
 name     = "Authorization"
 template = "Bearer {{secret}}"
 
-# The GraphQL endpoint's body is JSON with a document in it; only there is the
-# document worth reading, so the binding is limited to it and comes first.
+# Decoders are bound by route, whatever Content-Type the client sends (`media =
+# ["*"]`).  The type is the client's to choose, and GitHub reads a JSON body as
+# JSON whatever it is labelled — so a binding by media type would let a body
+# labelled `text/plain` past every rule below that reads it.  A body these cannot
+# read is undecodable, and refused.
+#
+# The GraphQL endpoint first: its body is JSON with a document in it.
 [[decoder]]
-media   = ["application/json"]
+media   = ["*"]
 decoder = "graphql"
 match   = "POST api.github.com /graphql"
 
 [[decoder]]
-media   = ["application/x-git-receive-pack-request"]
+media   = ["*"]
 decoder = "git-receive-pack"
+match   = "POST github.com /{owner}/{repo}/git-receive-pack"
 
 [[decoder]]
-media   = ["application/x-git-upload-pack-request"]
+media   = ["*"]
 decoder = "git-upload-pack"
+match   = "POST github.com /{owner}/{repo}/git-upload-pack"
+
+# Every other write to the API is JSON.
+[[decoder]]
+media   = ["*"]
+decoder = "json"
+match   = "POST|PUT|PATCH|DELETE api.github.com /{rest*}"
 
 # ---------------------------------------------------------------- git
 

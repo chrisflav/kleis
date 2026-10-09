@@ -22,7 +22,9 @@ permissions:
 # Superseded runs are worth nothing and this build is long.
 concurrency:
   group: docker-${{ github.ref }}
-  cancel-in-progress: true
+  # Only for pull requests.  On master each commit's image is what a deployment pins
+  # by its sha, so a run cancelled by the next push would leave a commit with none.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   image:

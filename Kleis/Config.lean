@@ -117,6 +117,15 @@ structure Config where
   What passes through is a blind tunnel: no interception, no credential, no
   policy beyond "the bearer presented a valid token".  The tunnel is audited. -/
   passthrough : List String := []
+  /-- The ports a passthrough host may be reached on.  443 alone by default: what a
+  sandbox needs beyond the manifests is HTTPS, and a tunnel to any port of any host
+  is a way to anything that listens. -/
+  passthroughPorts : List Nat := [443]
+  /-- Whether passthrough may reach internal addresses — loopback, private,
+  link-local (`Net.Tcp.isInternal`).  Off by default: with `passthrough = ["*"]`
+  a bearer could otherwise tunnel to the daemon's own host, the cloud metadata
+  service, or anything on the deployment's internal network. -/
+  passthroughInternal : Bool := false
   /-- The programs allowed to ask for tokens. -/
   issuers : List Issuer := []
   deriving Repr, Inhabited
@@ -124,6 +133,9 @@ structure Config where
 /-- May a host no manifest claims be reached through the proxy? -/
 def Config.passes (c : Config) (host : String) : Bool :=
   c.passthrough.any fun p => Facts.hostMatches (Str.toLowerAscii p) (Str.toLowerAscii host)
+
+/-- May a passthrough host be reached on this port? -/
+def Config.passesPort (c : Config) (port : Nat) : Bool := c.passthroughPorts.contains port
 
 /-- An issuer by name. -/
 def Config.issuer? (c : Config) (name : String) : Option Issuer :=
@@ -173,6 +185,10 @@ def Config.ofToml (source : String) : Except String Config := do
     upstreamIdleSeconds := ((limits.int? "upstream_idle_seconds").getD 30).toNat
     audit := (j.bool? "audit").getD true
     passthrough := (j.arr? "passthrough").filterMap Json.asString?
+    passthroughPorts := match (j.arr? "passthrough_ports").filterMap Json.asInt? with
+      | [] => [443]
+      | ps => ps.map Int.toNat
+    passthroughInternal := (j.bool? "passthrough_internal").getD false
     issuers }
 
 /-- Load the configuration, or the defaults if there is no file. -/

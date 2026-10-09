@@ -228,6 +228,19 @@ def parse (s : String) : Except String Json := do
 
 /-! ## Writing -/
 
+/-- Does any object in this value name a key twice?
+
+Parsers disagree about which of two values for one key counts — this one keeps
+both and its lookups find the first, most servers keep the last — and a policy
+that read one while the origin acted on the other would be deciding about a
+request nobody sent.  A body that does this is not one to read at all. -/
+partial def hasDuplicateKeys : Json → Bool
+  | .obj fields =>
+    let names := fields.map (·.1)
+    names.length != names.eraseDups.length || fields.any (hasDuplicateKeys ·.2)
+  | .arr l => l.any hasDuplicateKeys
+  | _ => false
+
 /-- Escape a string for output. -/
 def escape (s : String) : String :=
   String.ofList (s.toList.flatMap fun c =>

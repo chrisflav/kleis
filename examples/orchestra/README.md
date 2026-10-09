@@ -87,3 +87,10 @@ Then add a `kleis` block to orchestra's `config.json`; see orchestra's
   exist.
 - **App installations:** one per credential.  Forks in a second organisation
   need a second `github-app` credential and a route to it.
+- **Scope on the upstream** is the repository, not the job's pull request: a job
+  with `merge_pr` may merge any pull request there, and one with `create_pr`
+  may add its pull request labels to any issue — the number of a pull request
+  is not known until it exists.
+- **GraphQL queries** go out on the App's token, so a job can read whatever the
+  installation can, including other jobs' forks; the same was true of the
+  installation token it used to hold.

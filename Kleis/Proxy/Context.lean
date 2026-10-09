@@ -75,7 +75,8 @@ sub-step still finds the repository it created.  Kept in one append-only file
 so a restart does not forget, and in memory behind a mutex. -/
 structure Memory where
   private mk ::
-  private entries : Std.Mutex (Array (String × Builder.Fact))
+  /-- Token key, fact, and when the token expires (0 if unknown). -/
+  private entries : Std.Mutex (Array (String × Builder.Fact × Nat))
 
 /-- The key a token's memories are filed under. -/
 def Memory.keyOf (token : LeanBiscuit.Token.Biscuit) : String :=
@@ -83,36 +84,44 @@ def Memory.keyOf (token : LeanBiscuit.Token.Biscuit) : String :=
 
 /-- Load what was remembered before. -/
 def Memory.load : IO Memory := do
-  let mut entries : Array (String × Builder.Fact) := #[]
+  -- What a token remembered goes with the token: once it has expired nothing can
+  -- present it, so its facts are dropped rather than carried for ever.
+  let now ← Store.now
+  let mut entries : Array (String × Builder.Fact × Nat) := #[]
   if let some text ← Store.read? (← Dirs.remembered) then
     for line in text.splitOn "\n" do
       if let .ok j := Json.parse line then
         if let (some key, some fj) := (j.str? "token", j.field? "fact") then
           if let .ok f := Token.factOfJson fj then
-            entries := entries.push (key, f)
+            let expires := ((j.int? "expires").getD 0).toNat
+            if expires == 0 || expires > now then
+              entries := entries.push (key, f, expires)
   return ⟨← Std.Mutex.new entries⟩
 
 /-- The facts remembered for a token. -/
 def Memory.factsFor (m : Memory) (token : LeanBiscuit.Token.Biscuit) : IO (List Builder.Fact) :=
   let key := Memory.keyOf token
   m.entries.atomically do
-    return ((← get).filter (·.1 == key)).toList.map (·.2)
+    let now ← Store.now
+    return ((← get).filter fun (k, _, e) => k == key && (e == 0 || e > now)).toList.map (·.2.1)
 
 /-- Remember facts for a token, once each. -/
 def Memory.add (m : Memory) (token : LeanBiscuit.Token.Biscuit) (facts : List Builder.Fact) :
     IO Unit := do
   let key := Memory.keyOf token
   if key.isEmpty then return
+  let expires := ((← Token.findIssuedExactly? key).map (·.expires)).getD 0
   m.entries.atomically do
     for f in facts do
       let some fj := Token.factToJson? f | continue
       let rendered := Json.render fj
-      let known := (← get).any fun (k, g) =>
+      let known := (← get).any fun (k, g, _) =>
         k == key && ((Token.factToJson? g).map Json.render) == some rendered
       if !known then
         Store.appendLine (← Dirs.remembered)
-          (Json.render (.obj [("token", .str key), ("fact", fj)]))
-        modify (·.push (key, f))
+          (Json.render (.obj [("token", .str key), ("fact", fj),
+                              ("expires", .num (toString expires))]))
+        modify (·.push (key, f, expires))
 
 /-- Everything a connection handler needs. -/
 structure Context where
@@ -138,6 +147,8 @@ structure Context where
   pool : Pool
   /-- Facts remembered for tokens. -/
   memory : Memory
+  /-- Credentials declared in the configuration, read with it rather than per request. -/
+  declared : IO.Ref (Array Credential.Record)
 
 /-- Build the shared state. -/
 def Context.create (config : Config) : IO Context := do
@@ -169,16 +180,21 @@ def Context.create (config : Config) : IO Context := do
     counter := ← IO.mkRef 0
     audit := ← AuditLog.create
     pool := ← Pool.create config.upstreamIdleSeconds
-    memory := ← Memory.load }
+    memory := ← Memory.load
+    declared := ← IO.mkRef (← Credential.declared) }
 
 /-- Re-read manifests, grants and revocations, and forget cached credentials. -/
 def Context.reload (ctx : Context) : IO Unit := do
   -- Loaded before anything is replaced, so a registry that fails to load
   -- leaves the old one in place rather than half of a new one.
   let registry ← Service.Registry.load
+  let declared ← Credential.declared
   let revocations ← Token.loadRevocations
   ctx.registry.set registry
-  ctx.revocations.set revocations
+  ctx.declared.set declared
+  -- A union, not a replacement: a revocation an issuer made a moment ago is in memory
+  -- and on disk, but a read of the file that raced its write would drop it.
+  ctx.revocations.modify fun r => { r with ids := revocations.ids ++ r.ids.filter (!revocations.ids.contains ·) }
   ctx.credentials.clear
 
 /-- What the files a reload reads look like now: each one's path and modification
@@ -222,9 +238,14 @@ partial def Context.watch (ctx : Context) (log : String → IO Unit)
       catch e =>
         log s!"kleis: configuration changed but did not load, keeping the previous one: {e}"
         -- Revocations do not depend on the rest loading.
-        try ctx.revocations.set (← Token.loadRevocations) catch _ => pure ()
+        try
+          let disk ← Token.loadRevocations
+          ctx.revocations.modify fun r => { r with ids := disk.ids ++ r.ids.filter (!disk.ids.contains ·) }
+        catch _ => pure ()
     else if now.2 != last.2 then
-      try ctx.revocations.set (← Token.loadRevocations)
+      try
+        let disk ← Token.loadRevocations
+        ctx.revocations.modify fun r => { r with ids := disk.ids ++ r.ids.filter (!disk.ids.contains ·) }
       catch e => log s!"kleis: the revocation list did not load: {e}"
     loop now
   loop (← snapshot)

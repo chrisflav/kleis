@@ -91,7 +91,12 @@ private def mintFor (ctx : Context) (issuer : Issuer) (body : Json) :
   for g in grants do
     if !issuer.mayClaim g then
       return .error (403, s!"the issuer `{issuer.name}` may not issue the grant `{g}`")
-  let ttl := ((body.field? "ttl").bind durationOf).getD issuer.maxTtl
+  -- A `ttl` that does not parse is an error, not the maximum: "30 minutes" asked for less.
+  let ttl ← match body.field? "ttl" with
+    | none => pure issuer.maxTtl
+    | some j => match durationOf j with
+      | some t => pure t
+      | none => return .error (400, "`ttl` is seconds or a duration such as `8h`")
   if ttl == 0 then return .error (400, "`ttl` must be positive")
   if ttl > issuer.maxTtl then
     return .error (403, s!"the issuer `{issuer.name}` may issue tokens of at most {issuer.maxTtl}s")

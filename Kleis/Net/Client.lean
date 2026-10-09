@@ -85,8 +85,11 @@ def readResponse (s : Stream) (method : String) (maxBody : Nat) : IO Fetched := 
 
 /-- Open a connection to an origin, wrapping it in TLS when the scheme calls
 for it. -/
-def openOrigin (clientCtx : Tls.Context) (scheme host : String) (port : UInt16) : IO Stream := do
-  let raw ← Tcp.connect host port
+def openOrigin (clientCtx : Tls.Context) (scheme host : String) (port : UInt16)
+    (allow : Option (Std.Net.SocketAddress → Bool) := none) : IO Stream := do
+  let raw ← match allow with
+    | some a => Tcp.connectChecked host port a
+    | none => Tcp.connect host port
   if scheme == "https" then tlsClient clientCtx raw host else pure raw
 
 /-- Make one request and read the response. -/

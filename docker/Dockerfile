@@ -22,17 +22,16 @@ COPY Kleis.lean Kleisd.lean Main.lean ./
 COPY Kleis ./Kleis
 COPY ffi ./ffi
 # The two executables, not the default target: the test driver has no place in the image.
-# Lean's bundled linker does not search the distribution's multiarch directory, so the
-# directory OpenSSL lives in is named explicitly.
-ENV LIBRARY_PATH=/usr/lib/x86_64-linux-gnu
+# They link the Lean toolchain's own static OpenSSL, so OpenSSL fixes reach the image with a
+# toolchain bump rather than from apt; libssl-dev above is for the shim's headers.
 RUN lake build kleis kleisd
 
 # ---- Runtime ----
 FROM debian:bookworm-slim AS runtime
-# `libssl3` is what the binaries load; `ca-certificates` is the trust store origins are verified
-# against (kleisd refuses to start with an empty one); `curl` is for the health check.
+# `ca-certificates` is the trust store origins are verified against (kleisd refuses to start
+# with an empty one); `curl` is for the health check.  No libssl: the binaries carry their own.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates libssl3 curl \
+      ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/.lake/build/bin/kleisd /src/.lake/build/bin/kleis /usr/local/bin/
 

@@ -134,12 +134,18 @@ organisation or a user, tried in that order. -/
 private def githubAppInstallation (ctx : Net.Tls.Context) (api jwt owner : String) : IO Nat := do
   let headers := #[("authorization", s!"Bearer {jwt}"), ("accept", "application/vnd.github+json"),
                    ("user-agent", "kleis")]
+  -- A 404 from both means no installation; anything else is a different problem —
+  -- a JWT GitHub rejects, a rate limit — and is reported as what it is.
+  let mut statuses : List Nat := []
   for kind in ["orgs", "users"] do
     let response ← Net.fetch ctx "GET" s!"{api}/{kind}/{Str.percentEncode owner}/installation" headers
     if response.status == 200 then
       if let .ok j := Json.parse response.text then
         if let some id := j.int? "id" then return id.toNat
-  throw (IO.userError s!"the GitHub App has no installation on `{owner}`")
+    statuses := statuses ++ [response.status]
+  if statuses.all (· == 404) then
+    throw (IO.userError s!"the GitHub App has no installation on `{owner}`")
+  throw (IO.userError s!"looking up the GitHub App's installation on `{owner}` failed: GitHub answered {statuses}")
 
 /-- Mint a GitHub App installation token.
 

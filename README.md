@@ -192,6 +192,10 @@ installed into kleis's own encrypted store:
 - an `[[issuer]]` with a `token_file` has kleisd keep that issuer's credential
   there, renewed at startup before it expires, for an issuer running beside it.
 
+Passthrough reaches public addresses on port 443 only, unless `passthrough_ports`
+and `passthrough_internal` say otherwise; a credential goes out over https only,
+unless its manifest sets `allow_plaintext` (for a local test origin).
+
 ## Licence
 
 Apache 2.0. See [LICENSE](LICENSE).
