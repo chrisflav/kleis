@@ -24,8 +24,14 @@ open LeanBiscuit (Bytes)
 def restrict (p : System.FilePath) (mode : String := "600") : IO Unit := do
   let _ ← IO.Process.run { cmd := "chmod", args := #[mode, p.toString] }
 
-/-- Create a directory and everything above it, owner-only. -/
+/-- Create a directory and everything above it, owner-only.
+
+A directory that already exists is left as it is: one the operator made — a
+mount, a setgid directory shared with another account — has the permissions
+they chose, and changing them is not this function's call, nor always possible
+for the account kleis runs as. -/
 def mkdir (p : System.FilePath) : IO Unit := do
+  if ← p.isDir then return
   IO.FS.createDirAll p
   restrict p "700"
 
