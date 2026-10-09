@@ -226,7 +226,10 @@ private def sendUpstream (ctx : Context) (job : Job) (outgoing : Model.Request)
     if !(← sendHead origin head body) then return none
     let after ← relayBody job.client origin job.wire.framing body
     if after.size > 0 then clientExcess.set after
-    relayResponse ctx origin job.client outgoing.method requestId clientCloses started
+    -- A client whose pipelined bytes were dropped is told the connection ends here, so it
+    -- sends that request again rather than wait for an answer that is not coming.
+    relayResponse ctx origin job.client outgoing.method requestId
+      (clientCloses || (← clientExcess.get).size > 0) started
   let retryable := idempotent outgoing.method && body.framingDone
   let pooled ← if pooling && retryable then ctx.pool.take? key else pure none
   let viaFresh : IO (Net.Stream × Relayed) := do

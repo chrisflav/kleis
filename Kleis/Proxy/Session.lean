@@ -1,3 +1,4 @@
+import Std.Internal.UV.Timer
 import Kleis.Proxy.Admin
 import Kleis.Net.ClientHello
 import Kleis.Net.TlsStream
@@ -63,14 +64,22 @@ past it. -/
 def readHead (s : Net.Stream) (limits : Http.Limits) (already : Bytes)
     (timeoutSeconds : Nat := 30) : IO (Option (Http.Request × Bytes)) := do
   -- A client that opens a connection and sends no request — or not all of one —
-  -- holds a thread and a descriptor for as long as it likes.  A watchdog closes the
-  -- stream if the head has not arrived in time, which wakes the read below.
-  let done ← IO.mkRef false
-  if timeoutSeconds > 0 then
-    let _ ← IO.asTask (prio := .dedicated) do
-      IO.sleep (UInt32.ofNat (timeoutSeconds * 1000))
-      if !(← done.get) then s.close
-  try go already 4096 finally done.set true
+  -- would hold a thread and a descriptor for as long as it liked.  A libuv timer
+  -- closes the stream if the head has not arrived in time, which wakes the read
+  -- below.  A timer rather than a sleeping task: it costs no thread while it waits,
+  -- and stopping it when the head arrives drops its hold on the stream at once —
+  -- a sleeping task would keep both for the whole timeout on every connection,
+  -- which anyone able to connect could use to exhaust them.
+  if timeoutSeconds == 0 then return ← go already 4096
+  let timer ← Std.Internal.UV.Timer.mk (UInt64.ofNat (timeoutSeconds * 1000)) false
+  let fired ← timer.next
+  -- The callback may run on libuv's own loop, where waiting for a socket operation —
+  -- which closing does — would wait for itself; so the close is handed to a task of its
+  -- own, which exists only for a connection that actually timed out.
+  let _ ← IO.mapTask (t := fired.result?) fun r => do
+    if r.isSome then
+      let _ ← IO.asTask (prio := .dedicated) s.close
+  try go already 4096 finally timer.stop
 where
   go (buf : Bytes) (fuel : Nat) : IO (Option (Http.Request × Bytes)) := do
     match Http.readRequest buf limits with

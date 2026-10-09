@@ -50,7 +50,6 @@ def ofSocket (sock : Socket) (describe : String) : IO Stream := do
       if !(← closed.get) then
         closed.set true
         closedSignal.resolve ()
-        try sock.cancelRecv catch _ => pure ()
         try await (← sock.shutdown) catch _ => pure ()
     describe
   }

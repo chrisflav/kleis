@@ -104,7 +104,10 @@ def readBodyPrefix (s : Net.Stream) (framing : Http.Framing) (decoder : Wire.Dec
     | .done value _ => return (seen, some value)
     | .opaque =>
       match decoder with
-      | .exec command args => return (seen, ← Wire.runExec command args entity)
+      -- Only a whole body: a decoder run on a prefix cut off at the cap would answer for
+      -- bytes it never saw, and nothing would mark the answer as partial.
+      | .exec command args =>
+        if complete then return (seen, ← Wire.runExec command args entity) else return (seen, none)
       | _ => return (seen, none)
     | .need atLeast =>
       if complete then return (seen, none)
