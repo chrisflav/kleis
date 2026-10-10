@@ -456,9 +456,12 @@ A `github-app` credential finds its installation by `installation_id`, or by
 looking it up on `owner`. An App is installed per account, and its tokens reach
 only that account's repositories, so with `per_owner = true` the lookup is on
 the owner of the repository the request is about instead, and `owner` is only
-for a request about none (GraphQL). Each owner's token is cached on its own, and
-an owner the App is not installed on is remembered for ten minutes and refused
-without asking GitHub again.
+for a request about none (GraphQL), and for one about an owner the App is not
+installed on, which is remembered for ten minutes and not asked about again.
+Each owner's token is cached on its own. The owner is the first term of the first
+resource fact, so a manifest whose resources are about several owners lists the
+one to mint for first. A `repositories` narrowing names `owner/repo` entries
+under `per_owner`, and a token is narrowed to the minting owner's.
 
 `exec` is why "adding a provider costs a file, if `exec` will do" is in the
 table: any credential you can obtain with a shell command needs no Lean. The

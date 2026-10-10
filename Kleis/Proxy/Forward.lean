@@ -406,7 +406,7 @@ def forward (ctx : Context) (job : Job) : IO Bool := do
               throw (IO.userError s!"the credential `{credentialName}` is for `{credentialRecord.service}`, not `{manifest.name}`")
             let secret ← Credential.resolve ctx.credentials ctx.clientCtx credentialRecord
               grant.narrow
-              (authorized.resources.head?.bind fun r => (r.splitOn "/").head?)
+              authorized.owner
             auditRecord := { auditRecord with
               credential := some (credentialName, secret.fingerprint) }
             match Credential.bind authorized secret with

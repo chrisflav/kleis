@@ -126,10 +126,9 @@ structure AuthorizedRequest where
   /-- The credential to spend, or `none` to forward without one, as the grant
   chose it (`Grant.chooseCredential`). -/
   credential : Option String
-  /-- What the request is about, as `Manifest.resourcesOf` names it — `owner/repo`,
-  `org/name`, `org` — in the manifest's order.  A provider that mints per owner reads
-  the first. -/
-  resources : List String
+  /-- The owner of what the request is about (`Manifest.ownerOf`), which a provider
+  that mints per owner mints for. -/
+  owner : Option String
 
 /-- Everything a decision produced, for the audit log and for the client. -/
 structure Outcome where
@@ -239,13 +238,13 @@ def run (i : Input) : Outcome :=
         { decision := .deny (TokenError.toString e) (failedChecks e)
           facts, revocationIds, authorized := none }
       | .ok policy =>
-        let resources := i.manifest.resourcesOf
-          (i.manifest.contribute i.request i.body.value? ++ i.remembered)
+        let contributed := i.manifest.contribute i.request i.body.value? ++ i.remembered
+        let resources := i.manifest.resourcesOf contributed
         let credential := i.grant.chooseCredential resources (derivedCredentials dump)
         { decision := .allow policy
           facts, revocationIds
           authorized := some (AuthorizedRequest.mk i.request i.manifest i.grant policy
-            (i.manifest.gatesResponse i.request i.body.value?) credential resources) }
+            (i.manifest.gatesResponse i.request i.body.value?) credential (i.manifest.ownerOf contributed)) }
 
 /-- Was this allowed? -/
 def Outcome.allowed (o : Outcome) : Bool :=

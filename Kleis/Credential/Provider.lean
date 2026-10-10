@@ -155,6 +155,40 @@ private def githubAppInstallation (ctx : Net.Tls.Context) (api jwt owner : Strin
   if statuses.all (· == 404) then return none
   throw (IO.userError s!"looking up the GitHub App's installation on `{owner}` failed: GitHub answered {statuses}")
 
+/-- Could this be a GitHub account name: 1 to 39 letters, digits and hyphens.  An
+owner that could not is never looked up — it would only cost two calls to learn
+that GitHub has no such account — and the configured owner is used instead. -/
+def isGitHubLogin (s : String) : Bool :=
+  !s.isEmpty && s.length ≤ 39 && s.all (fun c => c.isAlphanum || c == '-')
+
+/-- Whether a `github-app` credential is minted per owner: `per_owner = true`,
+and no `installation_id`, which fixes the installation whatever the owner. -/
+def perOwner (config : Json) : Bool :=
+  config.bool? "per_owner" == some true && (config.int? "installation_id").isNone
+
+/-- How many owners without an installation are remembered at once.  Past it the
+oldest is forgotten, so a bearer naming owner after owner cannot grow the list
+without bound. -/
+def missingInstallationCap : Nat := 1024
+
+/-- A grant's `repositories` narrowing for a token minted on `owner`'s
+installation.  A bare name means a repository of whichever installation is
+minted, which for a `per_owner` App is any owner's — so there only `owner/repo`
+entries are accepted, and those of other owners dropped.  `none` when nothing
+the grant named is under this owner: the token would otherwise be unnarrowed. -/
+def narrowRepositories (perOwner : Bool) (owner : Option String) (repositories : List String) :
+    Except String (Option (List String)) :=
+  if repositories.isEmpty then .ok (some [])
+  else if !perOwner then .ok (some repositories)
+  else if repositories.any (!·.contains '/') then
+    .error "a `per_owner` App narrows by `owner/repo`, not by a bare repository name"
+  else
+    let mine := repositories.filterMap fun r =>
+      match r.splitOn "/" with
+      | [o, n] => if some o.toLower == owner.map (·.toLower) then some n else none
+      | _ => none
+    .ok (if mine.isEmpty then none else some mine)
+
 /-- The account a GitHub App credential's installation is looked up on, for a
 request about `requestOwner`.
 
@@ -167,9 +201,9 @@ in another — and `owner` is what a request about no repository (GraphQL) uses.
 look one up on. -/
 def installationOwner (config : Json) (requestOwner : Option String) : Option String :=
   let configured := config.str? "owner"
-  if config.bool? "per_owner" == some true then
+  if perOwner config then
     match requestOwner with
-    | some o => if o.isEmpty then configured else some o
+    | some o => if isGitHubLogin o then some o else configured
     | none => configured
   else configured
 
@@ -182,21 +216,15 @@ installation is `installation_id` or else looked up on `owner` (see
 is used as it is.  The key never leaves this function; what goes upstream is the
 installation token, which lasts an hour and is cached until shortly before then.
 
-An owner the App turns out not to be installed on is remembered in `missing` for
-`missingInstallationTtl`, so that it is not asked about again on every request. -/
+An owner the App is not installed on is remembered in `missing` for
+`missingInstallationTtl`, so that it is not asked about on every request, and the
+token is minted on the configured `owner`'s installation instead: what a
+credential naming one owner always did, and what still reads a public repository
+of anybody's. -/
 private def githubAppSecret (ctx : Net.Tls.Context) (missing : IO.Ref (Array (String × Nat)))
     (name : String) (config : Json) (material : Secret) (narrow : Json) (owner : Option String) :
     IO Live := do
   let api := (config.str? "api").getD "https://api.github.com"
-  let installation? := config.int? "installation_id"
-  -- Asked before signing anything: an owner already known to have no installation
-  -- costs nothing.
-  let missingKey := owner.map fun o => s!"{name}\n{o.toLower}"
-  if installation?.isNone then
-    if let some k := missingKey then
-      let now ← Store.now
-      if (← missing.get).any (fun (k', due) => k' == k && now < due) then
-        throw (IO.userError s!"the GitHub App has no installation on `{owner.getD ""}`")
   let raw := Secret.reveal material
   let isPem := (Bytes.toStringLossy (Bytes.take raw 64)).trimAscii.toString.startsWith "-----BEGIN"
   let jwt ← if isPem then do
@@ -204,25 +232,44 @@ private def githubAppSecret (ctx : Net.Tls.Context) (missing : IO.Ref (Array (St
         | throw (IO.userError "a `github-app` credential holding a private key needs an `app_id`")
       githubAppJwt appId.toNat raw
     else pure (Str.trim (Bytes.toStringLossy raw))
-  let installation ← match installation? with
-    | some id => pure id.toNat
+  -- The installation on `o`, or `none` if there is none — remembered either way
+  -- for as long as the answer is worth trusting.
+  let lookup (o : String) : IO (Option Nat) := do
+    let k := s!"{name}\n{o.toLower}"
+    let now ← Store.now
+    if (← missing.get).any (fun (k', due) => k' == k && now < due) then return none
+    match ← githubAppInstallation ctx api jwt o with
+    | some id => return some id
     | none =>
-      match owner with
-      | some o =>
-        match ← githubAppInstallation ctx api jwt o with
-        | some id => pure id
-        | none =>
-          if let some k := missingKey then
-            let now ← Store.now
-            missing.modify fun ms =>
-              (ms.filter fun (k', due) => k' != k && now < due).push
-                (k, now + missingInstallationTtl)
-          throw (IO.userError s!"the GitHub App has no installation on `{o}`")
+      missing.modify fun ms =>
+        let kept := ms.filter fun (k', due) => k' != k && now < due
+        let kept := if kept.size < missingInstallationCap then kept
+          else kept.extract (kept.size + 1 - missingInstallationCap) kept.size
+        kept.push (k, now + missingInstallationTtl)
+      return none
+  let configured := config.str? "owner"
+  let (installation, mintedOn) ← match config.int? "installation_id" with
+    | some id => pure (id.toNat, configured)
+    | none =>
+      let candidates := (owner.toList ++ configured.toList).eraseDups
+      if candidates.isEmpty then throw (IO.userError
+        "a `github-app` credential needs an `installation_id`, or an `owner` to look one up on")
+      let mut found : Option (Nat × String) := none
+      for o in candidates do
+        if found.isNone then
+          if let some id ← lookup o then found := some (id, o)
+      match found with
+      | some (id, o) => pure (id, some o)
       | none => throw (IO.userError
-          "a `github-app` credential needs an `installation_id`, or an `owner` to look one up on")
+          s!"the GitHub App has no installation on {" or ".intercalate (candidates.map (s!"`{·}`"))}")
   let url := s!"{api}/app/installations/{installation}/access_tokens"
-  -- The narrowing the grant asked for, passed straight through to GitHub.
-  let repositories := (narrow.arr? "repositories").filterMap Json.asString?
+  -- The narrowing the grant asked for, for the installation the token is minted on.
+  let repositories ← match narrowRepositories (perOwner config) mintedOn
+      ((narrow.arr? "repositories").filterMap Json.asString?) with
+    | .ok (some rs) => pure rs
+    | .ok none => throw (IO.userError
+        s!"the grant narrows the token to repositories none of which is under `{mintedOn.getD ""}`")
+    | .error e => throw (IO.userError e)
   let body := Json.render (.obj (
     (if repositories.isEmpty then []
      else [("repositories", Json.arr (repositories.map Json.str))])
@@ -261,8 +308,8 @@ def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : 
   -- secret, and keying it by owner would only mint it again for each.
   let owner := if record.provider == "github-app" then installationOwner record.config requestOwner
     else none
-  let perOwner := record.provider == "github-app" && record.config.bool? "per_owner" == some true
-  let key := cacheKey record.name narrow (if perOwner then owner else none)
+  let keyed := record.provider == "github-app" && perOwner record.config
+  let key := cacheKey record.name narrow (if keyed then owner else none)
   -- A static secret read from a file is read again each time: the file is the secret's
   -- home, and a rotation there should take effect on the next request rather than after
   -- a restart.  What a provider mints from it is still cached — an installation token

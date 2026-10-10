@@ -82,5 +82,18 @@ def providerTests : IO Unit := do
     (Credential.cacheKey "app" (.obj []) (some "acme") != Credential.cacheKey "app" (.obj []) (some "beta"))
   checkEq "a credential minted for no owner keeps its old key"
     (Credential.cacheKey "app" (.obj [])) "app\n{}"
+  checkEq "a name GitHub could not have is not an owner"
+    (Credential.installationOwner per (some "a/b")) (some "acme")
+  checkEq "nor is one with a dot" (Credential.installationOwner per (some "..")) (some "acme")
+  let fixed := Json.obj [("installation_id", .num "7"), ("owner", .str "acme"), ("per_owner", .bool true)]
+  check "an installation_id fixes the installation, per_owner or not" (!Credential.perOwner fixed)
+  checkEq "a narrowing keeps what it said without per_owner"
+    (Credential.narrowRepositories false (some "x") ["kleis"]).toOption (some (some ["kleis"]))
+  check "per_owner refuses a bare repository name"
+    (Credential.narrowRepositories true (some "acme") ["kleis"] matches .error _)
+  checkEq "and keeps the minting owner's own"
+    (Credential.narrowRepositories true (some "Acme") ["acme/a", "beta/b"]).toOption (some (some ["a"]))
+  checkEq "and has nothing to mint where none is that owner's"
+    (Credential.narrowRepositories true (some "gamma") ["acme/a"]).toOption (some none)
 
 end KleisTests

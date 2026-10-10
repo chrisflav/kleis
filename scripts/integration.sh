@@ -455,13 +455,17 @@ OUT="$(app /echo/plain)"
 echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
 check $? "a request about no repository uses the configured owner" "$OUT"
 OUT="$(app /echo/repo/nope/q)"
-[ "$(echo "$OUT" | tail -1)" = "502" ] && echo "$OUT" | grep -q "no installation on"
-check $? "an owner the App is not installed on is refused, and says why" "$OUT"
+echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
+check $? "an owner the App is not installed on falls back to the configured owner" "$OUT"
 OUT="$(app /echo/repo/nope/r)"
-[ "$(echo "$OUT" | tail -1)" = "502" ]
-check $? "and is refused again" "$OUT"
+echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
+check $? "and does again, from what was remembered" "$OUT"
+OUT="$(app /echo/repo/no.such/r)"
+echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
+check $? "a name that cannot be a GitHub account is never looked up" "$OUT"
 OUT="$(lookups)"
 echo "$OUT" | grep -q '"acme": 1' && echo "$OUT" | grep -q '"beta": 1' && echo "$OUT" | grep -q '"nope": 1'
+echo "$OUT" | grep -qv "no.such"
 check $? "each owner was looked up once: the tokens and the miss are remembered" "$OUT"
 grep -q 'inst-11\|inst-22' "$KLEIS_HOME/data/audit.log"
 if [ $? -eq 0 ]; then bad "no installation token reaches the audit log"; else ok "no installation token reaches the audit log"; fi
