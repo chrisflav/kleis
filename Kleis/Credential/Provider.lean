@@ -326,7 +326,11 @@ def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : 
     let candidates : List (Option String) :=
       if !keyed then [asked]
       else if asked.map (·.toLower) == configured.map (·.toLower) then [configured]
-      else [asked, configured]
+      -- A missing configured owner is no fallback, and asking it would only report
+      -- the credential as misconfigured instead of the owner as not installed.
+      else match configured with
+        | some _ => [asked, configured]
+        | none => [asked]
     let known (o : String) : IO Bool := do
       let k := s!"{record.name}\n{o.toLower}"
       return (← cache.missing.get).any (fun (k', due) => k' == k && now < due)
