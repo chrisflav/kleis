@@ -217,13 +217,11 @@ is used as it is.  The key never leaves this function; what goes upstream is the
 installation token, which lasts an hour and is cached until shortly before then.
 
 An owner the App is not installed on is remembered in `missing` for
-`missingInstallationTtl`, so that it is not asked about on every request, and the
-token is minted on the configured `owner`'s installation instead: what a
-credential naming one owner always did, and what still reads a public repository
-of anybody's. -/
+`missingInstallationTtl`, so that it is not asked about on every request, and is
+`none`; `resolve` then uses the configured `owner`'s token instead. -/
 private def githubAppSecret (ctx : Net.Tls.Context) (missing : IO.Ref (Array (String × Nat)))
     (name : String) (config : Json) (material : Secret) (narrow : Json) (owner : Option String) :
-    IO Live := do
+    IO (Option Live) := do
   let api := (config.str? "api").getD "https://api.github.com"
   let raw := Secret.reveal material
   let isPem := (Bytes.toStringLossy (Bytes.take raw 64)).trimAscii.toString.startsWith "-----BEGIN"
@@ -251,17 +249,13 @@ private def githubAppSecret (ctx : Net.Tls.Context) (missing : IO.Ref (Array (St
   let (installation, mintedOn) ← match config.int? "installation_id" with
     | some id => pure (id.toNat, configured)
     | none =>
-      let candidates := (owner.toList ++ configured.toList).eraseDups
-      if candidates.isEmpty then throw (IO.userError
-        "a `github-app` credential needs an `installation_id`, or an `owner` to look one up on")
-      let mut found : Option (Nat × String) := none
-      for o in candidates do
-        if found.isNone then
-          if let some id ← lookup o then found := some (id, o)
-      match found with
-      | some (id, o) => pure (id, some o)
+      match owner with
       | none => throw (IO.userError
-          s!"the GitHub App has no installation on {" or ".intercalate (candidates.map (s!"`{·}`"))}")
+          "a `github-app` credential needs an `installation_id`, or an `owner` to look one up on")
+      | some o =>
+        match ← lookup o with
+        | some id => pure (id, some o)
+        | none => return none
   let url := s!"{api}/app/installations/{installation}/access_tokens"
   -- The narrowing the grant asked for, for the installation the token is minted on.
   let repositories ← match narrowRepositories (perOwner config) mintedOn
@@ -289,7 +283,7 @@ private def githubAppSecret (ctx : Net.Tls.Context) (missing : IO.Ref (Array (St
     | throw (IO.userError "GitHub returned no token")
   -- Installation tokens last an hour; the expiry is returned but a fixed
   -- margin is enough and avoids depending on a timestamp format.
-  return { secret := Secret.ofString token, expires := some ((← Store.now) + 3000) }
+  return some { secret := Secret.ofString token, expires := some ((← Store.now) + 3000) }
 
 /-- The cache key for a credential, a narrowing and — where the credential is
 minted per owner — the owner, lowercased, as GitHub compares account names. -/
@@ -300,35 +294,66 @@ def cacheKey (name : String) (narrow : Json) (owner : Option String := none) : S
 
 /-- Obtain a usable secret for a credential, refreshing or minting if what is
 cached has expired.  `requestOwner` is the owner of the repository the request
-is about, which a `per_owner` GitHub App mints for. -/
+is about, which a `per_owner` GitHub App mints for.
+
+For a `per_owner` App the request's owner is tried first and the configured
+`owner` second, each through the cache: an owner the App is not installed on —
+found out once, then remembered — is served from the configured owner's one token,
+so a bearer naming owner after owner neither mints a token for each nor grows
+the cache by one. -/
 def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : Json)
     (requestOwner : Option String := none) : IO Secret := do
   let now ← Store.now
-  -- Only a `per_owner` App's tokens differ by owner; every other credential is one
-  -- secret, and keying it by owner would only mint it again for each.
-  let owner := if record.provider == "github-app" then installationOwner record.config requestOwner
-    else none
-  let keyed := record.provider == "github-app" && perOwner record.config
-  let key := cacheKey record.name narrow (if keyed then owner else none)
   -- A static secret read from a file is read again each time: the file is the secret's
   -- home, and a rotation there should take effect on the next request rather than after
   -- a restart.  What a provider mints from it is still cached — an installation token
   -- lasts an hour whatever happens to the key it was minted with.
   if record.secretFile.isSome && record.provider == "static" then
     return staticSecret (← unlock record)
-  let entries ← cache.entries.get
-  if let some (_, live) := Array.find? (fun (k, _) => k == key) entries then
-    if live.fresh now then return live.secret
+  let cached (key : String) : IO (Option Secret) := do
+    match Array.find? (fun (k, _) => k == key) (← cache.entries.get) with
+    | some (_, live) => return if live.fresh now then some live.secret else none
+    | none => return none
+  -- Expired entries go when something is stored, so the cache holds live tokens only.
+  let store (key : String) (live : Live) : IO Unit :=
+    cache.entries.modify fun es =>
+      (Array.filter (fun (k, l) => k != key && l.fresh now 0) es).push (key, live)
+  if record.provider == "github-app" then
+    let keyed := perOwner record.config
+    let configured := record.config.str? "owner"
+    let asked := installationOwner record.config requestOwner
+    -- Only a `per_owner` App's tokens differ by owner; any other is one token.
+    let candidates : List (Option String) :=
+      if !keyed then [asked]
+      else if asked.map (·.toLower) == configured.map (·.toLower) then [configured]
+      else [asked, configured]
+    let known (o : String) : IO Bool := do
+      let k := s!"{record.name}\n{o.toLower}"
+      return (← cache.missing.get).any (fun (k', due) => k' == k && now < due)
+    let mut material : Option Secret := none
+    for c in candidates do
+      let key := cacheKey record.name narrow (if keyed then c else none)
+      if let some s ← cached key then return s
+      -- Known to have no installation: straight to the next candidate.
+      if keyed && c != configured then
+        if let some o := c then
+          if ← known o then continue
+      let m ← match material with
+        | some m => pure m
+        | none => do let m ← unlock record; material := some m; pure m
+      match ← githubAppSecret ctx cache.missing record.name record.config m narrow c with
+      | some live => store key live; return live.secret
+      | none => continue
+    throw (IO.userError s!"the GitHub App has no installation on `{(asked.orElse fun _ => configured).getD ""}`")
+  let key := cacheKey record.name narrow
+  if let some s ← cached key then return s
   let material ← unlock record
   let live ← match record.provider with
     | "static" => pure { secret := staticSecret material, expires := none }
     | "exec" => execSecret record.config material
     | "oauth2" => oauth2Secret ctx record.config material
-    | "github-app" =>
-      githubAppSecret ctx cache.missing record.name record.config material narrow owner
     | other => throw (IO.userError s!"unknown credential provider `{other}`")
-  cache.entries.modify fun es =>
-    (Array.filter (fun (k, _) => k != key) es).push (key, live)
+  store key live
   return live.secret
 
 /-- Forget everything cached, so that the next request re-mints and asks again

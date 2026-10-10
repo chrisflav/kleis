@@ -465,8 +465,10 @@ echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
 check $? "a name that cannot be a GitHub account is never looked up" "$OUT"
 OUT="$(lookups)"
 echo "$OUT" | grep -q '"acme": 1' && echo "$OUT" | grep -q '"beta": 1' && echo "$OUT" | grep -q '"nope": 1'
-echo "$OUT" | grep -qv "no.such"
+! echo "$OUT" | grep -qF "no.such"
 check $? "each owner was looked up once: the tokens and the miss are remembered" "$OUT"
+echo "$OUT" | grep -q '"mint-11": 1'
+check $? "and the owners without an installation share the configured owner's one token" "$OUT"
 grep -q 'inst-11\|inst-22' "$KLEIS_HOME/data/audit.log"
 if [ $? -eq 0 ]; then bad "no installation token reaches the audit log"; else ok "no installation token reaches the audit log"; fi
 # Out of the way of the passthrough checks below, which pass `localhost` through.

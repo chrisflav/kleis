@@ -99,6 +99,7 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[0] == "app" and parts[3] == "access_tokens":
             if self.headers.get("Authorization", "").count(".") != 2:
                 return self._json(401, {"message": "no JWT"})
+            LOOKUPS[f"mint-{parts[2]}"] = LOOKUPS.get(f"mint-{parts[2]}", 0) + 1
             return self._json(201, {"token": f"inst-{parts[2]}"})
         return None
 
