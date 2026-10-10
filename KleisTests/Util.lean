@@ -62,4 +62,25 @@ def utilTests : IO Unit := do
     checkEq "array of tables" (j.arr? "route").length 2
     checkEq "second table" (((j.arr? "route")[1]!).str? "match") (some "PUT a.com /y")
 
+
+def providerTests : IO Unit := do
+  group "credential providers"
+  let one := Json.obj [("app_id", .num "1"), ("owner", .str "acme")]
+  let per := Json.obj [("app_id", .num "1"), ("owner", .str "acme"), ("per_owner", .bool true)]
+  checkEq "an App names one owner by default" (Credential.installationOwner one (some "beta"))
+    (some "acme")
+  checkEq "per_owner looks up the request's owner" (Credential.installationOwner per (some "beta"))
+    (some "beta")
+  checkEq "and the configured one for a request about no repository"
+    (Credential.installationOwner per none) (some "acme")
+  checkEq "an empty owner is no owner" (Credential.installationOwner per (some "")) (some "acme")
+  checkEq "without an owner there is nothing to look up on"
+    (Credential.installationOwner (Json.obj [("per_owner", .bool true)]) none) none
+  checkEq "owners differing only in case share a cache entry"
+    (Credential.cacheKey "app" (.obj []) (some "ACME")) (Credential.cacheKey "app" (.obj []) (some "acme"))
+  check "and different owners do not"
+    (Credential.cacheKey "app" (.obj []) (some "acme") != Credential.cacheKey "app" (.obj []) (some "beta"))
+  checkEq "a credential minted for no owner keeps its old key"
+    (Credential.cacheKey "app" (.obj [])) "app\n{}"
+
 end KleisTests

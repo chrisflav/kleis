@@ -299,7 +299,7 @@ TLS_PORT="$(free_port)"
 TLS_KLEIS_PORT="$(free_port)"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
   -keyout "$WORK/origin.key" -out "$WORK/origin.crt" \
-  -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
+  -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" >/dev/null 2>&1
 check $? "mint a certificate for the TLS origin"
 
 git init --quiet --bare "$WORK/repos/tls.git"
@@ -374,6 +374,100 @@ OUT="$(curl -s --proxy "http://kleis:$TLS_ECHO_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" 
   -w '\n%{http_code}' "https://127.0.0.1:$TLS_PORT/echo" 2>&1)"
 [ "$(echo "$OUT" | tail -1)" = "200" ] && echo "$OUT" | grep -q '"method": "POST"'
 check $? "a request sent with Expect: 100-continue gets its real response" "$(echo "$OUT" | tail -c 300)"
+
+echo
+echo "== a GitHub App installed on several owners"
+# A `per_owner` App credential looks its installation up on the owner of the
+# repository a request is about, against a stand-in for GitHub's App API on the
+# TLS origin, and remembers both the tokens and an owner it is not installed on.
+openssl genrsa -out "$WORK/app.pem" 2048 >/dev/null 2>&1
+mkdir -p "$KLEIS_HOME/config/credentials"
+cat > "$KLEIS_HOME/config/services/ghapp.toml" <<'EOF2'
+name      = "ghapp"
+hosts     = ["localhost"]
+resources = ["repository"]
+
+[credential]
+provider = "github-app"
+hosts    = ["localhost"]
+
+[[credential.inject]]
+kind     = "header"
+name     = "Authorization"
+template = "Bearer {{secret}}"
+
+[[route]]
+match = "GET localhost /echo/repo/{owner}/{repo}"
+emit  = ['operation("read")', 'repository($owner, $repo)']
+
+[[route]]
+match = "GET localhost /echo/plain"
+emit  = ['operation("plain")']
+EOF2
+cat > "$KLEIS_HOME/config/grants/app-test.toml" <<'EOF2'
+name         = "app-test"
+service      = "ghapp"
+credential   = "github/test-app"
+max_lifetime = "1h"
+
+datalog = '''
+check if operation($x);
+allow if grant("app-test");
+'''
+EOF2
+cat > "$KLEIS_HOME/config/credentials/github-test-app.toml" <<EOF2
+name        = "github/test-app"
+service     = "ghapp"
+provider    = "github-app"
+secret_file = "$WORK/app.pem"
+
+[config]
+app_id    = 1
+owner     = "acme"
+per_owner = true
+api       = "https://localhost:$TLS_PORT"
+EOF2
+kill "$KLEISD_PID" 2>/dev/null; wait "$KLEISD_PID" 2>/dev/null
+"$KLEISD" > "$WORK/kleisd-app.log" 2>&1 &
+KLEISD_PID=$!
+for _ in $(seq 50); do
+  curl -s -o /dev/null "http://127.0.0.1:$TLS_KLEIS_PORT/" && break
+  sleep 0.1
+done
+APP_TOKEN="$("$KLEIS" token issue --grant app-test --bearer ci@app --ttl 1h)"
+check $? "issue a token for the App grant"
+app() {
+  curl -s --proxy "http://kleis:$APP_TOKEN@127.0.0.1:$TLS_KLEIS_PORT" --proxy-basic \
+    --cacert "$CA" -w '\n%{http_code}' "https://localhost:$TLS_PORT$1" 2>&1
+}
+lookups() { curl -s --cacert "$WORK/origin.crt" "https://localhost:$TLS_PORT/lookups"; }
+
+OUT="$(app /echo/repo/acme/x)"
+echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
+check $? "a request about acme goes out on acme's installation" "$OUT"
+OUT="$(app /echo/repo/beta/y)"
+echo "$OUT" | grep -q '"authorization": "Bearer inst-22"'
+check $? "and one about beta on beta's" "$OUT"
+OUT="$(app /echo/repo/ACME/z)"
+echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
+check $? "an owner is the same owner whatever its case" "$OUT"
+OUT="$(app /echo/plain)"
+echo "$OUT" | grep -q '"authorization": "Bearer inst-11"'
+check $? "a request about no repository uses the configured owner" "$OUT"
+OUT="$(app /echo/repo/nope/q)"
+[ "$(echo "$OUT" | tail -1)" = "502" ] && echo "$OUT" | grep -q "no installation on"
+check $? "an owner the App is not installed on is refused, and says why" "$OUT"
+OUT="$(app /echo/repo/nope/r)"
+[ "$(echo "$OUT" | tail -1)" = "502" ]
+check $? "and is refused again" "$OUT"
+OUT="$(lookups)"
+echo "$OUT" | grep -q '"acme": 1' && echo "$OUT" | grep -q '"beta": 1' && echo "$OUT" | grep -q '"nope": 1'
+check $? "each owner was looked up once: the tokens and the miss are remembered" "$OUT"
+grep -q 'inst-11\|inst-22' "$KLEIS_HOME/data/audit.log"
+if [ $? -eq 0 ]; then bad "no installation token reaches the audit log"; else ok "no installation token reaches the audit log"; fi
+# Out of the way of the passthrough checks below, which pass `localhost` through.
+rm -f "$KLEIS_HOME/config/services/ghapp.toml" "$KLEIS_HOME/config/grants/app-test.toml" \
+  "$KLEIS_HOME/config/credentials/github-test-app.toml"
 
 echo
 echo "== issuers and passthrough"

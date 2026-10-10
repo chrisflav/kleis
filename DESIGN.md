@@ -452,6 +452,14 @@ A provider turns stored material into a live secret. The manifest names one:
 | `github-app` | installation tokens, minted per repository, ~1 h |
 | `exec` | run a command, read the token from stdout |
 
+A `github-app` credential finds its installation by `installation_id`, or by
+looking it up on `owner`. An App is installed per account, and its tokens reach
+only that account's repositories, so with `per_owner = true` the lookup is on
+the owner of the repository the request is about instead, and `owner` is only
+for a request about none (GraphQL). Each owner's token is cached on its own, and
+an owner the App is not installed on is remembered for ten minutes and refused
+without asking GitHub again.
+
 `exec` is why "adding a provider costs a file, if `exec` will do" is in the
 table: any credential you can obtain with a shell command needs no Lean. The
 others exist because they are common enough to be worth caching and refreshing

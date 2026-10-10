@@ -126,6 +126,10 @@ structure AuthorizedRequest where
   /-- The credential to spend, or `none` to forward without one, as the grant
   chose it (`Grant.chooseCredential`). -/
   credential : Option String
+  /-- What the request is about, as `Manifest.resourcesOf` names it — `owner/repo`,
+  `org/name`, `org` — in the manifest's order.  A provider that mints per owner reads
+  the first. -/
+  resources : List String
 
 /-- Everything a decision produced, for the audit log and for the client. -/
 structure Outcome where
@@ -241,7 +245,7 @@ def run (i : Input) : Outcome :=
         { decision := .allow policy
           facts, revocationIds
           authorized := some (AuthorizedRequest.mk i.request i.manifest i.grant policy
-            (i.manifest.gatesResponse i.request i.body.value?) credential) }
+            (i.manifest.gatesResponse i.request i.body.value?) credential resources) }
 
 /-- Was this allowed? -/
 def Outcome.allowed (o : Outcome) : Bool :=

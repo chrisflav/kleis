@@ -11,6 +11,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 REPO_ROOT = sys.argv[2] if len(sys.argv) > 2 else "/tmp"
 
+# The fake GitHub App's installations, by owner, and how often each was looked up.
+INSTALLATIONS = {"acme": 11, "beta": 22}
+LOOKUPS = {}
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -71,9 +75,39 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _json(self, status, obj):
+        payload = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _github_app(self):
+        """A stand-in for the GitHub App endpoints kleis calls: where an App is
+        installed, and an installation token. Counts the lookups per owner, so the
+        test can tell a cached answer from a fresh one."""
+        parts = self.path.split("?")[0].strip("/").split("/")
+        if parts[:1] == ["lookups"]:
+            return self._json(200, LOOKUPS)
+        if len(parts) == 3 and parts[0] in ("orgs", "users") and parts[2] == "installation":
+            if parts[0] == "orgs":
+                LOOKUPS[parts[1]] = LOOKUPS.get(parts[1], 0) + 1
+            if parts[0] == "orgs" and parts[1] in INSTALLATIONS:
+                return self._json(200, {"id": INSTALLATIONS[parts[1]]})
+            return self._json(404, {"message": "Not Found"})
+        if len(parts) == 4 and parts[0] == "app" and parts[3] == "access_tokens":
+            if self.headers.get("Authorization", "").count(".") != 2:
+                return self._json(401, {"message": "no JWT"})
+            return self._json(201, {"token": f"inst-{parts[2]}"})
+        return None
+
     def _dispatch(self):
         body = self._body()
-        if self.path.startswith("/echo"):
+        if self.path.split("/")[1:2] in (["orgs"], ["users"], ["app"], ["lookups"]):
+            if self._github_app() is None:
+                self._json(404, {"message": "Not Found"})
+        elif self.path.startswith("/echo"):
             self._echo(body)
         else:
             self._git(body)

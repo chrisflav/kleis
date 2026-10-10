@@ -56,9 +56,12 @@ cp config.toml    "$KLEIS_HOME/config/config.toml"
 cp ../github.toml "$KLEIS_HOME/config/services/"
 cp grants/*.toml  "$KLEIS_HOME/config/grants/"
 
-# The App's private key; its installation is looked up on the fork organisation.
+# The App's private key. Its installation is looked up on the owner of each
+# repository a request is about (`per_owner`): orchestra works on a repository
+# directly when the App is installed there, and forks it into bot-org when not.
+# `owner` is for requests about no repository, such as GraphQL.
 kleis credential add github/orchestra-app --service github --provider github-app \
-  --config '{"app_id": 123456, "owner": "bot-org"}' --secret @app.private-key.pem
+  --config '{"app_id": 123456, "owner": "bot-org", "per_owner": true}' --secret @app.private-key.pem
 # The token for the upstream: pull requests, comments, merges.
 printf '%s' "$PAT" | kleis credential add github/orchestra-pat --service github --secret -
 
@@ -85,8 +88,8 @@ Then add a `kleis` block to orchestra's `config.json`; see orchestra's
 - **Label creation:** `label_issue` can add a label the repository does not
   define, and GitHub creates it.  A grant cannot ask the repository which labels
   exist.
-- **App installations:** one per credential.  Forks in a second organisation
-  need a second `github-app` credential and a route to it.
+- **App installations** are looked up per owner with `per_owner`. Without it a
+  credential reaches one account, and a second needs a credential and a route.
 - **Scope on the upstream** is the repository, not the job's pull request: a job
   with `merge_pr` may merge any pull request there, and one with `create_pr`
   may add its pull request labels to any issue — the number of a pull request

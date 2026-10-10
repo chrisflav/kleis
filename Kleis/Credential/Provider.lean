@@ -49,14 +49,21 @@ def Live.fresh (l : Live) (now : Nat) (margin : Nat := 60) : Bool :=
   | none => true
   | some e => now + margin < e
 
-/-- The cache of live credentials, keyed by the credential name and whatever
-narrowing was asked for. -/
+/-- The cache of live credentials, keyed by the credential name, whatever
+narrowing was asked for, and — for a `per_owner` App — the owner. -/
 structure Cache where
   /-- Name and narrowing key, to the live secret. -/
   entries : IO.Ref (Array (String × Live))
+  /-- Credential and owner, for a `per_owner` App found not to be installed on
+  that owner, to when to ask GitHub again.  Without it an owner the App is not
+  installed on would cost two lookups on every request for it. -/
+  missing : IO.Ref (Array (String × Nat))
 
 /-- An empty cache. -/
-def Cache.create : IO Cache := do return { entries := ← IO.mkRef #[] }
+def Cache.create : IO Cache := do return { entries := ← IO.mkRef #[], missing := ← IO.mkRef #[] }
+
+/-- How long an owner found to have no installation is believed to have none. -/
+def missingInstallationTtl : Nat := 600
 
 /-- Read the material of a `static` credential: the whole thing, trimmed, since
 a token pasted into a terminal usually arrives with a newline. -/
@@ -130,8 +137,10 @@ private def githubAppJwt (appId : Nat) (keyPem : ByteArray) : IO String := do
   return s!"{unsigned}.{Base64.encodeUrl signature}"
 
 /-- Ask GitHub, as the App, which installation it has on an account — an
-organisation or a user, tried in that order. -/
-private def githubAppInstallation (ctx : Net.Tls.Context) (api jwt owner : String) : IO Nat := do
+organisation or a user, tried in that order.  `none` when GitHub says it has
+none on either. -/
+private def githubAppInstallation (ctx : Net.Tls.Context) (api jwt owner : String) :
+    IO (Option Nat) := do
   let headers := #[("authorization", s!"Bearer {jwt}"), ("accept", "application/vnd.github+json"),
                    ("user-agent", "kleis")]
   -- A 404 from both means no installation; anything else is a different problem —
@@ -141,23 +150,53 @@ private def githubAppInstallation (ctx : Net.Tls.Context) (api jwt owner : Strin
     let response ← Net.fetch ctx "GET" s!"{api}/{kind}/{Str.percentEncode owner}/installation" headers
     if response.status == 200 then
       if let .ok j := Json.parse response.text then
-        if let some id := j.int? "id" then return id.toNat
+        if let some id := j.int? "id" then return some id.toNat
     statuses := statuses ++ [response.status]
-  if statuses.all (· == 404) then
-    throw (IO.userError s!"the GitHub App has no installation on `{owner}`")
+  if statuses.all (· == 404) then return none
   throw (IO.userError s!"looking up the GitHub App's installation on `{owner}` failed: GitHub answered {statuses}")
+
+/-- The account a GitHub App credential's installation is looked up on, for a
+request about `requestOwner`.
+
+An App is installed per account, and an installation token reaches only that
+account's repositories.  A credential naming one `owner` therefore works for one
+account; with `per_owner = true` it is looked up on the owner of the repository
+the request is about instead — the job's fork in one organisation, its upstream
+in another — and `owner` is what a request about no repository (GraphQL) uses.
+`none` when the credential names neither an `installation_id` nor anything to
+look one up on. -/
+def installationOwner (config : Json) (requestOwner : Option String) : Option String :=
+  let configured := config.str? "owner"
+  if config.bool? "per_owner" == some true then
+    match requestOwner with
+    | some o => if o.isEmpty then configured else some o
+    | none => configured
+  else configured
 
 /-- Mint a GitHub App installation token.
 
 The stored material is either the App's private key, PEM — in which case the
 App's token is signed here, with `app_id` from the configuration, and the
-installation is `installation_id` or else looked up on `owner` — or, as before,
-an App token somebody else signed, which is used as it is.  The key never
-leaves this function; what goes upstream is the installation token, which lasts
-an hour and is cached until shortly before then. -/
-private def githubAppSecret (ctx : Net.Tls.Context) (config : Json) (material : Secret)
-    (narrow : Json) : IO Live := do
+installation is `installation_id` or else looked up on `owner` (see
+`installationOwner`) — or, as before, an App token somebody else signed, which
+is used as it is.  The key never leaves this function; what goes upstream is the
+installation token, which lasts an hour and is cached until shortly before then.
+
+An owner the App turns out not to be installed on is remembered in `missing` for
+`missingInstallationTtl`, so that it is not asked about again on every request. -/
+private def githubAppSecret (ctx : Net.Tls.Context) (missing : IO.Ref (Array (String × Nat)))
+    (name : String) (config : Json) (material : Secret) (narrow : Json) (owner : Option String) :
+    IO Live := do
   let api := (config.str? "api").getD "https://api.github.com"
+  let installation? := config.int? "installation_id"
+  -- Asked before signing anything: an owner already known to have no installation
+  -- costs nothing.
+  let missingKey := owner.map fun o => s!"{name}\n{o.toLower}"
+  if installation?.isNone then
+    if let some k := missingKey then
+      let now ← Store.now
+      if (← missing.get).any (fun (k', due) => k' == k && now < due) then
+        throw (IO.userError s!"the GitHub App has no installation on `{owner.getD ""}`")
   let raw := Secret.reveal material
   let isPem := (Bytes.toStringLossy (Bytes.take raw 64)).trimAscii.toString.startsWith "-----BEGIN"
   let jwt ← if isPem then do
@@ -165,11 +204,20 @@ private def githubAppSecret (ctx : Net.Tls.Context) (config : Json) (material : 
         | throw (IO.userError "a `github-app` credential holding a private key needs an `app_id`")
       githubAppJwt appId.toNat raw
     else pure (Str.trim (Bytes.toStringLossy raw))
-  let installation ← match config.int? "installation_id" with
+  let installation ← match installation? with
     | some id => pure id.toNat
     | none =>
-      match config.str? "owner" with
-      | some owner => githubAppInstallation ctx api jwt owner
+      match owner with
+      | some o =>
+        match ← githubAppInstallation ctx api jwt o with
+        | some id => pure id
+        | none =>
+          if let some k := missingKey then
+            let now ← Store.now
+            missing.modify fun ms =>
+              (ms.filter fun (k', due) => k' != k && now < due).push
+                (k, now + missingInstallationTtl)
+          throw (IO.userError s!"the GitHub App has no installation on `{o}`")
       | none => throw (IO.userError
           "a `github-app` credential needs an `installation_id`, or an `owner` to look one up on")
   let url := s!"{api}/app/installations/{installation}/access_tokens"
@@ -196,16 +244,25 @@ private def githubAppSecret (ctx : Net.Tls.Context) (config : Json) (material : 
   -- margin is enough and avoids depending on a timestamp format.
   return { secret := Secret.ofString token, expires := some ((← Store.now) + 3000) }
 
-/-- The cache key for a credential and a narrowing. -/
-private def cacheKey (name : String) (narrow : Json) : String :=
-  s!"{name}\n{Json.render narrow}"
+/-- The cache key for a credential, a narrowing and — where the credential is
+minted per owner — the owner, lowercased, as GitHub compares account names. -/
+def cacheKey (name : String) (narrow : Json) (owner : Option String := none) : String :=
+  match owner with
+  | some o => s!"{name}\n{Json.render narrow}\n{o.toLower}"
+  | none => s!"{name}\n{Json.render narrow}"
 
 /-- Obtain a usable secret for a credential, refreshing or minting if what is
-cached has expired. -/
-def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : Json) :
-    IO Secret := do
+cached has expired.  `requestOwner` is the owner of the repository the request
+is about, which a `per_owner` GitHub App mints for. -/
+def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : Json)
+    (requestOwner : Option String := none) : IO Secret := do
   let now ← Store.now
-  let key := cacheKey record.name narrow
+  -- Only a `per_owner` App's tokens differ by owner; every other credential is one
+  -- secret, and keying it by owner would only mint it again for each.
+  let owner := if record.provider == "github-app" then installationOwner record.config requestOwner
+    else none
+  let perOwner := record.provider == "github-app" && record.config.bool? "per_owner" == some true
+  let key := cacheKey record.name narrow (if perOwner then owner else none)
   -- A static secret read from a file is read again each time: the file is the secret's
   -- home, and a rotation there should take effect on the next request rather than after
   -- a restart.  What a provider mints from it is still cached — an installation token
@@ -220,15 +277,19 @@ def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : 
     | "static" => pure { secret := staticSecret material, expires := none }
     | "exec" => execSecret record.config material
     | "oauth2" => oauth2Secret ctx record.config material
-    | "github-app" => githubAppSecret ctx record.config material narrow
+    | "github-app" =>
+      githubAppSecret ctx cache.missing record.name record.config material narrow owner
     | other => throw (IO.userError s!"unknown credential provider `{other}`")
   cache.entries.modify fun es =>
     (Array.filter (fun (k, _) => k != key) es).push (key, live)
   return live.secret
 
-/-- Forget everything cached, so that the next request re-mints.  What `kleis
-reload` does, and what a revoked upstream token needs. -/
-def Cache.clear (c : Cache) : IO Unit := c.entries.set #[]
+/-- Forget everything cached, so that the next request re-mints and asks again
+where an App is installed.  What `kleis reload` does, and what a revoked
+upstream token needs. -/
+def Cache.clear (c : Cache) : IO Unit := do
+  c.entries.set #[]
+  c.missing.set #[]
 
 end Credential
 end Kleis
