@@ -35,6 +35,7 @@ def main : IO UInt32 := do
   say s!"kleis test suite (home {home})"
   say ""
   utilTests
+  providerTests
   cryptoTests
   httpTests
   wireTests

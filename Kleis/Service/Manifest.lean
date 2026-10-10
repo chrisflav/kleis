@@ -314,6 +314,19 @@ def Manifest.resourcesOf (m : Manifest) (facts : List Builder.Fact) : List Strin
         | _ => none
       if parts.isEmpty then none else some ("/".intercalate parts)
 
+/-- The owner of what a request is about: the first string term of the first fact
+under one of the manifest's `resources` predicates — `repository(owner, repo)`,
+`new_repository(org, name)`, `organization(org)` — taken as the term itself rather
+than split back out of `resourcesOf`, whose `/` a percent-decoded segment may
+contain.  What a provider minting per owner mints for, so a manifest whose
+resources are about more than one owner should list the one to mint for first. -/
+def Manifest.ownerOf (m : Manifest) (facts : List Builder.Fact) : Option String :=
+  (m.resourceNames.flatMap fun n => facts.filterMap fun f =>
+    if f.predicate.name != n then none
+    else f.predicate.terms.findSome? fun t => match t with
+      | .str s => some s
+      | _ => none).head?
+
 /-- The facts every route matching this request asks to be remembered if it
 succeeds. -/
 def Manifest.remember (m : Manifest) (r : Model.Request)
