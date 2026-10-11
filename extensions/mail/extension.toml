@@ -2,7 +2,7 @@
 
 service = "mail"
 display = "Mail"
-client  = "`kleis-mail` (in ~/.local/bin; `kleis-mail --help`)"
+client  = "the `kleis-mail` command, in ~/.local/bin; see `kleis-mail --help`"
 hosts   = "fixed"
 
 [groups]

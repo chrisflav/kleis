@@ -137,6 +137,42 @@ kleis check --token "$T" --method POST \
   --content-type application/json --body '{"event":"APPROVE"}' --facts
 ```
 
+## Specs, and tokens that name them
+
+A grant is datalog; a **spec** is the same thing said in a service's own words, for a bearer
+with accounts on several services — an agent's identity, say:
+
+```
+spec secretary
+  description "Reads and files Christian's mail and keeps his calendar."
+  max_ttl 24h
+
+  account mail/christian
+    allow read, flag, move
+    allow send where recipient all ends_with "@merten.dev"
+
+  account caldav/christian@dav.example.org
+    allow read
+    allow write, delete where path starts_with "calendars/christian/personal/"
+```
+
+Each `account` block compiles into one grant (`kleis spec compile secretary` prints it). A
+token names the spec — `kleis token issue --spec secretary` — and the spec is resolved per
+request, so editing it changes what every token naming it may do. Operation names, groups and
+fields come from the service's **extension** (`extensions/`: GitHub, Zulip, CalDAV, mail), so a
+typo is a load error rather than a policy that allows nothing. An account of a service whose
+servers vary (Zulip, CalDAV) names its hosts, and is never spent on another.
+
+Every token has a **card**, plain text saying what it lets its bearer do, generated from the
+spec: `kleis card --token T`, or `GET /.kleis/v1/card` with the token. `GET /.kleis/v1/setup`
+returns what a sandbox needs to use the token with ordinary clients — a placeholder
+`GH_TOKEN`, a `~/.zuliprc`, the `kleis-mail` client — and nothing secret.
+
+An issuer allowed a spec (`specs = ["secretary"]`) makes a token per task with
+`POST /.kleis/v1/derive`: from the spec, with the task's facts and a narrowing
+(`"mail: only read"`), or from a token handed in, narrowed further. Each has one revocation id
+of its own. [docs/design/specs.md](docs/design/specs.md) is the design.
+
 ## Tokens for jobs
 
 A grant may spend several credentials and chooses one per request: by resource

@@ -1,7 +1,8 @@
 # Specs, task tokens and token cards
 
-*Status: proposal, for discussion. Nothing here is implemented. Revised once after review; the
-changes are listed at the end.*
+*Status: Part A is implemented in kleis (`Kleis.Spec`, `Kleis.Narrow`, `Kleis.Card`,
+`Kleis.Service.Extension`, `extensions/`). Revised once after review; the changes are listed at
+the end.*
 
 An agent reaches the world through the command-line tools it already knows — `git`, `gh`,
 `curl`, a mail client, a calendar client, a taxis client — and through nothing else. It holds no

@@ -34,6 +34,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/.lake/build/bin/kleisd /src/.lake/build/bin/kleis /usr/local/bin/
+# The extensions a deployment enables by name (`extensions = [...]` in config.toml); one under
+# /kleis/config/extensions/<name> takes precedence, for a deployment that needs its own.
+COPY extensions /usr/share/kleis/extensions
 
 # Configuration under /kleis/config, state under /kleis/data: a deployment mounts the first
 # read-only and the second as a volume that outlives the container.

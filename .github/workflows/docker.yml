@@ -1,8 +1,9 @@
 name: Docker image
 
-# Builds the runtime image on every change, and publishes it to ghcr.io/chrisflav/kleis
-# when the change is on master or tagged. Pull requests build but do not push: the point
-# there is to catch a broken Dockerfile on the pull request that caused it rather than on
+# Builds the runtime images on every change, and publishes them to ghcr.io/chrisflav/kleis
+# and ghcr.io/chrisflav/kleis-mail (the mail extension's gateway) when the change is on master
+# or tagged, both tagged with the same commit so a deployment pins one revision for both.
+# Pull requests build but do not push: the point there is to catch a broken Dockerfile on the pull request that caused it rather than on
 # master afterwards, and a fork's token cannot push to the registry in any case.
 
 on:
@@ -30,6 +31,18 @@ jobs:
   image:
     runs-on: ubuntu-latest
 
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: kleis
+            file: docker/Dockerfile
+            # The scope the cache had before there were two images, so master's keeps working.
+            cache: buildkit
+          - image: kleis-mail
+            file: docker/mail.Dockerfile
+            cache: kleis-mail
+
     env:
       # Every step that differs between "validate this change" and "ship this change" keys
       # off this, so there is one place to look for what a pull request does differently.
@@ -53,7 +66,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=tag
@@ -67,7 +80,7 @@ jobs:
         with:
           # Repository root: every COPY in the Dockerfile is written relative to it.
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.file }}
           push: ${{ env.publish == 'true' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -75,18 +88,18 @@ jobs:
           # Without this every run recompiles from nothing. A pull request reads master's
           # cache — the Actions cache falls back to the default branch when a branch has no
           # entry of its own — so a change to the docs reuses the whole build stage.
-          cache-from: type=gha
+          cache-from: type=gha,scope=${{ matrix.cache }}
           # Written on master only. mode=max keeps the intermediate stages, which is where
           # the expensive Lean layer lives, but the entries are correspondingly large
           # against the repository's shared 10 GB Actions cache. Letting every pull request
           # write one would evict the master entry that all of them are reading from, so
           # the cache would be least useful exactly when the repository is busiest.
-          cache-to: ${{ env.publish == 'true' && 'type=gha,mode=max' || '' }}
+          cache-to: ${{ env.publish == 'true' && format('type=gha,mode=max,scope={0}', matrix.cache) || '' }}
 
       # The deployment pins a revision by hand (see the NixOS module), so put the line to
       # paste somewhere it can be copied from instead of reconstructed.
       - name: Summarise
-        if: env.publish == 'true'
+        if: env.publish == 'true' && matrix.image == 'kleis'
         run: |
           {
             echo "### Published"

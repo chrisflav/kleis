@@ -1,0 +1,9 @@
+# What an orchestra task with no identity of its own may do: the GitHub grant, as it was.
+#
+# The grant reads the task's facts — its fork, its upstream, its tools — from the token's
+# authority block, which is where /.kleis/v1/derive puts them for a task made from a spec.
+spec worker
+  description "An orchestra task working on a repository."
+  max_ttl 24h
+
+  grant orchestra-github
