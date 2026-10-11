@@ -22,6 +22,10 @@ import Kleis.Facts.Primitive
 import Kleis.Facts.Flatten
 import Kleis.Facts.Route
 import Kleis.Service.Manifest
+import Kleis.Service.Extension
+import Kleis.Spec
+import Kleis.Narrow
+import Kleis.Card
 import Kleis.Service.Registry
 import Kleis.Policy.Externs
 import Kleis.Policy.Grant

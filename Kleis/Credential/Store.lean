@@ -49,13 +49,24 @@ structure Record where
   /-- For a credential declared in the configuration rather than installed: the file its
   material is read from, each time it is needed.  Empty `nonce` and `ciphertext`. -/
   secretFile : Option String := none
+  /-- The hosts it may be spent on, exactly. Empty means every host its manifest binds the
+  service's credential to, which is what every credential meant before this existed; for a
+  service whose servers vary from account to account (`Extension.dynamicHosts`) it is
+  required, so that one server's key is never sent to another. -/
+  hosts : List String := []
   deriving Inhabited
+
+/-- May this credential be spent on a request for this host? The manifest's own binding is
+checked separately (`Manifest.mayCredentialReach`); this is the account's, on top. -/
+def Record.reaches (r : Record) (host : String) : Bool :=
+  r.hosts.isEmpty || r.hosts.contains (host.toLower)
 
 /-- Render a record as JSON. -/
 def Record.toJson (r : Record) : Json :=
-  .obj [("name", .str r.name), ("service", .str r.service), ("provider", .str r.provider),
+  .obj ([("name", .str r.name), ("service", .str r.service), ("provider", .str r.provider),
         ("config", r.config), ("created", .num (toString r.created)),
         ("nonce", .str r.nonce), ("ciphertext", .str r.ciphertext)]
+    ++ (if r.hosts.isEmpty then [] else [("hosts", .arr (r.hosts.map Json.str))]))
 
 /-- Read a record from JSON. -/
 def Record.ofJson (j : Json) : Except String Record := do
@@ -65,12 +76,19 @@ def Record.ofJson (j : Json) : Except String Record := do
   pure { name := ← get "name", service := ← get "service", provider := ← get "provider"
          config := (j.field? "config").getD (.obj [])
          created := ((j.int? "created").getD 0).toNat
-         nonce := ← get "nonce", ciphertext := ← get "ciphertext" }
+         nonce := ← get "nonce", ciphertext := ← get "ciphertext"
+         hosts := ((j.arr? "hosts").filterMap Json.asString?).map (·.toLower) }
 
 /-- What a record's ciphertext is bound to.  Changing any of it invalidates the
 tag, so material cannot be moved between records. -/
 private def aadOf (r : Record) : Bytes :=
-  Bytes.ofString s!"kleis/credential/v1\n{r.name}\n{r.service}\n{r.provider}"
+  -- The hosts are bound too, when there are any, so that editing a record to send its
+  -- material somewhere else breaks the tag. A record without them keeps the v1 binding,
+  -- which is what every record installed before hosts existed was sealed under.
+  if r.hosts.isEmpty then
+    Bytes.ofString s!"kleis/credential/v1\n{r.name}\n{r.service}\n{r.provider}"
+  else
+    Bytes.ofString s!"kleis/credential/v2\n{r.name}\n{r.service}\n{r.provider}\n{",".intercalate r.hosts}"
 
 /-- Resolve the master key, generating a key file if that is the route and
 there is nothing there yet. -/
@@ -107,12 +125,13 @@ def pathOf (name : String) : IO System.FilePath := do
   return (← Dirs.credentials) / s!"{digest}.json"
 
 /-- Install a credential, replacing any of the same name. -/
-def save (name service provider : String) (config : Json) (material : Secret) : IO Unit := do
+def save (name service provider : String) (config : Json) (material : Secret)
+    (hosts : List String := []) : IO Unit := do
   let key ← masterKey
   let nonce ← Store.randomBytes 12
   let skeleton : Record :=
     { name, service, provider, config, created := ← Store.now
-      nonce := Bytes.toHex nonce, ciphertext := "" }
+      nonce := Bytes.toHex nonce, ciphertext := "", hosts := hosts.map (·.toLower) }
   let sealed := Aead.encrypt key nonce (aadOf skeleton) (Secret.reveal material)
   let record := { skeleton with ciphertext := Bytes.toHex sealed }
   Store.writeSecret (← pathOf name) (Bytes.ofString (Json.render record.toJson))
@@ -146,9 +165,12 @@ def declared : IO (Array Record) := do
         | throw (IO.userError s!"{f}: a credential needs a `service`")
       let some secretFile := j.str? "secret_file"
         | throw (IO.userError s!"{f}: a declared credential needs a `secret_file`")
+      let hosts := ((j.arr? "hosts").filterMap Json.asString?).map (·.toLower)
+      if hosts.any (fun h => h.isEmpty || h.contains '*') then
+        throw (IO.userError s!"{f}: `hosts` lists exact host names, not patterns")
       out := out.push { name, service, provider := (j.str? "provider").getD "static"
                         config := (j.field? "config").getD (.obj []), created := 0
-                        nonce := "", ciphertext := "", secretFile := some secretFile }
+                        nonce := "", ciphertext := "", secretFile := some secretFile, hosts }
   return out
 
 /-- Read a record without decrypting it. -/

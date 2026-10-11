@@ -152,7 +152,7 @@ structure Context where
 
 /-- Build the shared state. -/
 def Context.create (config : Config) : IO Context := do
-  let registry ← Service.Registry.load
+  let registry ← Service.Registry.load (some config)
   let root ← Token.rootPublicKey
   let caRoot ← Ca.loadOrCreateRoot
   -- The store is resolved and then checked, rather than trusted to have
@@ -187,7 +187,7 @@ def Context.create (config : Config) : IO Context := do
 def Context.reload (ctx : Context) : IO Unit := do
   -- Loaded before anything is replaced, so a registry that fails to load
   -- leaves the old one in place rather than half of a new one.
-  let registry ← Service.Registry.load
+  let registry ← Service.Registry.load (some ctx.config)
   let declared ← Credential.declared
   let revocations ← Token.loadRevocations
   ctx.registry.set registry
@@ -224,6 +224,7 @@ partial def Context.watch (ctx : Context) (log : String → IO Unit)
   let configFiles : IO (Array System.FilePath) := do
     return (← Store.listFiles (← Dirs.services) "toml")
       ++ (← Store.listFiles (← Dirs.grants) "toml")
+      ++ (← Store.listFiles (← Dirs.specs) "kleis")
       ++ (← Store.listFiles (← Dirs.credentials) "json")
       ++ (← Store.listFiles ((← Dirs.config) / "credentials") "toml")
   let snapshot : IO (List (String × String) × List (String × String)) := do

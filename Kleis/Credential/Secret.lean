@@ -30,12 +30,27 @@ open Policy (AuthorizedRequest)
 structure Secret where
   private mk ::
   private raw : ByteArray
+  /-- The hosts the account it came from may be spent on; empty for every host the
+  manifest binds. Carried with the secret rather than looked up beside it, so that `bind`
+  — the one place a secret is spent, including after a redirect — checks it too. -/
+  private hosts : List String := []
 
 /-- Wrap bytes as a secret. -/
-def Secret.ofBytes (b : ByteArray) : Secret := ⟨b⟩
+def Secret.ofBytes (b : ByteArray) : Secret := ⟨b, []⟩
 
 /-- Wrap text as a secret. -/
-def Secret.ofString (s : String) : Secret := ⟨s.toUTF8⟩
+def Secret.ofString (s : String) : Secret := ⟨s.toUTF8, []⟩
+
+/-- Confine a secret to an account's hosts. Only ever narrows: a secret already confined
+stays within its hosts, intersected with the new ones. -/
+def Secret.confine (s : Secret) (hosts : List String) : Secret :=
+  if hosts.isEmpty then s
+  else if s.hosts.isEmpty then { s with hosts }
+  else { s with hosts := s.hosts.filter hosts.contains }
+
+/-- Was the secret confined to hosts, and is this one of them? -/
+def Secret.mayReach (s : Secret) (host : String) : Bool :=
+  s.hosts.isEmpty || s.hosts.contains host.toLower
 
 /-- How long it is.  Safe to log: a length is not a secret, and a length of
 zero is a misconfiguration worth seeing. -/
@@ -95,6 +110,9 @@ def bind (r : AuthorizedRequest) (s : Secret) : Except BindError Model.Request :
   let m := r.manifest
   let req := r.request
   if !m.mayCredentialReach req.host then throw (.hostNotBound req.host)
+  -- The account's own binding, on top of the manifest's: a manifest claiming several
+  -- Zulip servers must not send one server's key to another.
+  if !s.mayReach req.host then throw (.hostNotBound req.host)
   let applicable := m.credential.inject.filter (·.appliesTo req.host)
   if applicable.isEmpty then throw .noInjection
   let headers := Http.Headers.removeAll req.headers

@@ -301,8 +301,8 @@ For a `per_owner` App the request's owner is tried first and the configured
 found out once, then remembered — is served from the configured owner's one token,
 so a bearer naming owner after owner neither mints a token for each nor grows
 the cache by one. -/
-def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : Json)
-    (requestOwner : Option String := none) : IO Secret := do
+private def resolveUnconfined (cache : Cache) (ctx : Net.Tls.Context) (record : Record)
+    (narrow : Json) (requestOwner : Option String := none) : IO Secret := do
   let now ← Store.now
   -- A static secret read from a file is read again each time: the file is the secret's
   -- home, and a rotation there should take effect on the next request rather than after
@@ -366,6 +366,12 @@ upstream token needs. -/
 def Cache.clear (c : Cache) : IO Unit := do
   c.entries.set #[]
   c.missing.set #[]
+
+/-- Turn a record into a live secret, confined to the record's hosts (`Record.hosts`): the
+secret carries them to `bind`, which refuses any other host. -/
+def resolve (cache : Cache) (ctx : Net.Tls.Context) (record : Record) (narrow : Json)
+    (requestOwner : Option String := none) : IO Secret := do
+  return (← resolveUnconfined cache ctx record narrow requestOwner).confine record.hosts
 
 end Credential
 end Kleis

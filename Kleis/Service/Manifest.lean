@@ -220,13 +220,23 @@ private def datalogOf (source : String) : Except String (List Builder.Fact × Li
     else .ok (r.facts, r.rules)
 
 /-- Read a manifest from TOML source. -/
-def Manifest.ofToml (source : String) : Except String Manifest := do
+def Manifest.ofToml (source : String) (dynamicHosts : Option (List String) := none) :
+    Except String Manifest := do
   let j ← Toml.parse source
   let name ← match j.str? "name" with
     | some n => pure n
     | none => throw "a manifest needs a `name`"
-  let hosts := (strings j "hosts").map Str.toLowerAscii
-  if hosts.isEmpty then throw "a manifest needs at least one host"
+  -- An extension whose servers vary from account to account (Zulip, CalDAV) has no hosts
+  -- of its own: it claims whichever its accounts are bound to, which may be none yet.
+  let hosts ← match dynamicHosts with
+    | some hs =>
+      if !(strings j "hosts").isEmpty then
+        throw "a manifest whose hosts come from its accounts may not list `hosts` itself"
+      pure (hs.map Str.toLowerAscii)
+    | none =>
+      let hs := (strings j "hosts").map Str.toLowerAscii
+      if hs.isEmpty then throw "a manifest needs at least one host"
+      pure hs
   let credJson := (j.field? "credential").getD (.obj [])
   let credential : CredentialSpec := {
     provider := (credJson.str? "provider").getD "static"

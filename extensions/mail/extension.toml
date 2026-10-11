@@ -1,0 +1,42 @@
+# Mail, through kleis-mail: an HTTP gateway to IMAP and SMTP. See manifest.toml and README.md.
+
+service = "mail"
+display = "Mail"
+client  = "`kleis-mail` (in ~/.local/bin; `kleis-mail --help`)"
+hosts   = "fixed"
+
+[groups]
+read = { operations = ["list_mailboxes", "list_messages", "read_message"], phrase = "list mailboxes and list and read messages" }
+flag = { operations = ["set_flags"], phrase = "flag messages (read, answered, starred, labels)" }
+move = { operations = ["move_message"], phrase = "move messages between mailboxes" }
+
+[operations]
+list_mailboxes = "list mailboxes"
+list_messages  = "list messages"
+read_message   = "read messages and their attachments"
+set_flags      = "flag messages"
+move_message   = "move messages between mailboxes"
+send           = "send mail"
+
+[fields.recipient]
+fact   = "recipient"
+type   = "string"
+values = "multi"
+phrase = "recipient's address"
+
+[fields.mailbox]
+fact   = "mailbox"
+type   = "string"
+values = "single"
+phrase = "the mailbox"
+
+[fields.move_target]
+fact   = "move_target"
+type   = "string"
+values = "single"
+phrase = "the mailbox moved to"
+
+[[setup.files]]
+path         = ".local/bin/kleis-mail"
+mode         = "0755"
+content_file = "kleis-mail"

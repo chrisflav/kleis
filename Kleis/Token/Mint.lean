@@ -22,6 +22,12 @@ open LeanBiscuit.Token (Biscuit)
 structure MintRequest where
   /-- The grants the token claims, in the order they are to be tried. -/
   grants : List String
+  /-- The specs it names, tried after the grants. -/
+  specs : List String := []
+  /-- Checks for its authority block beyond the expiry: a narrowing (`/.kleis/v1/derive`). -/
+  checks : List Builder.Check := []
+  /-- The narrowings those checks were compiled from, kept with the record for the card. -/
+  narrowings : List String := []
   /-- Who will hold it. -/
   bearer : String
   /-- How long it should live, in seconds. -/
@@ -37,10 +43,10 @@ structure MintRequest where
 recorded so it can be listed and revoked; the token itself is not kept. -/
 def mint (registry : Service.Registry) (r : MintRequest) :
     IO (Except String (Biscuit × IssuedRecord)) := do
-  if r.issuer.isSome && !r.grants.isEmpty then
+  if r.issuer.isSome && !(r.grants.isEmpty && r.specs.isEmpty) then
     return .error "an issuer's credential names no grants: it asks for tokens, it does not spend credentials"
-  if r.issuer.isNone && r.grants.isEmpty then
-    return .error "a token needs at least one grant"
+  if r.issuer.isNone && r.grants.isEmpty && r.specs.isEmpty then
+    return .error "a token needs at least one grant or spec"
   -- Beyond the fixed list, every name a loaded manifest gives meaning to — what its
   -- routes emit or remember, what its rules derive — and the one a grant chooses a
   -- credential with.  A token asserting any of them would be asserting what the
@@ -51,6 +57,8 @@ def mint (registry : Service.Registry) (r : MintRequest) :
     -- state `allowed("push")` and satisfy a grant's own bookkeeping.
     let grantVocabulary := registry.grants.toList.flatMap fun g =>
       g.rules.map (·.head.name) ++ g.facts.map (·.predicate.name)
+    -- The grants include every spec's compiled ones, so their vocabulary — `allowed`
+    -- among it — is refused here too.
     if n == "use_credential" || registry.manifests.any (·.vocabulary.contains n)
         || grantVocabulary.contains n then
       return .error s!"`{n}` is reserved and cannot be issued as a fact"
@@ -60,16 +68,25 @@ def mint (registry : Service.Registry) (r : MintRequest) :
     | some g =>
       if r.ttl > g.maxLifetime then
         return .error s!"the grant `{name}` allows tokens of at most {g.maxLifetime}s"
+  for name in r.specs do
+    match registry.spec? name with
+    | none => return .error s!"no such spec `{name}`"
+    | some s =>
+      let bound := registry.specLifetime s
+      if r.ttl > bound then
+        return .error s!"the spec `{name}` allows tokens of at most {bound}s"
   let root ← loadOrCreateRootKey
   let ephemeral ← match PrivateKey.ofBytes .ed25519 (← Store.randomBytes 32) with
     | .ok k => pure k
     | .error e => return .error e.toString
   let now ← Store.now
-  match issue root { grants := r.grants, bearer := r.bearer, lifetime := r.ttl
-                     issuer := r.issuer, issuedBy := r.issuedBy, extraFacts := r.facts }
+  match issue root { grants := r.grants, specs := r.specs, bearer := r.bearer, lifetime := r.ttl
+                     issuer := r.issuer, issuedBy := r.issuedBy, extraFacts := r.facts
+                     extraChecks := r.checks }
       now ephemeral with
   | .error e => return .error e
   | .ok (token, record) =>
+    let record := { record with narrowings := r.narrowings }
     recordIssued record
     return .ok (token, record)
 
