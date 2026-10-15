@@ -1,0 +1,54 @@
+# A service manifest for a CalDAV server.
+#
+# No `hosts`: the extension's hosts are dynamic (extension.toml), so the manifest claims every
+# server an account of it is bound to, and every route matches any host (`*`) -- a manifest's
+# routes only ever see requests for the hosts it claims.
+#
+# CalDAV is WebDAV: discovery and queries are PROPFIND and REPORT with XML bodies, an event is
+# one iCalendar resource written with PUT and removed with DELETE. Nothing here decodes the XML.
+# What a request may do is decided by its method and its path, which is all a server needs to
+# say too: a calendar is a collection, and an event is a resource under it.
+#
+# The credential is HTTP basic authentication, `<user>:<password>` -- for most servers an app
+# password rather than the account's own.
+#
+# Note on TOML: a key written after a `[[route]]` header belongs to *that* table. Document-level
+# settings therefore go at the top, before any header.
+
+name  = "caldav"
+modes = ["connect"]
+
+[credential]
+provider = "static"
+strip    = ["cookie"]
+
+[[credential.inject]]
+kind     = "basic"
+template = "{{secret}}"
+
+# ---------------------------------------------------------------- reading
+
+# `path` is the request path without its leading slash, so a grant can bound a write to one
+# calendar with `$p.starts_with("…")`.
+[[route]]
+match = "OPTIONS|GET|HEAD|PROPFIND|REPORT * /{path*}"
+emit  = ['operation("read")', 'path($path)']
+
+# ---------------------------------------------------------------- events
+
+# Creating or replacing an event (or a task, or a journal entry).
+[[route]]
+match = "PUT * /{path*}"
+emit  = ['operation("write")', 'path($path)']
+
+[[route]]
+match = "DELETE * /{path*}"
+emit  = ['operation("delete")', 'path($path)']
+
+# ---------------------------------------------------------------- the collections
+
+# Creating, renaming, moving or re-permissioning a calendar, rather than its contents. Separate
+# so that a grant that writes events does not thereby manage calendars.
+[[route]]
+match = "MKCALENDAR|MKCOL|PROPPATCH|MOVE|COPY|ACL|LOCK|UNLOCK * /{path*}"
+emit  = ['operation("manage")', 'path($path)']

@@ -1,0 +1,48 @@
+# CalDAV, on any number of servers. See manifest.toml.
+
+service = "caldav"
+display = "Calendar"
+client  = "curl with PROPFIND/REPORT/PUT/DELETE against the server, or vdirsyncer with ~/.config/vdirsyncer/<server>.conf"
+hosts   = "dynamic"
+
+[groups]
+read = { operations = ["read"], phrase = "discover and read calendars and events" }
+
+[operations]
+read   = "discover and read calendars and events"
+write  = "create and change events"
+delete = "delete events"
+manage = "create, rename, move and re-permission calendars themselves"
+
+[fields.path]
+fact   = "path"
+type   = "string"
+values = "single"
+phrase = "the path"
+
+# A vdirsyncer configuration per server, syncing every calendar into ~/calendars/<server>/.
+# The credentials are placeholders: kleis removes them and attaches the account's.
+[[setup.files]]
+path        = ".config/vdirsyncer/{host}.conf"
+per_account = true
+content     = """
+[general]
+status_path = "~/.local/share/vdirsyncer/{host}/"
+
+[pair calendars]
+a = "remote"
+b = "local"
+collections = ["from a"]
+metadata = ["displayname"]
+
+[storage remote]
+type = "caldav"
+url = "https://{host}/"
+username = "kleis"
+password = "kleis"
+
+[storage local]
+type = "filesystem"
+path = "~/calendars/{host}/"
+fileext = ".ics"
+"""

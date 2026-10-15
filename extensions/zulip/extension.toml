@@ -1,0 +1,46 @@
+# Zulip's REST API, on any number of servers. See manifest.toml.
+
+service = "zulip"
+display = "Zulip"
+client  = "the Python `zulip` package and its `zulip-send`, or curl against /api/v1; ~/.zuliprc points at the first server and ~/.config/zulip/<server>.zuliprc at each"
+hosts   = "dynamic"
+
+[groups]
+read  = { operations = ["read", "events"], phrase = "read messages, streams, users and uploads, and follow the event queue" }
+write = { operations = ["send_message", "edit_message", "react", "update_flags", "typing", "upload"], phrase = "send and edit messages, react, mark messages read, and upload files" }
+
+[operations]
+read           = "read messages, streams, users and uploads"
+events         = "register and follow an event queue"
+send_message   = "send messages"
+edit_message   = "edit messages it sent"
+delete_message = "delete messages"
+react          = "add and remove reactions"
+update_flags   = "mark messages read or starred"
+typing         = "send typing notifications"
+upload         = "upload files"
+subscriptions  = "subscribe to and leave streams (subscribing to one that does not exist creates it)"
+
+[fields.stream]
+fact   = "stream"
+type   = "string"
+values = "single"
+phrase = "the stream"
+
+[fields.message_type]
+fact   = "message_type"
+type   = "string"
+values = "single"
+phrase = "the message type"
+
+# The key is a placeholder: kleis removes whatever a client sends and attaches the account's.
+[[setup.files]]
+path        = ".config/zulip/{host}.zuliprc"
+mode        = "0600"
+per_account = true
+content     = "[api]\nemail=kleis\nkey=kleis\nsite=https://{host}\n"
+
+[[setup.files]]
+path    = ".zuliprc"
+mode    = "0600"
+content = "[api]\nemail=kleis\nkey=kleis\nsite=https://{host}\n"

@@ -1,5 +1,7 @@
 import Kleis.Proxy.Forward
 import Kleis.Token.Mint
+import Kleis.Narrow
+import Kleis.Card
 
 /-!
 # The daemon's own endpoints
@@ -13,8 +15,26 @@ holding the root key.
 GET  /.kleis/v1/health    any valid token
 GET  /.kleis/v1/ca        any valid token: the interception CA, PEM
 POST /.kleis/v1/tokens    an issuer's credential: mint a token
-POST /.kleis/v1/revoke    an issuer's credential: revoke a token it minted
+POST /.kleis/v1/derive    an issuer's credential: make a task token from a spec or a token
+POST /.kleis/v1/revoke    an issuer's credential: revoke a token it minted or derived
+GET  /.kleis/v1/setup     any valid token: what a sandbox needs to use it
+GET  /.kleis/v1/card      any valid token: what it lets its bearer do, in prose
 ```
+
+## Task tokens
+
+`derive` makes a token for one task. From a **spec** the issuer may name (`[[issuer]]
+specs`), it is a new token whose authority block kleis writes — `spec(…)`, the bearer, the
+issuer, the task's facts vetted exactly as for `/tokens`, an expiry, and the narrowing — so a
+grant reads the task's facts where it reads them today. From a **token** handed in, it is that
+token with one more block holding only checks — the expiry and the narrowing — so it reaches
+exactly what the token reached, minus what the block refuses; it carries no task facts, because
+the token's holder decided what it reaches, not the issuer. An issuer's own credential is not
+a source.
+
+Either way the answer names one `revocation_id`, the block that tells this task token from
+anything else, and the record kept for it holds that id alone: revoking it revokes this copy,
+never the token it was made from.
 
 ## What an issuer may ask for
 
@@ -120,6 +140,101 @@ private def mintFor (ctx : Context) (issuer : Issuer) (body : Json) :
                       ("revocation_ids", .arr (record.revocationIds.map Json.str)),
                       ("expires", .num (toString record.expires))])
 
+/-- The issued records of a token's blocks: its own expiry and narrowings, and those of
+whatever it was derived from. -/
+private def recordsOf (token : Biscuit) : IO (List Token.IssuedRecord) :=
+  (Biscuit.revocationIdentifiers token).filterMapM fun id => Token.findIssuedExactly? (Bytes.toHex id)
+
+/-- `POST /.kleis/v1/derive`. -/
+private def deriveFor (ctx : Context) (issuer : Issuer) (body : Json) :
+    IO (Except (Nat × String) Json) := do
+  let registry ← ctx.registry.get
+  let ttl ← match body.field? "ttl" with
+    | none => pure issuer.maxTtl
+    | some j => match durationOf j with
+      | some t => pure t
+      | none => return .error (400, "`ttl` is seconds or a duration such as `8h`")
+  if ttl == 0 then return .error (400, "`ttl` must be positive")
+  if ttl > issuer.maxTtl then
+    return .error (403, s!"the issuer `{issuer.name}` may issue tokens of at most {issuer.maxTtl}s")
+  let narrowings := (body.arr? "narrow").filterMap Json.asString?
+  let checks ← match Narrow.compile registry narrowings with
+    | .ok cs => pure cs
+    | .error e => return .error (400, e)
+  let bearer := (body.str? "bearer").getD s!"{issuer.name}:unnamed"
+  let answer (token : Biscuit) (record : Token.IssuedRecord) : IO Json := do
+    let card := Card.render registry token (← recordsOf token)
+    return .obj [("token", .str (Token.print token)),
+                 ("revocation_id", .str (record.revocationIds.headD "")),
+                 ("revocation_ids", .arr (record.revocationIds.map Json.str)),
+                 ("expires", .num (toString record.expires)),
+                 ("card", .str card)]
+  match body.str? "spec", body.str? "token" with
+  | some _, some _ => return .error (400, "derive from a `spec` or from a `token`, not both")
+  | none, none => return .error (400, "name a `spec` or give a `token` to derive from")
+  | some spec, none =>
+    if !issuer.maySpec spec then
+      return .error (403, s!"the issuer `{issuer.name}` may not derive tokens from the spec `{spec}`")
+    let mut facts : List Builder.Fact := []
+    for fj in body.arr? "facts" do
+      match Token.factOfJson fj with
+      | .error e => return .error (400, e)
+      | .ok f =>
+        let name := f.predicate.name
+        if Token.isReservedPredicate name then
+          return .error (403, s!"`{name}` is reserved and cannot be issued as a fact")
+        if !issuer.mayState name then
+          return .error (403, s!"the issuer `{issuer.name}` may not state `{name}` facts")
+        facts := facts ++ [f]
+    match ← Token.mint registry
+        { grants := [], specs := [spec], checks, narrowings, bearer, ttl, facts
+          issuedBy := some issuer.name } with
+    | .error e => return .error (400, e)
+    | .ok (token, record) => return .ok (← answer token record)
+  | none, some text =>
+    if !(body.arr? "facts").isEmpty then
+      return .error (400, "a task token derived from a token carries no facts; only its holder decides what it reaches")
+    let parent ← match Token.parse text ctx.rootPublic with
+      | .ok t => pure t
+      | .error e => return .error (400, s!"the token to derive from was not accepted: {e}")
+    if (Token.issuerOf? parent).isSome then
+      return .error (403, "an issuer's credential is not something to derive a task token from")
+    match ← tokenHolds ctx parent with
+    | .error e => return .error (403, s!"the token to derive from does not hold: {e}")
+    | .ok () => pure ()
+    let now ← Store.now
+    let expiry := now + ttl
+    let block : LeanBiscuit.Token.BlockBuilder :=
+      { checks := Token.expiryCheck expiry :: checks, scopes := [] }
+    let ephemeral ← match PrivateKey.ofBytes .ed25519 (← Store.randomBytes 32) with
+      | .ok k => pure k
+      | .error e => return .error (500, e.toString)
+    match Biscuit.append parent ephemeral block with
+    | .error e => return .error (400, s!"could not derive: {TokenError.toString e}")
+    | .ok token =>
+      let some id := (Biscuit.revocationIdentifiers token).getLast?.map Bytes.toHex
+        | return .error (500, "the derived token has no revocation id")
+      let record : Token.IssuedRecord :=
+        { revocationIds := [id], grants := [], specs := [], narrowings, bearer
+          issuedBy := some issuer.name, issued := now, expires := expiry }
+      Token.recordIssued record
+      return .ok (← answer token record)
+
+/-- `GET /.kleis/v1/setup`, for the bearer's own token. -/
+private def setupFor (ctx : Context) (token : Biscuit) : IO (Except (Nat × String) Json) := do
+  let registry ← ctx.registry.get
+  match Card.setup registry token with
+  | .error e => return .error (500, e)
+  | .ok (env, files) =>
+    let card := Card.render registry token (← recordsOf token)
+    return .ok (.obj [
+      ("proxy", .obj [("ca_pem", .str ctx.ca.root.pem)]),
+      ("env", .obj (env.map fun (k, v) => (k, Json.str v))),
+      ("files", .arr (files.map fun f => .obj ([("path", .str f.path), ("content", .str f.content)]
+        ++ (f.mode.map fun m => ("mode", Json.str m)).toList))),
+      ("no_proxy", .arr []),
+      ("card", .str card)])
+
 /-- `POST /.kleis/v1/revoke`. -/
 private def revokeFor (ctx : Context) (issuer : Issuer) (body : Json) :
     IO (Except (Nat × String) Json) := do
@@ -147,7 +262,14 @@ def handleAdmin (ctx : Context) (client : Net.Stream) (wire : Http.Request) (res
   | "GET", "/.kleis/v1/health" => respondJson client 200 (.obj [("ok", .bool true)])
   | "GET", "/.kleis/v1/ca" =>
     client.write (Http.simpleResponse 200 "application/x-pem-file" ctx.ca.root.pem)
-  | "POST", "/.kleis/v1/tokens" | "POST", "/.kleis/v1/revoke" =>
+  | "GET", "/.kleis/v1/card" =>
+    let card := Card.render (← ctx.registry.get) token (← recordsOf token)
+    client.write (Http.simpleResponse 200 "text/plain; charset=utf-8" card)
+  | "GET", "/.kleis/v1/setup" =>
+    match ← setupFor ctx token with
+    | .error (status, message) => respondError client status message
+    | .ok answer => respondJson client 200 answer
+  | "POST", "/.kleis/v1/tokens" | "POST", "/.kleis/v1/revoke" | "POST", "/.kleis/v1/derive" =>
     match issuerFor ctx token with
     | .error e => respondError client 403 e
     | .ok issuer =>
@@ -158,6 +280,7 @@ def handleAdmin (ctx : Context) (client : Net.Stream) (wire : Http.Request) (res
         | .error e => respondError client 400 s!"the body is not JSON: {e}"
         | .ok body =>
           let result ← if path == "/.kleis/v1/tokens" then mintFor ctx issuer body
+            else if path == "/.kleis/v1/derive" then deriveFor ctx issuer body
             else revokeFor ctx issuer body
           match result with
           | .error (status, message) => respondError client status message

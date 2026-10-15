@@ -48,6 +48,9 @@ def services : IO System.FilePath := do return (← config) / "services"
 /-- Grants. -/
 def grants : IO System.FilePath := do return (← config) / "grants"
 
+/-- Specs (`Kleis.Spec`). -/
+def specs : IO System.FilePath := do return (← config) / "specs"
+
 /-- Encrypted credentials. -/
 def credentials : IO System.FilePath := do return (← data) / "credentials"
 

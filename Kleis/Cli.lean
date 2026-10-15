@@ -203,6 +203,36 @@ def cmdGrant (args : Args) : IO Unit := do
     for g in registry.grants do
       say s!"{g.name}\t{g.service}\t{g.credentialLabel}\tmax {g.maxLifetime}s"
 
+/-- `kleis spec list|show|compile` -/
+def cmdSpec (args : Args) : IO Unit := do
+  let registry ← Service.Registry.load
+  match args.at? 1 with
+  | some "compile" | some "show" =>
+    let some name := args.at? 2 | die "usage: kleis spec compile <name>"
+    let some s := registry.spec? name | die s!"no such spec `{name}`"
+    say s!"// spec {s.name}, version {s.version}, max_ttl {s.maxTtl}s"
+    for a in s.accounts do
+      say ""
+      say a.grant.source
+    for g in s.includes do
+      say ""
+      say s!"// includes the grant `{g}`, deciding with grant(\"{g}\") asserted"
+  | _ =>
+    for s in registry.specs do
+      let accounts := s.accounts.map (·.record.name) ++ s.includes.map (s!"grant:{·}")
+      say s!"{s.name}\t{String.intercalate ", " accounts}\tmax {s.maxTtl}s"
+
+/-- `kleis card --token T`: what a token lets its bearer do. -/
+def cmdCard (args : Args) : IO Unit := do
+  let registry ← Service.Registry.load
+  let text ← readValue (args.opt? "token")
+  let token ← match Token.parse text (← Token.rootPublicKey) with
+    | .ok t => pure t
+    | .error e => die s!"the token was not accepted: {e}"
+  let records ← (LeanBiscuit.Token.Biscuit.revocationIdentifiers token).filterMapM fun id =>
+    Token.findIssuedExactly? (Bytes.toHex id)
+  IO.print (Card.render registry token records)
+
 /-- `kleis credential add|list|remove` -/
 def cmdCredential (args : Args) : IO Unit := do
   match args.at? 1 with
@@ -221,7 +251,11 @@ def cmdCredential (args : Args) : IO Unit := do
         | .error e => die s!"--config is not JSON: {e}"
     let material ← readValue (args.opt? "secret")
     if Str.trim material |>.isEmpty then die "the credential material is empty"
-    Credential.save name service provider config (Credential.Secret.ofString material)
+    -- `--hosts a,b`: the exact hosts it may be spent on. Required for a service whose
+    -- servers vary by account, which the registry checks when it next loads.
+    let hosts := (args.opts "hosts").flatMap fun h =>
+      (h.splitOn ",").map Str.trim |>.filter (!·.isEmpty)
+    Credential.save name service provider config (Credential.Secret.ofString material) hosts
     say s!"installed `{name}` for {service} via {provider}"
   | some "remove" =>
     let some name := args.at? 2 | die "usage: kleis credential remove <name>"
@@ -229,7 +263,8 @@ def cmdCredential (args : Args) : IO Unit := do
     else die s!"no such credential `{name}`"
   | _ =>
     for r in ← Credential.list do
-      say s!"{r.name}\t{r.service}\t{r.provider}"
+      let hosts := if r.hosts.isEmpty then "" else s!"\t{String.intercalate "," r.hosts}"
+      say s!"{r.name}\t{r.service}\t{r.provider}{hosts}"
 
 /-- `kleis token issue|attenuate|inspect|list|revoke` -/
 def cmdToken (args : Args) : IO Unit := do
@@ -239,7 +274,9 @@ def cmdToken (args : Args) : IO Unit := do
     -- `--grant a --grant b` and `--grant a,b` both name two, tried in that order.
     let grants := (args.opts "grant").flatMap fun g =>
       (g.splitOn ",").map Str.trim |>.filter (!·.isEmpty)
-    if grants.isEmpty then die "issuing a token needs --grant"
+    let specs := (args.opts "spec").flatMap fun g =>
+      (g.splitOn ",").map Str.trim |>.filter (!·.isEmpty)
+    if grants.isEmpty && specs.isEmpty then die "issuing a token needs --grant or --spec"
     let bearer := args.optD "bearer" "unnamed"
     let ttl ← match Policy.parseDuration? (args.optD "ttl" "8h") with
       | some t => pure t
@@ -248,7 +285,7 @@ def cmdToken (args : Args) : IO Unit := do
       match Token.factOfSource src with
       | .ok f => pure f
       | .error e => die e
-    match ← Token.mint registry { grants, bearer, ttl, facts } with
+    match ← Token.mint registry { grants, specs, bearer, ttl, facts } with
     | .error e => die e
     | .ok (token, _) => say (Token.print token)
   | some "attenuate" =>
@@ -425,12 +462,15 @@ usage:
 
   kleis service list | show <name>
   kleis grant   list | show <name>
+  kleis spec    list | compile <name>   specs, and the grants they compile to
+  kleis card [--token <t|@file|->]      what a token lets its bearer do, in prose
 
   kleis credential add <name> --service <s> [--provider static|exec|oauth2|github-app]
                              [--config <json|@file>] [--secret <value|@file|->]
+                             [--hosts <host>[,<host>…]]
   kleis credential list | remove <name>
 
-  kleis token issue --grant <g>[,<g>…] [--bearer <b>] [--ttl 8h]
+  kleis token issue (--grant <g>[,<g>…] | --spec <s>[,<s>…]) [--bearer <b>] [--ttl 8h]
                     [--fact '<datalog fact>']…
   kleis token attenuate --check '<datalog>' [--token <t|@file|->]
   kleis token inspect [--token <t|@file|->]
@@ -458,6 +498,8 @@ def main (argv : List String) : IO UInt32 := do
       | "ca" => cmdCa args
       | "service" => cmdService args
       | "grant" => cmdGrant args
+      | "spec" => cmdSpec args
+      | "card" => cmdCard args
       | "credential" => cmdCredential args
       | "token" => cmdToken args
       | "issuer" => cmdIssuer args

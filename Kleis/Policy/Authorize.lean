@@ -163,6 +163,10 @@ def assemble (i : Input) : AuthorizerBuilder :=
   let bodyValue := i.body.value?
   let facts :=
     Facts.ofRequest i.request
+      -- Which manifest claimed the request: what a narrowing names a service by
+      -- (`reject if request_service("mail"), …`), so that it refuses requests to
+      -- that service and leaves every other alone.
+      ++ [⟨⟨"request_service", [.str i.manifest.name]⟩⟩]
       ++ Facts.ambient i.now i.clientIp i.requestId
       ++ bodyFacts i.body i.manifest.maxBodyFacts
       ++ i.manifest.contribute i.request bodyValue

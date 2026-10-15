@@ -40,6 +40,11 @@ inductive Rejection where
   | unknownHost (host : String)
   /-- The token names grants nobody has. -/
   | unknownGrant (names : List String)
+  /-- The token names a spec nobody has. -/
+  | unknownSpec (name : String)
+  /-- None of the token's specs has an account for the service, and it names no grant
+  that does. -/
+  | noAccount (specs : List String) (service : String)
   /-- The token names no grant at all. -/
   | noGrant
   /-- None of the token's grants is for the service the host belongs to. -/
@@ -53,7 +58,11 @@ def Rejection.toString : Rejection → String
   | .unknownGrant [n] => s!"the token names the grant `{n}`, which is not configured"
   | .unknownGrant ns =>
     s!"the token names the grants {", ".intercalate (ns.map (s!"`{·}`"))}, none of which is configured"
-  | .noGrant => "the token names no grant"
+  | .noGrant => "the token names no grant and no spec"
+  | .unknownSpec n => s!"the token names the spec `{n}`, which is not configured"
+  | .noAccount [s] svc => s!"the spec `{s}` has no account for `{svc}`"
+  | .noAccount ss svc =>
+    s!"none of the specs {", ".intercalate (ss.map (s!"`{·}`"))} has an account for `{svc}`"
   | .wrongService [g] s h =>
     s!"the grant `{g}` is not for the service `{s}`, which is what claims `{h}`"
   | .wrongService gs s h =>
@@ -61,15 +70,27 @@ def Rejection.toString : Rejection → String
       which is what claims `{h}`"
   | .noCredential n => s!"the credential `{n}` is not installed"
 
-/-- The grants a token may be decided by for one service, in the token's order. -/
+/-- The grants a token may be decided by for one service, in the token's order: the grants
+it names, then the grants of each spec it names (`Service.Registry.specGrants`).
+
+Both are read from the authority block only, which only the root key signs. A spec is
+resolved here, per request, so the spec file says what its tokens may do now. -/
 def candidates (registry : Service.Registry) (token : Biscuit) (manifest : Service.Manifest)
     (host : String) : Except Rejection (List Grant) := do
   let names := Token.grantsOf token
-  if names.isEmpty then throw .noGrant
+  let specNames := Token.specsOf token
+  if names.isEmpty && specNames.isEmpty then throw .noGrant
   let known := names.filterMap registry.grant?
-  if known.isEmpty then throw (.unknownGrant names)
-  match known.filter (·.service == manifest.name) with
-  | [] => throw (.wrongService (known.map (·.name)) manifest.name host)
+  if !names.isEmpty && known.isEmpty && specNames.isEmpty then throw (.unknownGrant names)
+  let mut fromSpecs : List Grant := []
+  for s in specNames do
+    match registry.spec? s with
+    | none => throw (.unknownSpec s)
+    | some spec => fromSpecs := fromSpecs ++ registry.specGrants spec
+  match (known ++ fromSpecs).filter (·.service == manifest.name) with
+  | [] =>
+    if specNames.isEmpty then throw (.wrongService (known.map (·.name)) manifest.name host)
+    else throw (.noAccount specNames manifest.name)
   | gs => pure gs
 
 /-- What deciding among several grants came to. -/

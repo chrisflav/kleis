@@ -1,0 +1,92 @@
+# A service manifest for kleis-mail, the HTTP gateway to IMAP and SMTP that runs beside kleisd
+# (./kleis-mail-gateway.py says what it is and why it exists; README.md how to run it).
+#
+# The gateway is reached as `http://kleis-mail:8025`, a name only kleisd resolves: the deployment
+# puts the two on one private network, which a sandbox cannot route to. A sandbox's request goes
+# to kleis through HTTP_PROXY, kleis decides it, adds the account the token's spec chose, and
+# forwards it over that network. Plain HTTP is therefore what the origin speaks, and
+# `allow_plaintext` says the credential may go over it -- it never leaves the deployment.
+#
+# Note on TOML: a key written after a `[[route]]` header belongs to *that* table. Document-level
+# settings therefore go at the top, before any header.
+
+name  = "mail"
+hosts = ["kleis-mail"]
+modes = ["connect", "rewrite"]
+
+max_body_facts    = 256
+max_decode_prefix = 65536
+
+# The mailbox a request is about.
+resources = ["mailbox"]
+
+# Every address a message is sent to. The gateway takes `to`, `cc` and `bcc` only as arrays of
+# bare addresses; the single-element path is here as well so that a body breaking that rule is
+# still read, not skipped, should the gateway ever stop refusing it.
+datalog = '''
+recipient($a) <-
+  operation("send"), body($p, $a), $p.length() == 2,
+  ["to", "cc", "bcc"].contains($p.get(0));
+recipient($a) <-
+  operation("send"), body($p, $a), $p.length() == 1,
+  ["to", "cc", "bcc"].contains($p.get(0));
+'''
+
+# The secret is the identity's whole account as one line of JSON -- login, password and servers,
+# see ./mail-gateway.py -- so that each identity's mailbox can be on a server of its own. A copy
+# of the header sent by the client is removed before kleis sets its own.
+[credential]
+provider        = "static"
+allow_plaintext = true
+strip           = ["x-kleis-mail-account"]
+
+[[credential.inject]]
+kind     = "header"
+name     = "X-Kleis-Mail-Account"
+template = "{{secret}}"
+
+# Every write is JSON, whatever the client calls it.
+[[decoder]]
+media   = ["*"]
+decoder = "json"
+match   = "POST kleis-mail /{rest*}"
+
+# ---------------------------------------------------------------- reading
+
+[[route]]
+match = "GET|HEAD kleis-mail /mailboxes"
+emit  = ['operation("list_mailboxes")']
+
+[[route]]
+match = "GET|HEAD kleis-mail /mailboxes/{mailbox}/messages"
+emit  = ['operation("list_messages")', 'mailbox($mailbox)']
+
+[[route]]
+match = "GET|HEAD kleis-mail /mailboxes/{mailbox}/messages/{uid:int}"
+emit  = ['operation("read_message")', 'mailbox($mailbox)', 'message($uid)']
+
+[[route]]
+match = "GET|HEAD kleis-mail /mailboxes/{mailbox}/messages/{uid:int}/raw"
+emit  = ['operation("read_message")', 'mailbox($mailbox)', 'message($uid)']
+
+[[route]]
+match = "GET|HEAD kleis-mail /mailboxes/{mailbox}/messages/{uid:int}/attachments/{n:int}"
+emit  = ['operation("read_message")', 'mailbox($mailbox)', 'message($uid)']
+
+# ---------------------------------------------------------------- filing
+
+[[route]]
+match = "POST kleis-mail /mailboxes/{mailbox}/messages/{uid:int}/flags"
+emit  = ['operation("set_flags")', 'mailbox($mailbox)', 'message($uid)']
+
+[[route]]
+match   = "POST kleis-mail /mailboxes/{mailbox}/messages/{uid:int}/move"
+capture = { target = "body:to" }
+emit    = ['operation("move_message")', 'mailbox($mailbox)', 'message($uid)',
+           'move_target($target)']
+
+# ---------------------------------------------------------------- sending
+
+[[route]]
+match = "POST kleis-mail /send"
+emit  = ['operation("send")']

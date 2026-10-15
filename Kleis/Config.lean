@@ -66,6 +66,11 @@ structure Issuer where
   tokenFile : Option String := none
   /-- How long a credential written to `tokenFile` lives, in seconds. -/
   tokenTtl : Nat := 365 * 86400
+  /-- Spec names, or `prefix*` patterns, it may make task tokens from by name
+  (`/.kleis/v1/derive` with `spec`). A spec is the owner's statement of what a bearer
+  may do; naming one here is what lets this issuer hand that out without holding a
+  token for it. -/
+  specs : List String := []
   deriving Repr, Inhabited
 
 /-- Does a name match a list of names and `prefix*` patterns? -/
@@ -75,6 +80,9 @@ def namePatternsMatch (patterns : List String) (name : String) : Bool :=
 
 /-- May this issuer claim a grant? -/
 def Issuer.mayClaim (i : Issuer) (grant : String) : Bool := namePatternsMatch i.grants grant
+
+/-- May this issuer make task tokens from a spec by name? -/
+def Issuer.maySpec (i : Issuer) (spec : String) : Bool := namePatternsMatch i.specs spec
 
 /-- May this issuer add a fact with this predicate? -/
 def Issuer.mayState (i : Issuer) (predicate : String) : Bool :=
@@ -128,6 +136,12 @@ structure Config where
   passthroughInternal : Bool := false
   /-- The programs allowed to ask for tokens. -/
   issuers : List Issuer := []
+  /-- The extensions enabled, by name (`Kleis.Service.Extension`). -/
+  extensions : List String := []
+  /-- Hosts an extension with dynamic hosts claims besides its accounts', by extension:
+  `[extension.zulip] hosts = [...]`. A request there is refused with a reason rather than
+  passing through, even before any account is bound to it. -/
+  extensionHosts : List (String × List String) := []
   deriving Repr, Inhabited
 
 /-- May a host no manifest claims be reached through the proxy? -/
@@ -159,7 +173,8 @@ private def issuerOf (j : Json) : Except String Issuer := do
     | some d => match Policy.parseDuration? d with
       | some n => pure n
       | none => throw s!"`{d}` is not a duration"
-  pure { name, grants := strings "grants", facts, maxTtl, tokenFile := j.str? "token_file", tokenTtl }
+  pure { name, grants := strings "grants", facts, maxTtl, tokenFile := j.str? "token_file", tokenTtl
+         specs := strings "specs" }
 
 /-- Read a configuration from TOML. -/
 def Config.ofToml (source : String) : Except String Config := do
@@ -189,7 +204,12 @@ def Config.ofToml (source : String) : Except String Config := do
       | [] => [443]
       | ps => ps.map Int.toNat
     passthroughInternal := (j.bool? "passthrough_internal").getD false
-    issuers }
+    issuers
+    extensions := (j.arr? "extensions").filterMap Json.asString?
+    extensionHosts := match j.field? "extension" with
+      | some (.obj entries) => entries.map fun (name, e) =>
+          (name, ((e.arr? "hosts").filterMap Json.asString?).map Str.toLowerAscii)
+      | _ => [] }
 
 /-- Load the configuration, or the defaults if there is no file. -/
 def loadConfig : IO Config := do

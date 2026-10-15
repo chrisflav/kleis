@@ -1,0 +1,81 @@
+# A service manifest for the taxis issue tracker's API (github.com/chrisflav/taxis), as the
+# `taxis` command-line client uses it.
+#
+# No `hosts`: a taxis instance is per deployment, so the extension's hosts are dynamic and the
+# manifest claims every server an account is bound to. Routes match any host (`*`).
+#
+# taxis authenticates with `Authorization: Bearer <token>`; the client sends whatever its config
+# holds, kleis removes it and attaches the account's.
+#
+# What it covers: every read, issues created, edited and deleted, comments, artifacts — a claim is
+# a `session` artifact, an attached pull request a `github-pr` one, a context note a `context` one
+# — and labels. A request no route matches gets no `operation` fact and is refused.
+#
+# Note on TOML: a key written after a `[[route]]` header belongs to *that* table.
+
+name  = "taxis"
+modes = ["connect"]
+
+max_body_facts    = 256
+max_decode_prefix = 262144
+
+[credential]
+provider = "static"
+strip    = ["cookie"]
+
+[[credential.inject]]
+kind     = "header"
+name     = "Authorization"
+template = "Bearer {{secret}}"
+
+# Every write is JSON, whatever the client calls it.
+[[decoder]]
+media   = ["*"]
+decoder = "json"
+match   = "POST|PUT|PATCH|DELETE * /api/{rest*}"
+
+# ---------------------------------------------------------------- reading
+
+[[route]]
+match = "GET|HEAD * /api/{endpoint*}"
+emit  = ['operation("read")']
+
+# ---------------------------------------------------------------- issues
+
+[[route]]
+match = "POST * /api/issues"
+emit  = ['operation("create_issue")']
+
+[[route]]
+match = "PATCH * /api/issues/{id}"
+emit  = ['operation("edit_issue")', 'issue($id)']
+
+[[route]]
+match = "DELETE * /api/issues/{id}"
+emit  = ['operation("delete_issue")', 'issue($id)']
+
+[[route]]
+match = "POST * /api/issues/{id}/comments"
+emit  = ['operation("comment")', 'issue($id)']
+
+# ---------------------------------------------------------------- artifacts
+
+# Claims, pull requests, context notes: which one is in the body.
+[[route]]
+match   = "POST * /api/issues/{id}/artifacts"
+capture = { kind = "body:kind" }
+emit    = ['operation("attach")', 'issue($id)', 'artifact_kind($kind)']
+
+[[route]]
+match = "PATCH * /api/artifacts/{id}"
+emit  = ['operation("edit_artifact")', 'artifact($id)']
+
+[[route]]
+match = "DELETE * /api/artifacts/{id}"
+emit  = ['operation("delete_artifact")', 'artifact($id)']
+
+# ---------------------------------------------------------------- labels
+
+[[route]]
+match = "POST * /api/labels"
+emit  = ['operation("create_label")']

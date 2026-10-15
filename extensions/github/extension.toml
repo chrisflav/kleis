@@ -1,0 +1,49 @@
+# GitHub: git over smart HTTP, the REST API and GraphQL. See manifest.toml.
+#
+# Operations are the manifest's; the groups are what a spec says most often. Repository-level
+# conditions (`repository(owner, repo)` has two terms) are not fields yet: a spec that needs them
+# includes a grant file (`grant orchestra-github`) or writes `datalog`.
+
+service = "github"
+display = "GitHub"
+client  = "git and gh, against the real URLs; gh has a placeholder token, kleis supplies the real one"
+hosts   = "fixed"
+
+[groups]
+read   = { operations = ["discover", "fetch", "read", "download", "api_read", "graphql"], phrase = "clone, fetch and read repositories and the API" }
+push   = { operations = ["discover", "push"], phrase = "push" }
+pulls  = { operations = ["open_pr", "edit_pr", "review_pr", "review_comment", "comment"], phrase = "open, edit, review and comment on pull requests" }
+labels = { operations = ["add_labels", "set_labels", "remove_label", "create_label"], phrase = "manage labels" }
+
+[operations]
+discover          = "discover refs"
+fetch             = "fetch"
+read              = "read repository contents"
+download          = "download archives and releases"
+api_read          = "read the REST API"
+graphql           = "run GraphQL queries"
+push              = "push"
+open_pr           = "open pull requests"
+edit_pr           = "edit pull requests"
+review_pr         = "review pull requests"
+review_comment    = "comment on pull request diffs"
+comment           = "comment on issues and pull requests"
+merge_pr          = "merge pull requests"
+add_labels        = "add labels"
+set_labels        = "set labels"
+remove_label      = "remove labels"
+create_label      = "create labels"
+create_repository = "create repositories"
+
+# What a card says about the facts an orchestrator states for a task (`/.kleis/v1/derive`).
+[facts]
+task_fork        = "your fork is {0}/{1}; push there"
+task_upstream    = "you work for {0}/{1}; open pull requests there, from your fork"
+task_issue       = "you were started from issue or pull request #{0}"
+task_pr_labels   = "label your pull requests {0}"
+task_push_prefix = "push only to refs under {0}"
+task_org         = "repositories you create go in {0}"
+task_tool        = "you may: {0}"
+
+[setup]
+env = { GH_TOKEN = "kleis", GIT_TERMINAL_PROMPT = "0", GIT_CONFIG_COUNT = "1", GIT_CONFIG_KEY_0 = "http.proxyAuthMethod", GIT_CONFIG_VALUE_0 = "basic" }

@@ -1,0 +1,45 @@
+# The taxis issue tracker, on any number of instances. See manifest.toml.
+
+service = "taxis"
+display = "taxis"
+client  = "the `taxis` command (`taxis --help`); ~/.config/taxis/config.toml points at the first server, ~/.config/taxis/<server>.toml at each (`taxis --config …`)"
+hosts   = "dynamic"
+
+[groups]
+read  = { operations = ["read"], phrase = "read issues, comments, context notes, labels, projects and actors" }
+work  = { operations = ["create_issue", "edit_issue", "comment", "attach", "edit_artifact"], phrase = "create and edit issues, comment, claim and release issues, attach pull requests and context notes" }
+
+[operations]
+read            = "read issues, comments, context notes, labels, projects and actors"
+create_issue    = "create issues"
+edit_issue      = "edit issues"
+delete_issue    = "delete issues"
+comment         = "comment on issues"
+attach          = "attach claims, pull requests and context notes to issues"
+edit_artifact   = "change claims, pull requests and context notes"
+delete_artifact = "remove claims, pull requests and context notes"
+create_label    = "create labels"
+
+[fields.issue]
+fact   = "issue"
+type   = "string"
+values = "single"
+phrase = "the issue"
+
+[fields.artifact_kind]
+fact   = "artifact_kind"
+type   = "string"
+values = "single"
+phrase = "what is attached (session = a claim, github-pr, context)"
+
+# The token is a placeholder: kleis removes it and attaches the account's.
+[[setup.files]]
+path        = ".config/taxis/{host}.toml"
+mode        = "0600"
+per_account = true
+content     = "url = \"https://{host}\"\ntoken = \"kleis\"\n"
+
+[[setup.files]]
+path    = ".config/taxis/config.toml"
+mode    = "0600"
+content = "url = \"https://{host}\"\ntoken = \"kleis\"\n"

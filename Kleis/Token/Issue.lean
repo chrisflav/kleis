@@ -81,6 +81,10 @@ structure Issue where
   the upstream it opens pull requests on.  Each grant is still decided on its
   own; see `Kleis.Policy.Select`. -/
   grants : List String
+  /-- The specs the token names (`Kleis.Spec`), tried after its grants. A spec is
+  resolved when a request is decided, not when the token is issued, so editing the spec
+  changes what every token naming it may do. -/
+  specs : List String := []
   /-- Who holds it, recorded as a fact so a policy can name them. -/
   bearer : String
   /-- How long it lives, in seconds. -/
@@ -107,7 +111,7 @@ would satisfy a grant's check for every request it made, whatever the request
 was.  This list is the floor; an issuer is further confined to the predicates
 its configuration names. -/
 def reservedPredicates : List String :=
-  ["grant", "bearer", "issuer", "issued_by", "time", "client_ip", "request_id",
+  ["grant", "spec", "bearer", "issuer", "issued_by", "time", "client_ip", "request_id",
    "operation", "repository", "pull_request", "issue", "ref_update", "creates_ref",
    "deletes_ref", "wants_object", "discover_service", "body", "request_body",
    -- The shipped GitHub manifest's vocabulary, for the same reason.
@@ -141,6 +145,7 @@ def expiryCheck (expiry : Nat) : Builder.Check :=
 /-- The authority block for an issue. -/
 def authorityBlock (i : Issue) (expiry : Nat) : BlockBuilder :=
   { facts := i.grants.map (fun g => ⟨⟨"grant", [.str g]⟩⟩)
+      ++ i.specs.map (fun s => ⟨⟨"spec", [.str s]⟩⟩)
       ++ [⟨⟨"bearer", [.str i.bearer]⟩⟩]
       ++ (i.issuer.map fun n => ⟨⟨"issuer", [.str n]⟩⟩).toList
       ++ (i.issuedBy.map fun n => ⟨⟨"issued_by", [.str n]⟩⟩).toList
@@ -158,6 +163,11 @@ structure IssuedRecord where
   revocationIds : List String
   /-- The grants it claims. -/
   grants : List String
+  /-- The specs it names. -/
+  specs : List String := []
+  /-- Narrowings applied when it was made (`/.kleis/v1/derive`), as written, for its card.
+  What enforces them is the checks in the token; this is the prose. -/
+  narrowings : List String := []
   /-- Who it was issued to. -/
   bearer : String
   /-- The issuer that asked for it, if one did. -/
@@ -169,14 +179,17 @@ structure IssuedRecord where
 
 /-- The grants, as one word for a listing. -/
 def IssuedRecord.grantLabel (r : IssuedRecord) : String :=
-  if r.grants.isEmpty then "-" else ",".intercalate r.grants
+  let names := r.grants ++ r.specs.map (s!"spec:{·}")
+  if names.isEmpty then "-" else ",".intercalate names
 
 /-- Render an issued record. -/
 def IssuedRecord.toJson (r : IssuedRecord) : Json :=
   .obj ([("revocation_ids", .arr (r.revocationIds.map Json.str)),
          ("grants", .arr (r.grants.map Json.str)), ("bearer", .str r.bearer),
          ("issued", .num (toString r.issued)), ("expires", .num (toString r.expires))]
-        ++ (r.issuedBy.map fun n => ("issued_by", Json.str n)).toList)
+        ++ (r.issuedBy.map fun n => ("issued_by", Json.str n)).toList
+        ++ (if r.specs.isEmpty then [] else [("specs", .arr (r.specs.map Json.str))])
+        ++ (if r.narrowings.isEmpty then [] else [("narrowings", .arr (r.narrowings.map Json.str))]))
 
 /-- Read an issued record.  A record written before tokens could name more than
 one grant has a single `grant`, which is read as a list of one. -/
@@ -186,6 +199,8 @@ def IssuedRecord.ofJson (j : Json) : Except String IssuedRecord := do
     | none => (j.arr? "grants").filterMap Json.asString?
   pure { revocationIds := (j.arr? "revocation_ids").filterMap Json.asString?
          grants
+         specs := (j.arr? "specs").filterMap Json.asString?
+         narrowings := (j.arr? "narrowings").filterMap Json.asString?
          bearer := (j.str? "bearer").getD ""
          issuedBy := j.str? "issued_by"
          issued := ((j.int? "issued").getD 0).toNat
@@ -249,7 +264,7 @@ def issue (root : PrivateKey) (i : Issue) (now : Nat) (ephemeral : PrivateKey) :
   | .ok token =>
     let record : IssuedRecord :=
       { revocationIds := (Biscuit.revocationIdentifiers token).map Bytes.toHex
-        grants := i.grants, bearer := i.bearer, issuedBy := i.issuedBy
+        grants := i.grants, specs := i.specs, bearer := i.bearer, issuedBy := i.issuedBy
         issued := now, expires := expiry }
     pure (token, record)
 
@@ -305,6 +320,9 @@ def grantsOf (token : Biscuit) : List String := authorityStrings token "grant"
 
 /-- The first grant a token claims. -/
 def grantOf? (token : Biscuit) : Option String := (grantsOf token).head?
+
+/-- The specs a token names, from its authority block only. -/
+def specsOf (token : Biscuit) : List String := authorityStrings token "spec"
 
 /-- Who a token says it was issued to, for the log. -/
 def bearerOf? (token : Biscuit) : Option String := (authorityStrings token "bearer").head?

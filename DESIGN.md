@@ -429,6 +429,27 @@ manifests give meaning to are refused whatever it lists
 `check if repository($o, $r), task_fork($o, $r)` means "the job's own fork" for
 every job, and a job's token says only which job it is.
 
+### 4.8 Specs, task tokens and cards
+
+A **spec** (`config/specs/*.kleis`, `Kleis.Spec`) says what a bearer with accounts on several
+services may do, in each service's own vocabulary, and compiles into one ordinary grant per
+account — so everything above holds of it. A token names it with `spec(name)` in its authority
+block, read there and nowhere else, and resolved per request (`Policy.candidates`): the spec
+file says what its tokens may do now. A compiled grant begins `check if spec(name)`, so it
+cannot be reached by naming it as a grant.
+
+An issuer allowed a spec makes a token per task with `POST /.kleis/v1/derive`, with the task's
+facts in an authority block kleis writes, exactly as `/tokens` does; or narrows a token it was
+handed, with a block of checks and no facts. A narrowing is `reject if request_service(…)`
+rather than `check if`, because a token's checks are also evaluated with no request at all
+(`Proxy.tokenHolds`). Every token has a **card**, prose generated from the spec, and a
+**setup**, what a sandbox needs to use it with ordinary clients, both served to its bearer.
+
+An account of a service whose servers vary (Zulip, CalDAV) names its hosts
+(`Credential.Record.hosts`); the secret carries them to `bind`, which refuses any other host,
+after a redirect as before it. [docs/design/specs.md](docs/design/specs.md) is the whole design,
+and what a review of it changed.
+
 ## 5. Credentials
 
 ### 5.1 The secret type

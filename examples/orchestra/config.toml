@@ -15,10 +15,18 @@ mode   = "connect"
 # else.
 passthrough = ["*"]
 
-# The orchestrator mints a token per job through /.kleis/v1/tokens.  It may name
-# only the grants below, state only `task_*` facts, and ask for at most a day.
+# The services kleis knows, from the extensions it ships (extensions/ in the
+# repository, /usr/share/kleis/extensions in the image).  With "github" here, the
+# manifest comes from the extension; do not also copy github.toml into services/.
+extensions = ["github", "zulip", "caldav", "mail"]
+
+# The orchestrator makes a token per job: through /.kleis/v1/derive from one of
+# the specs below (specs/*.kleis), or through /.kleis/v1/tokens naming grants.  It
+# may name only these grants and specs, state only `task_*` facts, and ask for at
+# most a day.
 [[issuer]]
 name    = "orchestra"
 grants  = ["orchestra-*"]
+specs   = ["worker", "secretary"]
 facts   = ["task_*"]
 max_ttl = "24h"

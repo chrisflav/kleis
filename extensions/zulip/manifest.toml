@@ -1,0 +1,135 @@
+# A service manifest for a Zulip server's REST API.
+#
+# No `hosts`: the extension's hosts are dynamic (extension.toml), so the manifest claims every
+# server an account of it is bound to (`hosts` on the credential), and nothing else. Every route
+# below therefore matches any host (`*`); a manifest's routes only ever see requests for the
+# hosts it claims.
+#
+# Zulip authenticates the API with HTTP basic authentication, `<bot email>:<API key>` -- the two
+# fields of a zuliprc. The credential's secret is that whole pair, so one manifest serves any
+# number of accounts, on any number of servers, and a spec chooses which one goes out.
+#
+# What it covers: every read (`GET`), sending, editing and reacting to messages, read flags,
+# typing notifications, uploads, and the event queue a client long-polls. A request no route
+# matches gets no `operation` fact and is refused by a grant that requires one -- that is where
+# account, organisation and stream administration, `fetch_api_key` and the session-only `/json/`
+# endpoints go.
+#
+# Note on TOML: a key written after a `[[route]]` header belongs to *that* table. Document-level
+# settings therefore go at the top, before any header.
+
+name  = "zulip"
+modes = ["connect"]
+
+max_body_facts    = 256
+max_decode_prefix = 262144
+
+# The stream a message is sent to, for a grant that bounds where it may post. Zulip 9 renamed
+# the `stream` message type `channel` and accepts both.
+datalog = '''
+stream($to) <- message_type("stream"), recipient($to);
+stream($to) <- message_type("channel"), recipient($to);
+'''
+
+[credential]
+provider = "static"
+# A browser session must not ride along with the bot's key.
+strip    = ["cookie"]
+
+[[credential.inject]]
+kind     = "basic"
+template = "{{secret}}"
+
+# Zulip takes form-encoded parameters on every write. Bound by route, whatever Content-Type the
+# client sends (`media = ["*"]`), so a body relabelled `text/plain` is still read.
+[[decoder]]
+media   = ["*"]
+decoder = "multipart"
+match   = "POST * /api/v1/user_uploads"
+
+[[decoder]]
+media   = ["*"]
+decoder = "form"
+match   = "POST|PUT|PATCH|DELETE * /api/v1/{rest*}"
+
+# ---------------------------------------------------------------- reading
+
+[[route]]
+match = "GET|HEAD * /api/v1/{endpoint*}"
+emit  = ['operation("read")', 'endpoint($endpoint)']
+
+# Uploaded files are served outside /api/v1.
+[[route]]
+match = "GET|HEAD * /user_uploads/{path*}"
+emit  = ['operation("read")', 'endpoint("user_uploads")']
+
+# Rendering markdown changes nothing.
+[[route]]
+match = "POST * /api/v1/messages/render"
+emit  = ['operation("read")', 'endpoint("messages/render")']
+
+# ---------------------------------------------------------------- the event queue
+
+# A client registers a queue, long-polls GET /events (a read, above), and deletes it.
+[[route]]
+match = "POST * /api/v1/register"
+emit  = ['operation("events")']
+
+[[route]]
+match = "DELETE * /api/v1/events"
+emit  = ['operation("events")']
+
+# ---------------------------------------------------------------- messages
+
+[[route]]
+match   = "POST * /api/v1/messages"
+capture = { type = "body:type", to = "body:to" }
+emit    = ['operation("send_message")', 'message_type($type)', 'recipient($to)']
+
+[[route]]
+match = "PATCH * /api/v1/messages/{id:int}"
+emit  = ['operation("edit_message")', 'message($id)']
+
+[[route]]
+match = "DELETE * /api/v1/messages/{id:int}"
+emit  = ['operation("delete_message")', 'message($id)']
+
+[[route]]
+match = "POST|DELETE * /api/v1/messages/{id:int}/reactions"
+emit  = ['operation("react")', 'message($id)']
+
+[[route]]
+match = "POST * /api/v1/messages/flags"
+emit  = ['operation("update_flags")']
+
+[[route]]
+match = "POST * /api/v1/messages/flags/narrow"
+emit  = ['operation("update_flags")']
+
+[[route]]
+match = "POST * /api/v1/mark_all_as_read"
+emit  = ['operation("update_flags")']
+
+[[route]]
+match = "POST * /api/v1/mark_stream_as_read"
+emit  = ['operation("update_flags")']
+
+[[route]]
+match = "POST * /api/v1/mark_topic_as_read"
+emit  = ['operation("update_flags")']
+
+[[route]]
+match = "POST * /api/v1/typing"
+emit  = ['operation("typing")']
+
+[[route]]
+match = "POST * /api/v1/user_uploads"
+emit  = ['operation("upload")']
+
+# ---------------------------------------------------------------- subscriptions
+
+# Subscribing to a stream that does not exist creates it, so this is its own operation and a
+# grant has to name it.
+[[route]]
+match = "POST|PATCH|DELETE * /api/v1/users/me/subscriptions"
+emit  = ['operation("subscriptions")']

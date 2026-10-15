@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""kleis-mail: read, file and send mail through kleis.
+
+The mailbox is whichever one your kleis token's spec gives you; this program holds no
+password. It talks to the kleis-mail gateway (http://kleis-mail:8025 by default, or
+$KLEIS_MAIL_URL) through the proxy in $HTTP_PROXY, which is where kleis adds the account.
+
+    kleis-mail mailboxes
+    kleis-mail list [MAILBOX] [--unseen] [--from X] [--to X] [--subject X] [--text X]
+                    [--since YYYY-MM-DD] [--limit N] [--before-uid N]
+    kleis-mail show MAILBOX UID              headers, text, and the list of attachments
+    kleis-mail raw MAILBOX UID               the message as received (RFC 822)
+    kleis-mail attachment MAILBOX UID N [-o FILE]
+    kleis-mail flag MAILBOX UID [--add FLAG]... [--remove FLAG]...
+    kleis-mail move MAILBOX UID TARGET
+    kleis-mail send --to ADDR [--to ADDR]... [--cc ADDR]... [--bcc ADDR]...
+                    --subject TEXT (--text TEXT | --text-file FILE|-)
+                    [--in-reply-to MESSAGE-ID] [--references MESSAGE-ID]...
+    kleis-mail reply MAILBOX UID (--text TEXT | --text-file FILE|-) [--all]
+
+Flags are IMAP flags: \\Seen, \\Answered, \\Flagged, \\Draft, or a keyword such as $Label1.
+Every command takes --json to print the gateway's answer as it is.
+
+What your token allows is on its card; anything else is refused with HTTP 403, and the
+message says which rule refused it.
+"""
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+URL = os.environ.get("KLEIS_MAIL_URL", "http://kleis-mail:8025").rstrip("/")
+
+
+def call(method, path, body=None, raw=False):
+    data = None if body is None else json.dumps(body).encode()
+    req = urllib.request.Request(URL + path, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            payload = resp.read()
+            return payload if raw else json.loads(payload)
+    except urllib.error.HTTPError as e:
+        text = e.read().decode(errors="replace").strip()
+        try:
+            text = json.loads(text).get("error", text)
+        except (ValueError, AttributeError):
+            pass
+        sys.exit(f"kleis-mail: {e.code}: {text}")
+    except urllib.error.URLError as e:
+        sys.exit(f"kleis-mail: cannot reach {URL}: {e.reason}")
+
+
+def box(name):
+    return urllib.parse.quote(name, safe="")
+
+
+def who(addrs):
+    return ", ".join(a["address"] if not a.get("name") else f'{a["name"]} <{a["address"]}>'
+                     for a in addrs or [])
+
+
+def text_arg(args):
+    if args.text is not None:
+        return args.text
+    if args.text_file == "-":
+        return sys.stdin.read()
+    if args.text_file:
+        with open(args.text_file) as f:
+            return f.read()
+    sys.exit("kleis-mail: give the message with --text or --text-file")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="kleis-mail", description=__doc__.split("\n\n")[0],
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog=__doc__.split("\n\n", 1)[1])
+    p.add_argument("--json", action="store_true", help="print the gateway's JSON")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("mailboxes", help="list mailboxes")
+
+    ls = sub.add_parser("list", help="list messages, newest first")
+    ls.add_argument("mailbox", nargs="?", default="INBOX")
+    ls.add_argument("--unseen", action="store_true")
+    for k in ("from", "to", "subject", "text", "since"):
+        ls.add_argument(f"--{k}")
+    ls.add_argument("--limit", type=int)
+    ls.add_argument("--before-uid", type=int)
+
+    for name in ("show", "raw"):
+        s = sub.add_parser(name)
+        s.add_argument("mailbox")
+        s.add_argument("uid", type=int)
+
+    at = sub.add_parser("attachment")
+    at.add_argument("mailbox")
+    at.add_argument("uid", type=int)
+    at.add_argument("index", type=int)
+    at.add_argument("-o", "--output")
+
+    fl = sub.add_parser("flag")
+    fl.add_argument("mailbox")
+    fl.add_argument("uid", type=int)
+    fl.add_argument("--add", action="append", default=[])
+    fl.add_argument("--remove", action="append", default=[])
+
+    mv = sub.add_parser("move")
+    mv.add_argument("mailbox")
+    mv.add_argument("uid", type=int)
+    mv.add_argument("target")
+
+    sd = sub.add_parser("send")
+    sd.add_argument("--to", action="append", default=[])
+    sd.add_argument("--cc", action="append", default=[])
+    sd.add_argument("--bcc", action="append", default=[])
+    sd.add_argument("--subject", required=True)
+    sd.add_argument("--text")
+    sd.add_argument("--text-file")
+    sd.add_argument("--in-reply-to")
+    sd.add_argument("--references", action="append", default=[])
+
+    rp = sub.add_parser("reply")
+    rp.add_argument("mailbox")
+    rp.add_argument("uid", type=int)
+    rp.add_argument("--text")
+    rp.add_argument("--text-file")
+    rp.add_argument("--all", action="store_true", help="reply to everyone, not just the sender")
+
+    a = p.parse_args()
+    out = None
+
+    if a.cmd == "mailboxes":
+        out = call("GET", "/mailboxes")
+        if not a.json:
+            for b in out["mailboxes"]:
+                flags = " ".join(f for f in b["flags"] if f not in ("\\HasNoChildren", "\\HasChildren"))
+                print(b["name"] + (f"  {flags}" if flags else ""))
+            return
+
+    elif a.cmd == "list":
+        q = {k: v for k, v in (("unseen", "1" if a.unseen else None), ("from", getattr(a, "from")),
+                                ("to", a.to), ("subject", a.subject), ("text", a.text),
+                                ("since", a.since), ("limit", a.limit), ("before_uid", a.before_uid))
+             if v is not None}
+        out = call("GET", f"/mailboxes/{box(a.mailbox)}/messages?" + urllib.parse.urlencode(q))
+        if not a.json:
+            for m in out["messages"]:
+                seen = " " if "\\Seen" in m["flags"] else "*"
+                print(f'{m["uid"]:>7} {seen} {m["date"] or "":<32} {who(m["from"])[:40]:<40}  {m["subject"] or ""}')
+            return
+
+    elif a.cmd == "show":
+        out = call("GET", f"/mailboxes/{box(a.mailbox)}/messages/{a.uid}")
+        if not a.json:
+            for k, v in (("From", who(out["from"])), ("To", who(out["to"])), ("Cc", who(out["cc"])),
+                         ("Reply-To", who(out["reply_to"])), ("Date", out["date"]),
+                         ("Subject", out["subject"]), ("Message-ID", out["message_id"])):
+                if v:
+                    print(f"{k}: {v}")
+            print()
+            print(out["text"] or ("(no text part; HTML only — use --json)" if out["html"] else ""))
+            for att in out["attachments"]:
+                print(f'[attachment {att["index"]}] {att["filename"] or "(unnamed)"} '
+                      f'{att["content_type"]} {att["size"]} bytes')
+            return
+
+    elif a.cmd == "raw":
+        sys.stdout.buffer.write(call("GET", f"/mailboxes/{box(a.mailbox)}/messages/{a.uid}/raw", raw=True))
+        return
+
+    elif a.cmd == "attachment":
+        data = call("GET", f"/mailboxes/{box(a.mailbox)}/messages/{a.uid}/attachments/{a.index}", raw=True)
+        if a.output:
+            with open(a.output, "wb") as f:
+                f.write(data)
+        else:
+            sys.stdout.buffer.write(data)
+        return
+
+    elif a.cmd == "flag":
+        out = call("POST", f"/mailboxes/{box(a.mailbox)}/messages/{a.uid}/flags",
+                   {"add": a.add, "remove": a.remove})
+
+    elif a.cmd == "move":
+        out = call("POST", f"/mailboxes/{box(a.mailbox)}/messages/{a.uid}/move", {"to": a.target})
+
+    elif a.cmd in ("send", "reply"):
+        if a.cmd == "send":
+            body = {"to": a.to, "cc": a.cc, "bcc": a.bcc, "subject": a.subject, "text": text_arg(a)}
+            if a.in_reply_to:
+                body["in_reply_to"] = a.in_reply_to
+            if a.references:
+                body["references"] = a.references
+        else:
+            orig = call("GET", f"/mailboxes/{box(a.mailbox)}/messages/{a.uid}")
+            to = [x["address"].lower() for x in (orig["reply_to"] or orig["from"])]
+            cc = [x["address"].lower() for x in orig["to"] + orig["cc"]] if a.all else []
+            subject = orig["subject"] or ""
+            if not subject.lower().startswith("re:"):
+                subject = "Re: " + subject
+            body = {"to": to, "cc": [c for c in cc if c not in to], "subject": subject,
+                    "text": text_arg(a)}
+            if orig["message_id"]:
+                body["in_reply_to"] = orig["message_id"]
+                body["references"] = orig["references"] + [orig["message_id"]]
+        for k in ("to", "cc", "bcc"):
+            body[k] = [x.strip().lower() for x in body.get(k, [])]
+        out = call("POST", "/send", body)
+
+    print(json.dumps(out, indent=1, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()
