@@ -105,7 +105,8 @@ private def compileErr (src : String) : IO (Option String) := do
 
 def specTests : IO Unit := do
   group "the shipped extensions load and agree with their manifests"
-  for (n, h) in [("github", []), ("zulip", ["z.example"]), ("caldav", ["d.example"]), ("mail", [])] do
+  for (n, h) in [("github", []), ("zulip", ["z.example"]), ("caldav", ["d.example"]), ("mail", []),
+                 ("taxis", ["t.example"])] do
     let ok ← try let _ ← shipped n h; pure true catch _ => pure false
     check s!"{n}" ok
 
