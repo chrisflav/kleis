@@ -220,6 +220,19 @@ def specTests : IO Unit := do
     (match Narrow.compile reg ["mail: only teleport"] with | .error _ => true | .ok _ => false)
   check "as is one for a service nobody has"
     (match Narrow.compile reg ["fax: only read"] with | .error _ => true | .ok _ => false)
+  let confined ← match Narrow.compile reg ["services: mail"] with
+    | .ok cs => pure cs
+    | .error e => throw (IO.userError e)
+  let tokS ← match specToken ["secretary"] [] confined with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  checkEq "confined to mail, it still reads mail"
+    (spentOn (choose reg tokS "GET" "kleis-mail" "/mailboxes")) (some "mail/christian")
+  checkEq "but no longer reaches the calendar its spec has"
+    (spentOn (choose reg tokS "PROPFIND" "dav.example.org" "/")) none
+  check "and still holds where there is no request" (holdsWithoutRequest tokS)
+  check "confining to a service nobody has is refused"
+    (match Narrow.compile reg ["services: mail, fax"] with | .error _ => true | .ok _ => false)
 
   group "cards"
   let card := Card.render reg tok [{ revocationIds := [], grants := [], bearer := "test"
