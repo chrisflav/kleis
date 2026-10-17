@@ -2,7 +2,7 @@
 
 service = "caldav"
 display = "Calendar"
-client  = "curl with PROPFIND/REPORT/PUT/DELETE against the server, or vdirsyncer with ~/.config/vdirsyncer/<server>.conf"
+client  = "vdirsyncer and khal: `yes | vdirsyncer discover` once, `vdirsyncer sync` before reading and after every change (the server wins a conflict), then `khal list`, `khal new`, `khal edit`, `khal search`; with several servers, `vdirsyncer -c ~/.config/vdirsyncer/<server>.conf`"
 hosts   = "dynamic"
 
 [groups]
@@ -20,8 +20,10 @@ type   = "string"
 values = "single"
 phrase = "the path"
 
-# A vdirsyncer configuration per server, syncing every calendar into ~/calendars/<server>/.
-# The credentials are placeholders: kleis removes them and attaches the account's.
+# vdirsyncer keeps a local copy of every calendar under ~/calendars/<server>/ and pushes changes
+# back; khal reads and edits that copy. One vdirsyncer configuration per server, and the first one
+# also as vdirsyncer's default, so `vdirsyncer sync` alone works with one server. The credentials
+# are placeholders: kleis removes them and attaches the account's.
 [[setup.files]]
 path        = ".config/vdirsyncer/{host}.conf"
 per_account = true
@@ -33,7 +35,9 @@ status_path = "~/.local/share/vdirsyncer/{host}/"
 a = "remote"
 b = "local"
 collections = ["from a"]
-metadata = ["displayname"]
+metadata = ["displayname", "color"]
+# The server's copy wins: a person editing the same event at the same time is not overwritten.
+conflict_resolution = "a wins"
 
 [storage remote]
 type = "caldav"
@@ -45,4 +49,53 @@ password = "kleis"
 type = "filesystem"
 path = "~/calendars/{host}/"
 fileext = ".ics"
+"""
+
+[[setup.files]]
+path    = ".config/vdirsyncer/config"
+content = """
+[general]
+status_path = "~/.local/share/vdirsyncer/{host}/"
+
+[pair calendars]
+a = "remote"
+b = "local"
+collections = ["from a"]
+metadata = ["displayname", "color"]
+# The server's copy wins: a person editing the same event at the same time is not overwritten.
+conflict_resolution = "a wins"
+
+[storage remote]
+type = "caldav"
+url = "https://{host}/"
+username = "kleis"
+password = "kleis"
+
+[storage local]
+type = "filesystem"
+path = "~/calendars/{host}/"
+fileext = ".ics"
+"""
+
+# khal over every calendar vdirsyncer synced, from every server.
+[[setup.files]]
+path    = ".config/khal/config"
+content = """
+[calendars]
+[[synced]]
+path = ~/calendars/*/*
+type = discover
+
+[locale]
+local_timezone = Europe/Berlin
+default_timezone = Europe/Berlin
+timeformat = %H:%M
+dateformat = %Y-%m-%d
+longdateformat = %Y-%m-%d
+datetimeformat = %Y-%m-%d %H:%M
+longdatetimeformat = %Y-%m-%d %H:%M
+firstweekday = 0
+
+[default]
+highlight_event_days = False
 """
