@@ -130,6 +130,7 @@ extensions, with the accounts they name made up. -/
 private def reviewRegistry : IO Service.Registry := do
   let credentials : Array Credential.Record := #[
     account "diff-reviewer/agent" "diff-reviewer" ["reviews.example"],
+    account "diff-reviewer/proposer" "diff-reviewer" ["reviews.example"],
     account "github/orchestra-app" "github", account "github/orchestra-pat" "github",
     account "github/chrisflav" "github"]
   let exts ← [("github", []), ("diff-reviewer", ["reviews.example"])].mapM fun (n, h) => shipped n h
@@ -419,6 +420,7 @@ def specTests : IO Unit := do
     "{\"decision\": \"comment\", \"body\": \"b\", \"comments\": []}}"
   let own := "/api/agent/v1/repos/up/proj/pulls/7"
   let agentToken := some "diff-reviewer/agent"
+  let proposerToken := some "diff-reviewer/proposer"
   checkEq "reads its own pull request's job, on the agent token" (dr "GET" own) agentToken
   checkEq "and its diff" (dr "GET" s!"{own}/diff") agentToken
   checkEq "submits its review" (dr "POST" s!"{own}/review" review) agentToken
@@ -437,6 +439,10 @@ def specTests : IO Unit := do
     (refusedFor (choose rr rt "POST" "reviews.example" s!"{own}/review" (agentReview 206)
       (some "application/json")) "body_truncated")
   let proposal := "{\"rubric\": \"r\", \"notes\": null}"
+  checkEq "its spec names the agent account, and not the proposer's"
+    ((rr.specs.find? (·.name == "reviewer")).map fun s =>
+      s.accounts.map (·.account.credential) |>.filter (·.startsWith "diff-reviewer/"))
+    (some ["diff-reviewer/agent"])
   checkEq "reads no proposal job, not even its own repository's"
     (dr "GET" "/api/agent/v1/repos/up/proj/proposals/0123456789abcdef") none
   checkEq "and submits no proposal"
@@ -528,8 +534,12 @@ def specTests : IO Unit := do
     spentOn (choose rr t method "reviews.example" path body
       (if body.isEmpty then none else some "application/json"))
   let ownJob := "/api/agent/v1/repos/up/proj/proposals/0123456789abcdef"
-  checkEq "reads its repository's proposal job, on the agent token" (pr "GET" ownJob) agentToken
-  checkEq "submits its proposal" (pr "POST" ownJob proposal) agentToken
+  checkEq "reads its repository's proposal job, on the proposer token" (pr "GET" ownJob) proposerToken
+  checkEq "submits its proposal, on the proposer token" (pr "POST" ownJob proposal) proposerToken
+  checkEq "its spec names the proposer account, and not the agent's"
+    ((rr.specs.find? (·.name == "rubric-proposer")).map fun s =>
+      s.accounts.map (·.account.credential) |>.filter (·.startsWith "diff-reviewer/"))
+    (some ["diff-reviewer/proposer"])
   checkEq "not another repository's" (pr "GET" "/api/agent/v1/repos/other/proj/proposals/0123456789abcdef") none
   checkEq "nor its fork's" (pr "POST" "/api/agent/v1/repos/bot/proj/proposals/0123456789abcdef" proposal) none
   checkEq "nor another of its owner's" (pr "GET" "/api/agent/v1/repos/up/other/proposals/0123456789abcdef") none
@@ -543,6 +553,42 @@ def specTests : IO Unit := do
     | .ok t => pure t
     | .error e => throw (IO.userError e)
   checkEq "a token without the task's repository reaches no proposal" (pr "GET" ownJob (t := pfactless)) none
+  match Card.setup rr prt with
+  | .error e => check "setup" false e
+  | .ok (_, files) =>
+    checkEq "setup writes the agent's config for the proposer's host, with the placeholder token"
+      ((files.find? (·.path == ".config/diff-reviewer/agent.json")).map (·.content))
+      (some "{\"url\": \"https://reviews.example\", \"token\": \"kleis\"}\n")
+  -- The platform takes the agent token on its pull request routes only and the proposer token
+  -- on its proposal routes only. Every agent route, for either token, with the task's own
+  -- repository and pull request: each token spends its own account or none, never the other's.
+  let routes : List (String × String × String) := [
+    ("GET", own, ""), ("GET", s!"{own}/diff", ""), ("POST", s!"{own}/review", review),
+    ("GET", ownJob, ""), ("POST", ownJob, proposal)]
+  for (m, path, body) in routes do
+    check s!"a reviewer token never spends the proposer account: {m} {path}"
+      (dr m path body != proposerToken)
+    check s!"a rubric-proposer token never spends the agent account: {m} {path}"
+      (pr m path body != agentToken)
+  -- A token naming both specs, which orchestra never derives: the route still decides the
+  -- credential, the agent token on the pull request routes, the proposer token on the proposal
+  -- routes.
+  let bothSpecs : Except String Biscuit := do
+    let facts ← task.mapM Token.factOfSource
+    let (t, _) ← Token.issue (fixedKey 7)
+      { grants := [], specs := ["reviewer", "rubric-proposer"], bearer := "orchestra:t-1"
+        lifetime := 3600, issuedBy := some "orchestra", extraFacts := facts }
+      1700000000 (fixedKey 9)
+    pure t
+  let both ← match bothSpecs with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  for (m, path, body, expected) in [
+      ("GET", own, "", agentToken), ("GET", s!"{own}/diff", "", agentToken),
+      ("POST", s!"{own}/review", review, agentToken),
+      ("GET", ownJob, "", proposerToken), ("POST", ownJob, proposal, proposerToken)] do
+    checkEq s!"with both specs, {m} {path} goes out on its own account" (dr m path body (t := both))
+      expected
   checkEq "reads its repository on GitHub" (gh "GET" "api.github.com" "/repos/up/proj" (t := prt)) pat
   checkEq "and pushes nowhere" (push "bot/proj" (t := prt)) none
   for (m, path, body) in writes do
