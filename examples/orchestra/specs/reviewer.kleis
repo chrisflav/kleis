@@ -13,6 +13,9 @@
 #     hosts = ["reviews.example"]
 #     secret_file = "/run/secrets/diff-reviewer-agent-token"
 #
+# The platform takes it on its pull request routes only. A rubric proposal job spends the
+# platform's proposer token instead, `diff-reviewer/proposer` (see `rubric-proposer`).
+#
 # Which pull request is the task's: the platform queues each job with `upstream` and
 # `issue_number`, and orchestra states them as `task_upstream(owner, name)` and `task_issue(n)` in
 # the token's authority block. A spec's `where` compares a field with a value written here, not

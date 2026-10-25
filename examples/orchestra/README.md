@@ -97,11 +97,11 @@ a COMMENT review only, and an approving or change-requesting review only when
 a person clicks Post.  That is enforced by the platform, not by kleis, which
 cannot tell those requests apart and allows every review event.  It also has
 an agent propose a rubric for a repository, which a person then accepts or
-rejects on the platform.  Three specs, and the agent token and the PAT are not
-interchangeable:
+rejects on the platform.  Three specs, and the agent token, the proposer token
+and the PAT are not interchangeable:
 
 - `specs/reviewer.kleis`, the job's.  On the platform (the `diff-reviewer`
-  extension's account): read the job and the diff, and submit a review, only
+  extension's account `diff-reviewer/agent`, the platform's agent token): read the job and the diff, and submit a review, only
   for the pull request the job is for — `repository` equal to its
   `task_upstream`, `pull` equal to its `task_issue`.  Nothing else on the
   platform is reachable: no `/api/v1/`, no login.  On GitHub, the grant
@@ -110,13 +110,17 @@ interchangeable:
   comment or label.  Its GraphQL queries go out on the App's token, as a
   worker's do, so a review job can read whatever the installation can see.  A
   review job reaches no rubric proposal: those routes name no pull request.
-- `specs/rubric-proposer.kleis`, a proposal job's.  On the platform: read the
+- `specs/rubric-proposer.kleis`, a proposal job's.  On the platform (the
+  account `diff-reviewer/proposer`, the platform's proposer token): read the
   repository's proposal job and submit a proposed rubric
   (`/api/agent/v1/repos/{owner}/{name}/proposals/{job}`), only for its
   repository — `repository` equal to its `task_upstream`; the platform binds
   the request to the repository's live proposal job.  No review route: no
   `/pulls/{pr}` job, diff or review.  On GitHub, the same read-only grant as a
-  review job's.
+  review job's.  The two jobs' accounts are separate for defence in depth: the
+  platform takes the proposer token on its proposal routes only and the agent
+  token on its pull request routes only, so even a spec that let a job reach
+  the other's routes would send a token the platform refuses there.
 - `specs/diff-reviewer-poster.kleis`, the platform's own.  On
   `github/chrisflav`: read the repositories in its list through the REST API,
   review their pull requests and comment on their diffs.  Reading is every GET
@@ -144,6 +148,11 @@ the configuration it had, so copying the specs first only logs a failed reload.
 # platform's host; the account the reviewer spec names.
 kleis credential add diff-reviewer/agent --service diff-reviewer \
   --hosts reviews.example --secret @agent.token
+# The platform's proposer token, which its proposal routes take and its pull
+# request routes refuse, bound to the same host; the account the
+# rubric-proposer spec names.
+kleis credential add diff-reviewer/proposer --service diff-reviewer \
+  --hosts reviews.example --secret @proposer.token
 # Christian's token, which approved reviews are posted with.
 printf '%s' "$PAT" | kleis credential add github/chrisflav --service github --secret -
 

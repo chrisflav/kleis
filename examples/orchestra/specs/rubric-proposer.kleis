@@ -3,7 +3,15 @@
 # request on the platform, and posts nothing to GitHub. An operator accepts or rejects what it
 # proposes on the platform.
 #
-# The account is the platform's agent token, the same one the `reviewer` spec names (see there).
+# The account is the platform's proposer token, bound to the platform's host. It is not the agent
+# token the `reviewer` spec names: the platform takes the proposer token on its proposal routes
+# only, and the agent token on its pull request routes only, so neither job can spend the other's.
+#
+#   config/credentials/diff-reviewer-proposer.toml
+#     name = "diff-reviewer/proposer"
+#     service = "diff-reviewer"
+#     hosts = ["reviews.example"]
+#     secret_file = "/run/secrets/diff-reviewer-proposer-token"
 #
 # Which repository is the task's: the platform queues a proposal job through its second orchestra
 # client (`diff-reviewer-proposer.json`) with an `upstream` and no `issue_number`, and orchestra
@@ -14,7 +22,7 @@ spec rubric-proposer
   description "Proposes a review rubric for one repository, for the diff-reviewer platform."
   max_ttl 24h
 
-  account diff-reviewer/agent
+  account diff-reviewer/proposer
     allow propose
     datalog '''
       check if repository($o, $n), task_upstream($o, $n);

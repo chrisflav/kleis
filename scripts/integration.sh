@@ -823,8 +823,9 @@ read -r SUB_PASS SUB_FAIL < "$DECL/counts" 2>/dev/null || { SUB_PASS=0; SUB_FAIL
 PASS=$SUB_PASS; FAIL=$SUB_FAIL
 echo
 echo "== an extension's service: the diff-reviewer platform, through its specs"
-# The shipped extension, the orchestra example's specs and grant as they are, and an account
-# bound to the TLS origin, which answers the agent API by echoing the request.  The platform's
+# The shipped extension, the orchestra example's specs and grant as they are, and two accounts,
+# the agent token and the proposer token, bound to the TLS origin, which answers the agent API by
+# echoing the request.  The platform's
 # own spec is for GitHub, which the origin stands in for at 127.0.0.1: the GitHub extension,
 # overridden in the configuration with api.github.com rewritten to that address.
 DR="$WORK/diff-reviewer"
@@ -832,6 +833,7 @@ DR_PORT="$(free_port)"
 mkdir -p "$DR/home/config/specs" "$DR/home/config/grants" "$DR/home/config/credentials" "$DR/secrets" "$DR/issuers"
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DR/secrets/root_key"
 printf 'agent-secret-55' > "$DR/secrets/agent"
+printf 'proposer-secret-77' > "$DR/secrets/proposer"
 printf 'unused' > "$DR/secrets/github"
 cp "$ROOT/examples/orchestra/specs/reviewer.kleis" "$ROOT/examples/orchestra/specs/diff-reviewer-poster.kleis" \
   "$ROOT/examples/orchestra/specs/rubric-proposer.kleis" \
@@ -847,6 +849,12 @@ name        = "diff-reviewer/agent"
 service     = "diff-reviewer"
 hosts       = ["localhost"]
 secret_file = "$DR/secrets/agent"
+EOF2
+cat > "$DR/home/config/credentials/proposer.toml" <<EOF2
+name        = "diff-reviewer/proposer"
+service     = "diff-reviewer"
+hosts       = ["localhost"]
+secret_file = "$DR/secrets/proposer"
 EOF2
 cat > "$DR/home/config/credentials/chrisflav.toml" <<EOF2
 name        = "github/chrisflav"
@@ -906,15 +914,16 @@ assert json.loads(files[".config/diff-reviewer/agent.json"]) == {"url": "https:/
   API="https://localhost:$TLS_PORT/api/agent/v1/repos"
   CODE="$(agent "$API/acme/widgets/pulls/7")"
   [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer agent-secret-55"' "$DR/out" \
-    && ! grep -q 'Bearer kleis' "$DR/out"
+    && ! grep -q 'Bearer kleis' "$DR/out" && ! grep -q 'proposer-secret-77' "$DR/out"
   check $? "the job of its own pull request is read on the agent token, the placeholder gone" "got $CODE: $(cat "$DR/out")"
   CODE="$(agent "$API/acme/widgets/pulls/7/diff")"
   [ "$CODE" = "200" ]; check $? "and its diff" "got $CODE: $(cat "$DR/out")"
   CODE="$(agent -H 'content-type: application/json' \
     -d '{"headSha":"abc","prType":null,"review":{"decision":"comment","body":"b","comments":[]}}' \
     "$API/acme/widgets/pulls/7/review")"
-  [ "$CODE" = "200" ] && grep -q '"method": "POST"' "$DR/out"
-  check $? "its review is submitted" "got $CODE: $(cat "$DR/out")"
+  [ "$CODE" = "200" ] && grep -q '"method": "POST"' "$DR/out" \
+    && grep -q '"authorization": "Bearer agent-secret-55"' "$DR/out" && ! grep -q 'proposer-secret-77' "$DR/out"
+  check $? "its review is submitted, on the agent token" "got $CODE: $(cat "$DR/out")"
   # The platform's largest, 200 comments, some 1.6 MB: past the default limits, inside the
   # example's.
   python3 -c '
@@ -934,6 +943,10 @@ print(json.dumps({"headSha": "abc", "prType": None,
   [ "$CODE" = "403" ]; check $? "and the rest of the platform's API" "got $CODE"
   CODE="$(agent "$API/acme/widgets/proposals/0123456789abcdef")"
   [ "$CODE" = "403" ]; check $? "and a reviewer reaches no rubric proposal" "got $CODE"
+  CODE="$(agent -H 'content-type: application/json' -d '{"rubric":"r"}' \
+    "$API/acme/widgets/proposals/0123456789abcdef")"
+  [ "$CODE" = "403" ] && ! grep -qE 'agent-secret-55|proposer-secret-77' "$DR/out"
+  check $? "nor submits one, and no token goes out" "got $CODE: $(cat "$DR/out")"
   # A rubric proposal job: a repository, no pull request, and a spec of its own.
   OUT="$(curl -s -H "Authorization: Bearer $(cat "$DR/issuers/orchestra.token")" \
     -H 'content-type: application/json' \
@@ -948,12 +961,23 @@ print(json.dumps({"headSha": "abc", "prType": None,
   }
   CODE="$(proposer -H 'content-type: application/json' -d '{"rubric":"r"}' \
     "$API/acme/widgets/proposals/0123456789abcdef")"
-  [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer agent-secret-55"' "$DR/out"
-  check $? "it submits its repository's proposal on the agent token" "got $CODE: $(cat "$DR/out")"
+  [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer proposer-secret-77"' "$DR/out" \
+    && ! grep -q 'agent-secret-55' "$DR/out" && ! grep -q 'Bearer kleis' "$DR/out"
+  check $? "it submits its repository's proposal on the proposer token, never the agent's" "got $CODE: $(cat "$DR/out")"
+  CODE="$(proposer "$API/acme/widgets/proposals/0123456789abcdef")"
+  [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer proposer-secret-77"' "$DR/out" \
+    && ! grep -q 'agent-secret-55' "$DR/out"
+  check $? "and reads its proposal job on the proposer token" "got $CODE: $(cat "$DR/out")"
   CODE="$(proposer "$API/acme/other/proposals/0123456789abcdef")"
   [ "$CODE" = "403" ]; check $? "but not another repository's" "got $CODE"
   CODE="$(proposer "$API/acme/widgets/pulls/7")"
-  [ "$CODE" = "403" ]; check $? "and reaches no review job" "got $CODE"
+  [ "$CODE" = "403" ] && ! grep -qE 'agent-secret-55|proposer-secret-77' "$DR/out"
+  check $? "and reaches no review job" "got $CODE"
+  CODE="$(proposer -H 'content-type: application/json' \
+    -d '{"headSha":"abc","prType":null,"review":{"decision":"comment","body":"b","comments":[]}}' \
+    "$API/acme/widgets/pulls/7/review")"
+  [ "$CODE" = "403" ] && ! grep -qE 'agent-secret-55|proposer-secret-77' "$DR/out"
+  check $? "nor submits a review, and no token goes out" "got $CODE: $(cat "$DR/out")"
   POSTER="$("$KLEIS" token issue --spec diff-reviewer-poster --bearer diff-reviewer --ttl 1h)"
   github() {
     curl -s --proxy "http://kleis:$POSTER@127.0.0.1:$DR_PORT" --proxy-basic --cacert "$("$KLEIS" ca)" \
