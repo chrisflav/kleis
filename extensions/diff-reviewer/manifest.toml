@@ -10,7 +10,7 @@
 # What it covers: the three agent endpoints, each about one pull request of one repository —
 # the job, its diff, and the review submitted for it. Nothing else on the server is matched: not
 # the scripts' API (`/api/v1/`), not the login, not the front end. A request no route matches
-# gets no `operation` fact and is refused.
+# gets `operation("unrouted")` and is refused.
 #
 # Note on TOML: a key written after a `[[route]]` header belongs to *that* table.
 

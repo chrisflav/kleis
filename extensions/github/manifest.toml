@@ -7,7 +7,7 @@
 # API that `gh api` and `curl` reach — reads, pull requests, reviews, comments,
 # labels, repository creation — and the GraphQL endpoint, whose requests are
 # read for whether they are queries or mutations.  A request no route matches
-# gets no `operation` fact, and a grant that requires one refuses it.
+# gets `operation("unrouted")`, and kleis refuses it whatever the grant.
 #
 # Note on TOML: a key written after a `[[route]]` header belongs to *that*
 # table.  Document-level settings therefore go at the top, before any header.

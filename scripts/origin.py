@@ -23,6 +23,29 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _body(self):
+        """The request body.  Chunked framing is read the lenient way some servers do --
+        any whitespace-only line ends the trailers -- and kept as it arrived, so the
+        test can see the framing kleis sent and that nothing was hidden in it."""
+        self.raw_body = None
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            raw, body = b"", b""
+            while True:
+                line = self.rfile.readline()
+                raw += line
+                size = int(line.split(b";")[0].strip() or b"0", 16)
+                if size == 0:
+                    while True:
+                        t = self.rfile.readline()
+                        raw += t
+                        if not t.strip():
+                            break
+                    break
+                data = self.rfile.read(size)
+                raw += data
+                body += data
+                raw += self.rfile.readline()
+            self.raw_body = raw
+            return body
         n = int(self.headers.get("Content-Length") or 0)
         return self.rfile.read(n) if n else b""
 
@@ -32,6 +55,7 @@ class Handler(BaseHTTPRequestHandler):
             "path": self.path,
             "headers": {k.lower(): v for k, v in self.headers.items()},
             "body": body.decode("utf-8", "replace"),
+            "raw": None if self.raw_body is None else self.raw_body.decode("latin1"),
         }).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -108,6 +132,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("/")[1:2] in (["orgs"], ["users"], ["app"], ["lookups"]):
             if self._github_app() is None:
                 self._json(404, {"message": "Not Found"})
+        elif self.path.startswith("/echo?respond=connection-names-length"):
+            # An origin whose Connection field names its own Content-Length: a proxy that
+            # honoured it would relay the body with no length, for the client to read as
+            # the next response.
+            payload = b"hi"
+            self.send_response(200)
+            self.send_header("Connection", "content-length")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
         elif self.path.split("?")[0].split("/")[1:2] in (["echo"], ["api"], ["repos"]):
             # `/api/` stands in for the diff-reviewer platform, `/repos/` for GitHub's API.
             self._echo(body)

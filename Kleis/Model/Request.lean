@@ -122,7 +122,10 @@ def Request.ofWire (w : Http.Request) (scheme : String) (tunnel : Option (String
     path := Str.percentDecode (Str.pathOnly target)
     segments
     query := Str.parseQuery target
-    headers := w.headers
+    -- Without what the client's `Connection` named: those were for this hop, and
+    -- stripping them here, before a credential or kleis's own framing is added,
+    -- means nothing added later can be named away.
+    headers := Http.stripConnectionNamed w.headers
     bodyPrefix
     bodyComplete
     bodySize := match w.framing with | .length n => some n | _ => none

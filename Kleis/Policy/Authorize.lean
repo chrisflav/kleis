@@ -172,7 +172,7 @@ def assemble (i : Input) : AuthorizerBuilder :=
       ++ i.manifest.contribute i.request bodyValue
       ++ i.remembered
       ++ i.grant.facts
-  -- Two guards the authorizer imposes rather than leaving to the grant.  Both
+  -- Guards the authorizer imposes rather than leaving to the grant.  They
   -- are checks rather than policies, because a check is order-independent: it
   -- must pass whichever `allow` matched.
   let guard (predicate : String) : Builder.Check :=
@@ -188,9 +188,17 @@ def assemble (i : Input) : AuthorizerBuilder :=
   -- `reject if` is exactly what a grant should be using, because `check all`
   -- refuses requests that legitimately carry no such facts at all.
   let decodabilityGuard := guard "body_undecodable"
+  -- A request no route of the service's manifest matches is one nobody has said what
+  -- it means, and is refused whatever the grant: a grant could otherwise allow it
+  -- without meaning to, by testing only facts every request has.
+  let unroutedGuard : Builder.Check :=
+    { queries := [{ head := ⟨"query", []⟩,
+                    body := [Service.unroutedFact.predicate],
+                    expressions := [], scopes := [] }],
+      kind := .reject }
   { facts
     rules := i.manifest.rules ++ i.grant.rules
-    checks := truncationGuard :: decodabilityGuard :: i.grant.checks
+    checks := truncationGuard :: decodabilityGuard :: unroutedGuard :: i.grant.checks
     scopes := []
     policies := i.grant.policies ++
       [{ queries := [{ head := ⟨"query", []⟩, body := [], expressions := [],

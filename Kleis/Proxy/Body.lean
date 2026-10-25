@@ -37,6 +37,10 @@ structure BodyPrefix where
   /-- Bytes that arrived after the body ended: the start of a request the client
   pipelined behind this one.  Never part of `raw`, and so never relayed with it. -/
   excess : Bytes := ByteArray.empty
+  /-- For a chunked request body, the reader where the prefix left it: `raw` is then
+  the body framed again by kleis, and the relay goes on framing the rest the same way.
+  `none` for a body relayed as it arrived (a response's). -/
+  chunked : Option Http.Chunked.Reader := none
   deriving Inhabited
 
 /-- Nothing at all. -/
@@ -64,7 +68,8 @@ def splitAtFraming (framing : Http.Framing) (raw : Bytes) : Bytes × Bytes :=
 brought and no more: the bytes are appended once, the chunked framing is read
 once, and nothing is rescanned from the start. -/
 private structure Progress where
-  /-- The body's bytes as they arrived, framing included, never past its end. -/
+  /-- The body's bytes as they are to be sent on, never past its end: as they arrived,
+  or for chunked framing, framed again. -/
   raw : Bytes := ByteArray.empty
   /-- What arrived after the end. -/
   excess : Bytes := ByteArray.empty
@@ -86,10 +91,11 @@ private def Progress.feed (p : Progress) (framing : Http.Framing) (chunk : Bytes
   | .chunked =>
     match p.chunked.feed chunk with
     | .error e => throw e
+    -- What goes upstream is the body framed again, not the client's framing.
     | .ok (r, some k) =>
-      return { p with raw := p.raw ++ Bytes.take chunk k, excess := Bytes.drop chunk k
+      return { p with raw := p.raw ++ r.emitted, excess := Bytes.drop chunk k
                       chunked := r, ended := true }
-    | .ok (r, none) => return { p with raw := p.raw ++ chunk, chunked := r }
+    | .ok (r, none) => return { p with raw := p.raw ++ r.emitted, chunked := r }
   | .untilClose => return { p with raw := p.raw ++ chunk }
 
 /-- The entity bytes in hand, and whether they are the whole body. -/
@@ -100,6 +106,10 @@ private def Progress.entity (p : Progress) (framing : Http.Framing) : Bytes × B
   -- Data let go past the limit means the entity is not the body, ended or not.
   | .chunked => (p.chunked.entity, p.ended && !p.chunked.overflow)
   | .untilClose => (p.raw, false)
+
+/-- The chunked reader to hand on to the relay, for a chunked body. -/
+private def chunkedState (framing : Http.Framing) (p : Progress) : Option Http.Chunked.Reader :=
+  if framing == .chunked then some p.chunked else none
 
 /-- The most reads one body prefix may take.  A client writing a large body in pieces
 of under about 128 bytes (2 MiB over 16384 reads) runs out of them, and its body is
@@ -132,7 +142,7 @@ def readBodyPrefix (s : Net.Stream) (framing : Http.Framing) (decoder : Wire.Dec
   for _ in [0:maxPrefixReads] do
     let (entity, complete) := p.entity framing
     let seen : BodyPrefix := { raw := p.raw, entity, complete, framingDone := p.ended
-                               excess := p.excess }
+                               excess := p.excess, chunked := chunkedState framing p }
     let atCap := entity.size ≥ cap || p.raw.size ≥ cap * 2
     if complete || atCap || entity.size ≥ target then
       -- An out-of-process decoder is only worth starting once, so it waits for
@@ -164,7 +174,8 @@ def readBodyPrefix (s : Net.Stream) (framing : Http.Framing) (decoder : Wire.Dec
       | .ok q => pure q
       | .error e => throw (malformed e)
   let (entity, complete) := p.entity framing
-  return ({ raw := p.raw, entity, complete, framingDone := p.ended, excess := p.excess }, none)
+  return ({ raw := p.raw, entity, complete, framingDone := p.ended, excess := p.excess,
+             chunked := chunkedState framing p }, none)
 
 /-- Relay the rest of a body from one side to the other, returning whatever was
 read past its end.
@@ -193,11 +204,15 @@ def relayBody (from_ to : Net.Stream) (framing : Http.Framing) (sent : BodyPrefi
     goLength (n - min n sent.raw.size) 1000000
   | .chunked => do
     -- Read once, from where the prefix left off, holding no more than a line of the
-    -- framing: the data is let go as it is relayed.
-    let start ← match ({} : Http.Chunked.Reader).feed sent.raw with
-      | .ok (r, none) => pure r
-      | .ok (_, some _) => return ByteArray.empty
-      | .error e => throw (IO.userError s!"malformed chunked body: {e}")
+    -- framing: the data is let go as it is relayed.  A request body is framed again
+    -- (`sent.chunked`); a response is relayed as it arrived.
+    let (start, reframe) ← match sent.chunked with
+      | some r => pure (r, true)
+      | none => match ({} : Http.Chunked.Reader).feed sent.raw with
+        | .ok (r, none) => pure (r, false)
+        | .ok (_, some _) => return ByteArray.empty
+        | .error e => throw (IO.userError s!"malformed chunked body: {e}")
+    if start.finished then return ByteArray.empty
     let rec goChunked (r : Http.Chunked.Reader) (fuel : Nat) : IO Bytes := do
       match fuel with
       | 0 => throw (IO.userError "the chunked body did not end")
@@ -205,15 +220,15 @@ def relayBody (from_ to : Net.Stream) (framing : Http.Framing) (sent : BodyPrefi
         let chunk ← from_.read 65536
         if chunk.size == 0 then throw (IO.userError "the connection closed mid-body")
         match r.feed chunk with
-        | .ok (_, some upTo) =>
+        | .ok (r, some upTo) =>
           -- The body ends inside this read: relay up to the end and no further.
-          to.write (Bytes.take chunk upTo)
+          to.write (if reframe then r.emitted else Bytes.take chunk upTo)
           return Bytes.drop chunk upTo
         | .error e => throw (IO.userError s!"malformed chunked body: {e}")
         | .ok (r, none) =>
-          to.write chunk
+          to.write (if reframe then r.emitted else chunk)
           goChunked r fuel
-    goChunked start 1000000
+    goChunked { start with limit := 0, entity := ByteArray.empty } 1000000
   | .untilClose => do
     let rec goClose (fuel : Nat) : IO Bytes := do
       match fuel with

@@ -144,8 +144,14 @@ private def relayResponse (ctx : Context) (origin client : Net.Stream) (method :
   -- can quote it.
   let headers := (Http.stripHopByHop response.headers)
     |> (Http.Headers.set · "x-kleis-request-id" requestId)
+  -- The framing kleis relays the body by, written again: a response's `Connection`
+  -- cannot name it away (`Http.readResponse` refuses one that tries), and the length
+  -- here is the one the relay keeps to.  A body-less response keeps the origin's
+  -- `Content-Length`, which for `HEAD` or `304` describes a body not sent.
   let headers := match response.framing with
-    | .chunked => Http.Headers.set headers "transfer-encoding" "chunked"
+    | .chunked => Http.Headers.set (Http.Headers.remove headers "content-length")
+        "transfer-encoding" "chunked"
+    | .length n => Http.Headers.set headers "content-length" (toString n)
     | _ => headers
   -- A body that ends only when the connection does cannot be followed by
   -- another response on it, and the client has to be told.
@@ -169,6 +175,20 @@ private def relayResponse (ctx : Context) (origin client : Net.Stream) (method :
   return some { status := response.status
                 clean := delimited && excess.size == 0 && after.size == 0
                 originCloses }
+
+/-- A request's head with the framing kleis decided on and relays, whatever the client
+wrote: `Content-Length: n` for `n` bytes, `Transfer-Encoding: chunked` for a body
+kleis frames again, and neither for no body — but `Content-Length: 0` where the
+client sent one, since some origins want a length on every `POST`.  The head an
+origin reads and the bytes it is sent cannot then disagree about where the body
+ends. -/
+def framedAs (h : Http.Headers) (framing : Http.Framing) (hadLength : Bool) : Http.Headers :=
+  let h := Http.Headers.removeAll h ["content-length", "transfer-encoding"]
+  match framing with
+  | .length n => Http.Headers.set h "content-length" (toString n)
+  | .chunked => Http.Headers.set h "transfer-encoding" "chunked"
+  | .empty => if hadLength then Http.Headers.set h "content-length" "0" else h
+  | .untilClose => h
 
 /-- Send a request on an origin connection, returning `false` if the
 connection turned out to be dead before anything was written. -/
@@ -210,9 +230,12 @@ private def sendUpstream (ctx : Context) (job : Job) (outgoing : Model.Request)
   -- `Expect` is dropped as well as the hop-by-hop fields: the proxy already
   -- holds the start of the body and relays the rest unasked, so an origin's
   -- `100 Continue` would only be one more response to throw away.
-  let headers := (Http.stripHopByHop outgoing.headers)
+  -- The fixed hop-by-hop fields only: what the client's `Connection` named went when
+  -- the request was read, so that nothing kleis has added since can be named away.
+  let headers := (Http.stripFixedHopByHop outgoing.headers)
     |> (Http.Headers.remove · "expect")
     |> (Http.Headers.set · "host" outgoing.authority)
+    |> (framedAs · job.wire.framing (Http.Headers.contains job.wire.headers "content-length"))
     |> (fun h => if pooling then h else Http.Headers.set h "connection" "close")
   let head := Http.writeRequest {
     method := outgoing.method, target := outgoing.originTarget
