@@ -42,6 +42,9 @@ inductive CaptureKind where
   | int
   /-- An RFC 3339 timestamp; a segment that is not one does not match. -/
   | date
+  /-- Lowercase hexadecimal, one to 64 digits, bound as a string — an identifier a
+  service generates, such as a job id; a segment that is not one does not match. -/
+  | hex
   deriving Repr, DecidableEq, Inhabited
 
 /-- One element of a path pattern. -/
@@ -77,6 +80,7 @@ private def parsePlaceholder (inner : String) : Except String SegPat := do
     let (name, kind) ← match Str.splitOnce? head ":" with
       | some (n, "int") => pure (n, CaptureKind.int)
       | some (n, "date") => pure (n, CaptureKind.date)
+      | some (n, "hex") => pure (n, CaptureKind.hex)
       | some (_, t) => throw s!"unknown capture type `{t}`"
       | none => pure (head, CaptureKind.str)
     if name.isEmpty then throw "a capture needs a name"
@@ -124,6 +128,9 @@ private def bindCapture (kind : CaptureKind) (strip : Option String) (raw : Stri
   | .int => raw.toInt?.map Builder.Term.integer
   | .date => (Time.parseRfc3339 raw).map fun t =>
       Builder.Term.date (if t < 0 then 0 else t.toNat)
+  | .hex =>
+    if 0 < raw.length && raw.length ≤ 64 && raw.all (fun c => ('0' ≤ c && c ≤ '9') || ('a' ≤ c && c ≤ 'f'))
+    then some (.str raw) else none
 
 /-- Match a path pattern against the request's segments. -/
 private def matchSegments : List SegPat → List String → Option (List (String × Builder.Term))

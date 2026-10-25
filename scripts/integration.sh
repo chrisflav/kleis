@@ -834,6 +834,7 @@ head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DR/secrets/root_key"
 printf 'agent-secret-55' > "$DR/secrets/agent"
 printf 'unused' > "$DR/secrets/github"
 cp "$ROOT/examples/orchestra/specs/reviewer.kleis" "$ROOT/examples/orchestra/specs/diff-reviewer-poster.kleis" \
+  "$ROOT/examples/orchestra/specs/rubric-proposer.kleis" \
   "$DR/home/config/specs/"
 mkdir -p "$DR/home/config/extensions/github"
 for f in extension.toml manifest.toml; do
@@ -868,7 +869,7 @@ max_decode_prefix = 2097152
 [[issuer]]
 name = "orchestra"
 grants = ["orchestra-*"]
-specs = ["reviewer"]
+specs = ["reviewer", "rubric-proposer"]
 facts = ["task_*"]
 max_ttl = "24h"
 token_file = "$DR/issuers/orchestra.token"
@@ -931,6 +932,28 @@ print(json.dumps({"headSha": "abc", "prType": None,
   [ "$CODE" = "403" ]; check $? "and another repository's" "got $CODE"
   CODE="$(agent "https://localhost:$TLS_PORT/api/v1/jobs")"
   [ "$CODE" = "403" ]; check $? "and the rest of the platform's API" "got $CODE"
+  CODE="$(agent "$API/acme/widgets/proposals/0123456789abcdef")"
+  [ "$CODE" = "403" ]; check $? "and a reviewer reaches no rubric proposal" "got $CODE"
+  # A rubric proposal job: a repository, no pull request, and a spec of its own.
+  OUT="$(curl -s -H "Authorization: Bearer $(cat "$DR/issuers/orchestra.token")" \
+    -H 'content-type: application/json' \
+    -d '{"spec":"rubric-proposer","ttl":"1h","bearer":"orchestra:t-2","facts":[
+         {"name":"task_upstream","terms":["acme","widgets"]}]}' \
+    "http://127.0.0.1:$DR_PORT/.kleis/v1/derive")"
+  PROPOSER="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"
+  [ -n "$PROPOSER" ]; check $? "orchestra derives a rubric-proposer token for one repository" "$OUT"
+  proposer() {
+    curl -s --proxy "http://kleis:$PROPOSER@127.0.0.1:$DR_PORT" --proxy-basic --cacert "$("$KLEIS" ca)" \
+      -H "Authorization: Bearer kleis" -o "$DR/out" -w '%{http_code}' "$@"
+  }
+  CODE="$(proposer -H 'content-type: application/json' -d '{"rubric":"r"}' \
+    "$API/acme/widgets/proposals/0123456789abcdef")"
+  [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer agent-secret-55"' "$DR/out"
+  check $? "it submits its repository's proposal on the agent token" "got $CODE: $(cat "$DR/out")"
+  CODE="$(proposer "$API/acme/other/proposals/0123456789abcdef")"
+  [ "$CODE" = "403" ]; check $? "but not another repository's" "got $CODE"
+  CODE="$(proposer "$API/acme/widgets/pulls/7")"
+  [ "$CODE" = "403" ]; check $? "and reaches no review job" "got $CODE"
   POSTER="$("$KLEIS" token issue --spec diff-reviewer-poster --bearer diff-reviewer --ttl 1h)"
   github() {
     curl -s --proxy "http://kleis:$POSTER@127.0.0.1:$DR_PORT" --proxy-basic --cacert "$("$KLEIS" ca)" \

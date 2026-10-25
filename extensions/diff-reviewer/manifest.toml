@@ -7,8 +7,9 @@
 # The agent API authenticates with `Authorization: Bearer <agent token>`; the client sends whatever
 # its config holds (`kleis`), kleis removes it and attaches the account's.
 #
-# What it covers: the three agent endpoints, each about one pull request of one repository —
-# the job, its diff, and the review submitted for it. Nothing else on the server is matched: not
+# What it covers: the three agent endpoints about one pull request of one repository — the job,
+# its diff, and the review submitted for it — and the two about a repository's rubric proposal:
+# the proposal job, and the proposal submitted for it. Nothing else on the server is matched: not
 # the scripts' API (`/api/v1/`), not the login, not the front end. A request no route matches
 # gets `operation("unrouted")` and is refused.
 #
@@ -65,3 +66,17 @@ emit  = ['operation("read")', 'repository($owner, $name)', 'pull($pr)']
 [[route]]
 match = "POST * /api/agent/v1/repos/{owner}/{name}/pulls/{pr:int}/review"
 emit  = ['operation("submit_review")', 'repository($owner, $name)', 'pull($pr)']
+
+# ---------------------------------------------------------------- rubric proposals
+
+# A proposal is of a repository, not of a pull request: `{job}` is the platform's id for the
+# repository's live proposal job (lowercase hex), and the platform binds the request to that
+# job; kleis binds it to the repository. No `pull` fact, so a spec bound to its pull request,
+# as `reviewer` is, does not reach these.
+[[route]]
+match = "GET * /api/agent/v1/repos/{owner}/{name}/proposals/{job:hex}"
+emit  = ['operation("read_proposal")', 'repository($owner, $name)']
+
+[[route]]
+match = "POST * /api/agent/v1/repos/{owner}/{name}/proposals/{job:hex}"
+emit  = ['operation("submit_proposal")', 'repository($owner, $name)']

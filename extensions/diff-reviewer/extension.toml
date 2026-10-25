@@ -2,16 +2,19 @@
 
 service = "diff-reviewer"
 display = "diff-reviewer"
-client  = "the `diff-reviewer agent` command (`diff-reviewer agent show|diff|submit <owner/name> <pr>`); ~/.config/diff-reviewer/agent.json points at the server"
+client  = "the `diff-reviewer agent` command (`diff-reviewer agent show|diff|submit <owner/name> <pr>`, `diff-reviewer agent proposal show|submit <owner/name> … --job <id>`); ~/.config/diff-reviewer/agent.json points at the server"
 hosts   = "dynamic"
 
 [groups]
-read   = { operations = ["read"], phrase = "read the review job of a pull request and its diff" }
-review = { operations = ["read", "submit_review"], phrase = "read the review job of a pull request and its diff, and submit a review of it" }
+read    = { operations = ["read"], phrase = "read the review job of a pull request and its diff" }
+review  = { operations = ["read", "submit_review"], phrase = "read the review job of a pull request and its diff, and submit a review of it" }
+propose = { operations = ["read_proposal", "submit_proposal"], phrase = "read a repository's rubric proposal job, and submit a proposed rubric for it" }
 
 [operations]
-read          = "read the review job of a pull request and its diff"
-submit_review = "submit a review of a pull request to the platform, which posts it to GitHub only as its operator has configured"
+read            = "read the review job of a pull request and its diff"
+submit_review   = "submit a review of a pull request to the platform, which posts it to GitHub only as its operator has configured"
+read_proposal   = "read a repository's rubric proposal job: its rubric, its style notes, the reviews to learn from"
+submit_proposal = "submit a proposed rubric for a repository, which its operator accepts or rejects"
 
 [fields.pull]
 fact   = "pull"
