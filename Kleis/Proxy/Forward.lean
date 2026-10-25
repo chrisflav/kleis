@@ -213,6 +213,10 @@ private def sendUpstream (ctx : Context) (job : Job) (outgoing : Model.Request)
   let headers := (Http.stripHopByHop outgoing.headers)
     |> (Http.Headers.remove · "expect")
     |> (Http.Headers.set · "host" outgoing.authority)
+    -- `Transfer-Encoding` is hop-by-hop, and this hop's is kleis's own: a chunked body
+    -- goes on framed again by kleis (`BodyPrefix.chunked`), and says so.
+    |> (fun h => if job.wire.framing == .chunked then Http.Headers.set h "transfer-encoding" "chunked"
+                 else h)
     |> (fun h => if pooling then h else Http.Headers.set h "connection" "close")
   let head := Http.writeRequest {
     method := outgoing.method, target := outgoing.originTarget

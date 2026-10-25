@@ -694,6 +694,54 @@ print(data.decode("latin1"))
 PY
   [ "$(grep -c '^HTTP/1.1 ' "$DECL/smuggle")" = "1" ] && ! grep -q SMUGGLED "$DECL/smuggle"
   check $? "bytes behind a body are not relayed as a request" "$(head -c 400 "$DECL/smuggle")"
+  # A chunked body goes on in kleis's own framing: no extension, no trailer, its own
+  # size lines.  The origin reads chunked framing leniently, as some servers do.
+  python3 - "$DECL_PORT" "$ORIGIN_PORT" "$JOB" > "$DECL/rechunk" <<'PY'
+import socket, sys
+port, origin, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall((f"POST /http/127.0.0.1:{origin}/echo HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Proxy-Authorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n"
+           "Connection: close\r\n\r\n"
+           "5;ext=1\r\nhello\r\n3\r\nabc\r\n0\r\nx-a: 1\r\n\r\n").encode())
+s.settimeout(5)
+data = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout:
+    pass
+print(data.decode("latin1"))
+PY
+  grep -qF '"raw": "5\r\nhello\r\n3\r\nabc\r\n0\r\n\r\n"' "$DECL/rechunk"
+  check $? "a chunked body reaches the origin framed by kleis, without extensions or trailers" \
+    "$(head -c 600 "$DECL/rechunk")"
+  # A request hidden behind a whitespace-only trailer line, which a lenient origin takes
+  # for the end of the body: refused, and nothing reaches the origin.
+  python3 - "$DECL_PORT" "$ORIGIN_PORT" "$JOB" > "$DECL/chunk-smuggle" <<'PY'
+import socket, sys
+port, origin, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+s = socket.create_connection(("127.0.0.1", port))
+smuggled = f"GET /echo/SMUGGLED HTTP/1.1\r\nHost: 127.0.0.1:{origin}\r\n\r\n"
+s.sendall((f"POST /http/127.0.0.1:{origin}/echo HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Proxy-Authorization: Bearer {token}\r\nTransfer-Encoding: chunked\r\n\r\n"
+           "5\r\nhello\r\n0\r\n   \r\n" + smuggled + "\r\n").encode())
+s.settimeout(5)
+data = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout:
+    pass
+print(data.decode("latin1"))
+PY
+  head -1 "$DECL/chunk-smuggle" | grep -q '^HTTP/1.1 400' && ! grep -q SMUGGLED "$DECL/chunk-smuggle"
+  check $? "a request hidden behind a whitespace-only trailer line is refused" \
+    "$(head -c 400 "$DECL/chunk-smuggle")"
   # The next request — another connection, which may be given the pooled one to the
   # origin — gets its own answer, not one the smuggled request left there.
   OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \

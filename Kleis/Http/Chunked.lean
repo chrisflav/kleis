@@ -75,6 +75,11 @@ structure Reader where
   limit : Nat := 0
   /-- Whether data past `limit` was let go, so that `entity` is not the whole body. -/
   overflow : Bool := false
+  /-- The bytes of the last `feed`, framed again the one way this reader writes chunked
+  framing: a chunk per run of data, sized in lowercase hex with no extension, and a bare
+  terminator with no trailers.  What kleis sends upstream, so the origin never sees the
+  client's framing — however it reads that, it reads this the same way. -/
+  emitted : Bytes := ByteArray.empty
   deriving Inhabited
 
 /-- Is the body over? -/
@@ -83,15 +88,52 @@ def Reader.finished (r : Reader) : Bool :=
   | .finished => true
   | _ => false
 
-/-- Read a chunk-size line: the size, with any extension after `;` ignored. -/
-private def sizeOf? (line : Bytes) : Option Nat :=
-  let text := Bytes.toStringLossy line
-  Str.ofHex? (Str.trim ((text.splitOn ";").headD text))
+/-- A control character: what no line of the framing may carry. -/
+private def isControl (c : UInt8) : Bool := c < 32 || c == 127
+
+/-- A hexadecimal digit's value. -/
+private def hexDigit? (c : UInt8) : Option Nat :=
+  if 48 ≤ c && c ≤ 57 then some (c - 48).toNat
+  else if 97 ≤ c && c ≤ 102 then some (c - 87).toNat
+  else if 65 ≤ c && c ≤ 70 then some (c - 55).toNat
+  else none
+
+/-- A `token` character (RFC 9110 §5.6.2), what a field name is made of. -/
+private def isTchar (c : UInt8) : Bool :=
+  (48 ≤ c && c ≤ 57) || (65 ≤ c && c ≤ 90) || (97 ≤ c && c ≤ 122) ||
+  "!#$%&'*+-.^_`|~".toUTF8.toList.contains c
+
+/-- Read a chunk-size line, its CR removed: one to sixteen hexadecimal digits and nothing
+else — no space around them — then optionally `;` and an extension of no control
+characters, which is ignored.  Anything else is not a size line. -/
+private def sizeOf? (line : Bytes) : Option Nat := do
+  let semi := (Bytes.indexOfByte? line 59).getD line.size
+  if semi == 0 || semi > 16 then none
+  let mut n := 0
+  for k in [0:semi] do
+    n := n * 16 + (← hexDigit? (line.get! k))
+  if semi < line.size then
+    if semi + 1 == line.size then none
+    for k in [semi + 1:line.size] do
+      if isControl (line.get! k) then none
+  pure n
+
+/-- Is this, its CR removed, a trailer field: a name of `token` characters, a colon with
+nothing between, and a value of no control characters but tab? -/
+private def isTrailerField (line : Bytes) : Bool :=
+  match Bytes.indexOfByte? line 58 with
+  | none => false
+  | some colon =>
+    colon > 0 &&
+    (List.range colon).all (fun k => isTchar (line.get! k)) &&
+    (List.range (line.size - colon - 1)).all fun k =>
+      let c := line.get! (colon + 1 + k)
+      c == 9 || !isControl c
 
 /-- Feed the reader the next bytes. On the end of the body, also the number of
 these bytes that belonged to it: the rest are whatever the client sent next. -/
 def Reader.feed (r : Reader) (buf : Bytes) : Except String (Reader × Option Nat) := do
-  let mut r := r
+  let mut r := { r with emitted := ByteArray.empty }
   let mut i := 0
   -- Each pass consumes at least one byte, or ends.
   for _ in [0:buf.size + 1] do
@@ -103,6 +145,9 @@ def Reader.feed (r : Reader) (buf : Bytes) : Except String (Reader × Option Nat
       let keep := min n (r.limit - min r.limit r.entity.size)
       if keep > 0 then r := { r with entity := r.entity ++ Bytes.slice buf i (i + keep) }
       if keep < n then r := { r with overflow := true }
+      if n > 0 then
+        r := { r with emitted := r.emitted ++ Bytes.ofString s!"{Str.toHex n}\r\n" ++
+                                 Bytes.slice buf i (i + n) ++ Bytes.ofString "\r\n" }
       i := i + n
       r := { r with phase := if left == n then .gap 2 else .data (left - n) }
     | .gap left =>
@@ -125,7 +170,7 @@ def Reader.feed (r : Reader) (buf : Bytes) : Except String (Reader × Option Nat
         if line.size == 0 || line.get! (line.size - 1) != 13 then
           throw "a chunk size line must end in CRLF"
         i := nl + 1
-        match sizeOf? line with
+        match sizeOf? (Bytes.take line (line.size - 1)) with
         | none => throw "malformed chunk size line"
         | some 0 => r := { r with phase := .trailer ByteArray.empty maxTrailers }
         | some n => r := { r with phase := .data n }
@@ -142,8 +187,14 @@ def Reader.feed (r : Reader) (buf : Bytes) : Except String (Reader × Option Nat
         if line.size == 0 || line.get! (line.size - 1) != 13 then
           throw "a trailer line must end in CRLF"
         i := nl + 1
-        if (Bytes.trim line).size == 0 then
-          return ({ r with phase := .finished }, some i)
+        let field := Bytes.take line (line.size - 1)
+        -- The section ends at an empty line and nothing else: a line of spaces is
+        -- neither an end nor a field, and an origin might take it for either.
+        if field.size == 0 then
+          return ({ r with phase := .finished, emitted := r.emitted ++ Bytes.ofString "0\r\n\r\n" },
+                  some i)
+        if !isTrailerField field then throw "malformed trailer field"
+        -- Read and checked, then dropped: nothing decides on a trailer, so none is sent on.
         match left with
         | 0 => throw "too many trailer fields"
         | left + 1 => r := { r with phase := .trailer ByteArray.empty left }

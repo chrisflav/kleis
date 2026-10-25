@@ -127,6 +127,64 @@ def httpTests : IO Unit := do
   | .ok (_, some n) => checkEq "trailers are read to the empty line" n 21
   | _ => check "trailers are read to the empty line" false
 
+  group "chunked framing, strictly"
+  for (name, framed) in [
+      ("a trailer line of spaces", "5\r\n[1,2]\r\n0\r\n   \r\nGET"),
+      ("a trailer line of a tab", "5\r\n[1,2]\r\n0\r\n\t\r\n"),
+      ("a size of seventeen digits", "10000000000000005\r\n[1,2]\r\n0\r\n\r\n"),
+      ("a bare CR in an extension", "5;a\rX\r\n[1,2]\r\n0\r\n\r\n"),
+      ("spaces around the size", "  5  \r\n[1,2]\r\n0\r\n\r\n"),
+      ("a space after the size", "5 \r\n[1,2]\r\n0\r\n\r\n"),
+      ("a NUL after the size", "5\x00\r\n[1,2]\r\n0\r\n\r\n"),
+      ("an empty extension", "5;\r\n[1,2]\r\n0\r\n\r\n"),
+      ("a trailer with no colon", "5\r\n[1,2]\r\n0\r\nT\r\n\r\n"),
+      ("a space before a trailer's colon", "5\r\n[1,2]\r\n0\r\nT : x\r\n\r\n"),
+      ("a trailer line of a space, then the end", "5\r\n[1,2]\r\n0\r\n \r\n\r\n")] do
+    check s!"{name} is refused"
+      (match Http.Chunked.scan (Bytes.ofString framed) with | .error _ => true | _ => false)
+  for (name, framed, consumed) in [
+      ("sixteen digits", "0000000000000005\r\n[1,2]\r\n0\r\n\r\n", 30),
+      ("a leading zero", "05\r\n[1,2]\r\n0\r\n\r\n", 16),
+      ("an extension", "5;name=\"v\"\r\n[1,2]\r\n0\r\n\r\n", 24),
+      ("a trailer field", "5\r\n[1,2]\r\n0\r\nx-a: 1\r\n\r\n", 23)] do
+    checkEq s!"{name} is read" (match Http.Chunked.scan (Bytes.ofString framed) with
+      | .done n => some n | _ => none) (some consumed)
+
+  group "chunked framing, written again"
+  -- What kleis sends upstream: its own size lines, no extension, no trailer.
+  match feedAll {} (Bytes.ofString "5;ext=1\r\n[1,2]\r\n3\r\nabc\r\n0\r\nx-a: 1\r\n\r\n") 1000 with
+  | .ok (r, some _) =>
+    checkEq "in one read" (Kleis.Bytes.toStringLossy r.emitted) "5\r\n[1,2]\r\n3\r\nabc\r\n0\r\n\r\n"
+  | _ => check "a chunked body is written again" false
+  -- Read in pieces, a chunk split across reads is written as one chunk per piece.
+  let mut written : Bytes := ByteArray.empty
+  let mut reader : Http.Chunked.Reader := {}
+  for piece in (Bytes.ofString "5;ext\r\nhello\r\n0\r\nx: y\r\n\r\n").toList.map (fun b => ByteArray.mk #[b]) do
+    match reader.feed piece with
+    | .ok (r, _) => reader := r; written := written ++ r.emitted
+    | .error _ => pure ()
+  checkEq "byte by byte"
+    (Kleis.Bytes.toStringLossy written) "1\r\nh\r\n1\r\ne\r\n1\r\nl\r\n1\r\nl\r\n1\r\no\r\n0\r\n\r\n"
+  check "and the result reads as the same entity"
+    (match Http.Chunked.decode written 100 with
+     | .done e _ true => Kleis.Bytes.toStringLossy e == "hello"
+     | _ => false)
+
+  group "where a head ends"
+  let r2 := "GET /b HTTP/1.1\r\nHost: x\r\n\r\n"
+  check "a bare-LF head is refused"
+    (match Http.readRequest (Bytes.ofString ("GET /a HTTP/1.1\nHost: x\n\n" ++ r2)) with
+     | .error _ => true | _ => false)
+  check "so is one with a bare CR"
+    (match Http.readRequest (Bytes.ofString "GET /a HTTP/1.1\r\nX: a\rb\r\n\r\n") with
+     | .error _ => true | _ => false)
+  check "and one whose last line ends in a bare LF"
+    (match Http.readRequest (Bytes.ofString "GET /a HTTP/1.1\r\nHost: x\n\r\n") with
+     | .error _ => true | _ => false)
+  check "a bare-LF response head too"
+    (match Http.readResponse (Bytes.ofString "HTTP/1.1 200 OK\ncontent-length: 0\n\n") "GET" with
+     | .error _ => true | _ => false)
+
   group "http writing"
   let out := Http.simpleResponse 403 "text/plain" "no\n"
   let text := Kleis.Bytes.toStringLossy out
