@@ -148,7 +148,7 @@ the configuration it had, so copying the specs first only logs a failed reload.
 # platform's host; the account the reviewer spec names.
 kleis credential add diff-reviewer/agent --service diff-reviewer \
   --hosts reviews.example --secret @agent.token
-# The platform's proposer token, which its proposal routes take and its pull
+# The platform's proposer token (its DIFF_REVIEWER_PROPOSER_AGENT_TOKEN_FILE), which its proposal routes take and its pull
 # request routes refuse, bound to the same host; the account the
 # rubric-proposer spec names.
 kleis credential add diff-reviewer/proposer --service diff-reviewer \
