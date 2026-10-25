@@ -86,7 +86,12 @@ where
   go (buf : Bytes) (searched fuel : Nat) : IO (Option (Http.Request × Bytes)) := do
     match Http.readRequest buf limits (Http.resumeHeadSearch searched) with
     | .done r consumed => return some (r, Bytes.drop buf consumed)
-    | .error e => throw (IO.userError e)
+    | .error e =>
+      -- Told why, then closed: a head this reader refuses is not one to guess the end of,
+      -- so nothing after it on the connection can be read either.
+      try s.write (Http.simpleResponse 400 "text/plain; charset=utf-8" s!"kleis: {e}\n")
+      catch _ => pure ()
+      throw (IO.userError e)
     | .need =>
       match fuel with
       | 0 => throw (IO.userError "the request head never ended")

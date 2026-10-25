@@ -132,6 +132,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("/")[1:2] in (["orgs"], ["users"], ["app"], ["lookups"]):
             if self._github_app() is None:
                 self._json(404, {"message": "Not Found"})
+        elif self.path.startswith("/echo?respond=connection-names-length"):
+            # An origin whose Connection field names its own Content-Length: a proxy that
+            # honoured it would relay the body with no length, for the client to read as
+            # the next response.
+            payload = b"hi"
+            self.send_response(200)
+            self.send_header("Connection", "content-length")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
         elif self.path.split("?")[0].split("/")[1:2] in (["echo"], ["api"], ["repos"]):
             # `/api/` stands in for the diff-reviewer platform, `/repos/` for GitHub's API.
             self._echo(body)

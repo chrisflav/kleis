@@ -68,6 +68,9 @@ private def parseField (line : String) : Except String (String × String) := do
 
 /-- Reject the framing ambiguities that make smuggling possible. -/
 private def checkFraming (h : Headers) : Except String Unit := do
+  for n in Headers.tokens h "connection" do
+    if connectionMayNotName.contains n then
+      throw s!"Connection names `{n}`, which frames or routes the message"
   let hasTe := Headers.contains h "transfer-encoding"
   let cls := Headers.findAll h "content-length"
   if hasTe && !cls.isEmpty then

@@ -198,7 +198,23 @@ arrived: kleis writes it again (`Chunked.Reader.emitted`), one chunk per run of
 data in its own size lines, no extension, and a bare terminator. Trailers are
 read, checked and dropped: no policy decides on them, so sending them on would
 put fields past the grant that it never saw, and a server that read them
-differently from kleis would be reading a request kleis did not decide on. JSON nests at most 128 deep in the reader and long numbers
+differently from kleis would be reading a request kleis did not decide on.
+
+Nor does the head kleis sends upstream take its framing from the client. A
+`Connection` field names fields private to one hop, and honouring that by
+stripping them at forwarding time once let a client name `Content-Length` away:
+the head reached the origin with no length while kleis still relayed the body,
+which the origin then read as the next request — on a connection pooled for the
+next bearer. So a request or response whose `Connection` names `Content-Length`,
+`Transfer-Encoding` or `Host` is refused (400 to a client, 502 for an origin's);
+what `Connection` names is stripped when the request is read, before a credential
+or anything else kleis adds, so nothing added can be named away; and the forwarded
+head always carries the framing kleis relays by — `Content-Length: n` for `n`
+bytes, `Transfer-Encoding: chunked` for a body kleis frames again, nothing for no
+body (`Content-Length: 0` where the client sent one) — and a relayed response the
+length kleis keeps to. `Upgrade` may still be named, as `Connection: Upgrade` is
+how an `h2c` or WebSocket upgrade is asked for: kleis strips `Upgrade` whatever
+`Connection` says and forwards no upgrade, so naming it changes nothing. JSON nests at most 128 deep in the reader and long numbers
 stay text; a form stops at 4096 pairs; GraphQL and multipart are read without
 rescanning. What is left superlinear is the datalog engine itself, in the number
 of facts — which `maxBodyFacts` bounds: a body near that limit takes up to about

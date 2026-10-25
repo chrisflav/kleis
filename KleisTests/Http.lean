@@ -185,6 +185,37 @@ def httpTests : IO Unit := do
     (match Http.readResponse (Bytes.ofString "HTTP/1.1 200 OK\ncontent-length: 0\n\n") "GET" with
      | .error _ => true | _ => false)
 
+  group "what Connection may name"
+  for name in ["content-length", "Content-Length", "transfer-encoding", "host"] do
+    check s!"a request whose Connection names {name} is refused"
+      (match Http.readRequest (Bytes.ofString s!"POST / HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, {name}\r\nContent-Length: 2\r\n\r\nhi") with
+       | .error _ => true | _ => false)
+    check s!"so is a response"
+      (match Http.readResponse (Bytes.ofString s!"HTTP/1.1 200 OK\r\nConnection: {name}\r\nContent-Length: 2\r\n\r\nhi") "GET" with
+       | .error _ => true | _ => false)
+  for value in ["keep-alive", "close", "Upgrade, HTTP2-Settings", "x-private"] do
+    check s!"Connection: {value} is still read"
+      (match Http.readRequest (Bytes.ofString s!"GET / HTTP/1.1\r\nHost: x\r\nConnection: {value}\r\n\r\n") with
+       | .done _ _ => true | _ => false)
+  let named := Http.stripConnectionNamed #[("connection", "x-private"), ("x-private", "1"), ("accept", "*/*")]
+  check "what Connection names is stripped as the request is read"
+    (!Http.Headers.contains named "x-private" && Http.Headers.contains named "accept"
+      && Http.Headers.contains named "connection")
+
+  group "the head kleis writes is framed as the body it relays"
+  let heads : List Http.Headers := [
+    #[], #[("content-length", "7")], #[("content-length", "0")], #[("transfer-encoding", "chunked")],
+    #[("content-length", "3"), ("transfer-encoding", "chunked")], #[("x-other", "1")]]
+  for framing in [Http.Framing.empty, .length 5, .length 1, .chunked] do
+    for h in heads do
+      for hadLength in [false, true] do
+        let out := Proxy.framedAs h framing hadLength
+        let lengths := Http.Headers.findAll out "content-length"
+        let codings := Http.Headers.findAll out "transfer-encoding"
+        check s!"{repr framing}, from {h.toList}: the written framing is the relayed one"
+          (Http.requestFraming out == framing && lengths.size ≤ 1 && codings.size ≤ 1
+            && !(lengths.size == 1 && codings.size == 1))
+
   group "http writing"
   let out := Http.simpleResponse 403 "text/plain" "no\n"
   let text := Kleis.Bytes.toStringLossy out

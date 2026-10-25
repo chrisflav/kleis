@@ -742,6 +742,47 @@ PY
   head -1 "$DECL/chunk-smuggle" | grep -q '^HTTP/1.1 400' && ! grep -q SMUGGLED "$DECL/chunk-smuggle"
   check $? "a request hidden behind a whitespace-only trailer line is refused" \
     "$(head -c 400 "$DECL/chunk-smuggle")"
+  # A Connection field naming Content-Length would have the head reach the origin with no
+  # length while its bytes are still relayed: a body read as the next request, on a
+  # connection pooled for the next bearer.  Refused; and the next bearer, on a pooled
+  # connection, gets its own answer.
+  python3 - "$DECL_PORT" "$ORIGIN_PORT" "$JOB" > "$DECL/conn-smuggle" <<'PY'
+import socket, sys
+port, origin, token = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+smug = f"GET /echo/SMUGGLED HTTP/1.1\r\nHost: 127.0.0.1:{origin}\r\n\r\n".encode()
+s = socket.create_connection(("127.0.0.1", port))
+s.sendall((f"GET /http/127.0.0.1:{origin}/echo?n=attacker HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+           f"Proxy-Authorization: Bearer {token}\r\nConnection: content-length\r\n"
+           f"Content-Length: {len(smug)}\r\n\r\n").encode() + smug)
+s.settimeout(5)
+data = b""
+try:
+    while True:
+        chunk = s.recv(65536)
+        if not chunk: break
+        data += chunk
+except socket.timeout:
+    pass
+print(data.decode("latin1"))
+PY
+  head -1 "$DECL/conn-smuggle" | grep -q '^HTTP/1.1 400' && ! grep -q SMUGGLED "$DECL/conn-smuggle"
+  check $? "a request whose Connection names Content-Length is refused" "$(head -c 400 "$DECL/conn-smuggle")"
+  for n in 1 2 3; do
+    OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+      "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo?n=victim$n")"
+    echo "$OUT" | grep -q "\"path\": \"/echo?n=victim$n\"" && ! echo "$OUT" | grep -q SMUGGLED || break
+  done
+  echo "$OUT" | grep -q '"path": "/echo?n=victim3"'
+  check $? "and the next requests, on the pooled connection, get their own answers" "$OUT"
+  # The other direction: an origin whose Connection names its Content-Length.
+  CODE="$(curl -s -o "$DECL/conn-resp" -w '%{http_code}' -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo?respond=connection-names-length")"
+  [ "$CODE" = "502" ]; check $? "a response whose Connection names Content-Length is refused" \
+    "got $CODE: $(cat "$DECL/conn-resp")"
+  OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \
+    "http://127.0.0.1:$DECL_PORT/http/127.0.0.1:$ORIGIN_PORT/echo?n=after")"
+  echo "$OUT" | grep -q '"path": "/echo?n=after"'
+  check $? "and the next request gets its own answer" "$OUT"
   # The next request — another connection, which may be given the pooled one to the
   # origin — gets its own answer, not one the smuggled request left there.
   OUT="$(curl -s -H "Proxy-Authorization: Bearer $JOB" \

@@ -135,14 +135,24 @@ def hopByHop : List String :=
   ["connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
    "proxy-connection", "te", "trailer", "transfer-encoding", "upgrade"]
 
-/-- Strip the hop-by-hop fields, including any the `Connection` field names.
+/-- Fields a `Connection` field may not name.  Naming one would have a hop strip
+what the next hop frames or routes the message by — a `Content-Length` gone from
+the head while its bytes are still relayed is a body read as the next request — so
+a message that does is refused (`Http.readRequest`, `Http.readResponse`). -/
+def connectionMayNotName : List String := ["content-length", "transfer-encoding", "host"]
 
-The `Connection` list is honoured because that is how a hop declares a field
-private to it; forwarding such a field would leak a header the sender expected
-to be consumed here. -/
-def stripHopByHop (h : Headers) : Headers :=
-  let named := (Headers.tokens h "connection").toList
-  Headers.removeAll h (hopByHop ++ named)
+/-- Strip the fields the `Connection` field names, which is how a hop declares a
+field private to it; forwarding such a field would leak a header the sender
+expected to be consumed here.  Done to a request as it is read, so that nothing
+kleis adds later — a credential, its own framing — can be named away. -/
+def stripConnectionNamed (h : Headers) : Headers :=
+  Headers.removeAll h ((Headers.tokens h "connection").toList.filter (· != "connection"))
+
+/-- Strip the fixed hop-by-hop fields. -/
+def stripFixedHopByHop (h : Headers) : Headers := Headers.removeAll h hopByHop
+
+/-- Strip the hop-by-hop fields, including any the `Connection` field names. -/
+def stripHopByHop (h : Headers) : Headers := stripFixedHopByHop (stripConnectionNamed h)
 
 end Http
 end Kleis
