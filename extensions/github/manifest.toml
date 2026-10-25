@@ -18,12 +18,14 @@ modes = ["rewrite", "connect"]
 
 # How much of a body is read, and into how many facts. A body past either is
 # refused, not relayed unread. Sized for the largest review diff-reviewer posts:
-# 200 inline comments, at six facts each (path, start_line, line, side,
-# start_side, body; a suggestion is in the body) and up to some 10 KiB of text.
-# The daemon's own `[limits] max_decode_prefix` (64 KiB unless set) also bounds
-# the first, whichever is smaller.  Deciding on a body at the limit takes about
-# half a second, and any bearer may send one: raise these with care.
-max_body_facts    = 1280
+# 200 inline comments, at eight facts each (path, start_line, line, side,
+# start_side, body — a suggestion is in the body — and two for the comment
+# itself), and up to some 10 KiB of text.  The daemon's own `[limits]
+# max_decode_prefix` (64 KiB unless set) also bounds the first, whichever is
+# smaller.  Measured worst cases, bodies built for it of every shape (deep,
+# wide, empty containers, many keys, scalars, ref updates): up to 0.2 s for one
+# within these limits, up to 0.5 s for one of 2 MiB refused as past them.
+max_body_facts    = 1664
 max_decode_prefix = 2097152
 
 # What a request is about, for routing credentials (a grant's `credential_route`):
@@ -33,15 +35,19 @@ resources = ["repository", "new_repository", "organization"]
 # Rules deriving what a request means from the primitive and body facts.
 # A manifest may add facts and rules; it may never add a check or a policy.
 datalog = '''
+// A rule joining body facts with body facts is quadratic in the body, so it names the
+// operation first: then it costs nothing on a request it is not about.
 ref_update($ref) <-
   body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref";
 
 creates_ref($ref) <-
+  operation("push"),
   body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref",
   body($q, true), $q.length() == 3, $q.get(0) == "updates",
   $q.get(1) == $p.get(1), $q.get(2) == "create";
 
 deletes_ref($ref) <-
+  operation("push"),
   body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref",
   body($q, true), $q.length() == 3, $q.get(0) == "updates",
   $q.get(1) == $p.get(1), $q.get(2) == "delete";

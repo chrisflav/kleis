@@ -149,10 +149,11 @@ kleis token issue --spec diff-reviewer-poster --bearer diff-reviewer --ttl 90d
 issuer derive `reviewer`, and raises `[limits] max_decode_prefix` to 2 MiB.
 A body is refused, not relayed unread, when it is larger than the smaller of
 that and its manifest's `max_decode_prefix`, or becomes more facts than the
-manifest's `max_body_facts`.  The manifests are sized for the platform's
-largest review, 200 inline comments: 2 MiB, and 1280 facts for GitHub, 1536
-for diff-reviewer.  With the default 64 KiB a review of a few dozen comments
-is refused, both a job's submission and the platform's post.  On the orchestra side the platform is an API client,
+manifest's `max_body_facts` — every scalar one, every array or object two — or
+nests more than 64 deep.  The manifests are sized for the platform's largest
+review, 200 inline comments: 2 MiB, and 1664 facts for GitHub, 1856 for
+diff-reviewer.  With the default 64 KiB a review of a few dozen comments is
+refused, both a job's submission and the platform's post.  On the orchestra side the platform is an API client,
 `<config>/clients/diff-reviewer.json`, and the client names the spec:
 
 ```json
@@ -193,6 +194,7 @@ agree: the platform's registered repositories, the client's
 - **The poster's list** is matched exactly: `reviewed(["chrisflav/kleis"])`
   does not admit `/repos/ChrisFlav/kleis`, which GitHub would.  That refuses;
   it never admits more.
-- **Large bodies cost time to decide**: about half a second at the GitHub
-  manifest's 1280 facts, and any GitHub bearer may send one.  That is why the
-  limits are sized for 200 comments and no more.
+- **Large bodies cost time to decide.**  Measured worst cases, with bodies
+  built for it of every shape — deep, wide, empty containers, many keys,
+  scalars, ref updates: up to 0.2 s for one within the limits, up to 0.5 s for
+  one of 2 MiB refused as past them.  Any GitHub bearer may send one.

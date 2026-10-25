@@ -171,6 +171,37 @@ private def refusedFor (c : Except String Policy.Choice) (needle : String) : Boo
   | .ok c => !c.outcome.allowed && (c.reason.splitOn needle).length > 1
   | .error _ => false
 
+/-- Bodies built to be expensive to decide, each about `bytes` long: its name, and the body. -/
+private def costlyBodies (bytes : Nat) : List (String × String) :=
+  let rep (k : Nat) (t : String) : String := String.join (List.replicate k t)
+  let list (unit : String) : String :=
+    let k := bytes / (unit.length + 1)
+    "[" ++ ",".intercalate (List.replicate k unit) ++ "]"
+  [("deep arrays", rep (bytes / 2) "[" ++ rep (bytes / 2) "]"),
+   ("deep objects", rep (bytes / 6) "{\"a\":" ++ "1" ++ rep (bytes / 6) "}"),
+   ("empty arrays", list "[]"),
+   ("empty objects", list "{}"),
+   ("mixed containers", list "[{\"a\":[[]]},{}]"),
+   ("scalars", list "1"),
+   ("keys", "{" ++ ",".intercalate ((List.range (bytes / 10)).map fun i =>
+      "\"k" ++ toString i ++ "\":1") ++ "}"),
+   ("ref updates", "{\"updates\":" ++ list "{\"ref\":\"refs/heads/x\",\"create\":true,\"delete\":true}" ++ "}"),
+   ("labels", "{\"labels\":" ++ list "\"x\"" ++ "}")]
+
+/-- Bodies built to be expensive to decide that stay just within `facts` facts, so they are
+read and evaluated rather than refused as truncated. -/
+private def costlyWithin (facts : Nat) : List (String × String) :=
+  let list (k : Nat) (unit : String) : String := "[" ++ ",".intercalate (List.replicate k unit) ++ "]"
+  let n := facts - 3
+  [("scalars", list n "1"),
+   ("strings", list n "\"x\""),
+   ("trues", list n "true"),
+   ("empty arrays", list (n / 2 - 1) "[]"),
+   ("keys", "{" ++ ",".intercalate ((List.range n).map fun i => "\"k" ++ toString i ++ "\":1") ++ "}"),
+   ("ref updates", "{\"updates\":" ++
+      list (n / 6) "{\"ref\":\"refs/heads/x\",\"create\":true,\"delete\":true}" ++ "}"),
+   ("nesting 63 deep", String.join (List.replicate 63 "[") ++ "1" ++ String.join (List.replicate 63 "]"))]
+
 def specTests : IO Unit := do
   group "the shipped extensions load and agree with their manifests"
   for (n, h) in [("github", []), ("zulip", ["z.example"]), ("caldav", ["d.example"]), ("mail", []),
@@ -373,9 +404,9 @@ def specTests : IO Unit := do
     (dr "POST" "/api/agent/v1/repos/up/other/pulls/7/review" review) none
   checkEq "a review of 200 comments is submitted"
     (dr "POST" s!"{own}/review" (agentReview 200)) agentToken
-  -- 1536 facts: four for the review, seven a comment.
-  check "one of 219 is too many facts, and refused as unread"
-    (refusedFor (choose rr rt "POST" "reviews.example" s!"{own}/review" (agentReview 219)
+  -- 1856 facts: four scalars and three containers for the submission, nine a comment.
+  check "one of 206 is too many facts, and refused as unread"
+    (refusedFor (choose rr rt "POST" "reviews.example" s!"{own}/review" (agentReview 206)
       (some "application/json")) "body_truncated")
   checkEq "nor the scripts' API" (dr "GET" "/api/v1/jobs") none
   checkEq "nor the login" (dr "POST" "/api/login" "{\"password\": \"x\"}") none
@@ -473,10 +504,12 @@ def specTests : IO Unit := do
     (spentOn (choose rr pt "GET" "github.com" "/chrisflav/kleis.git/info/refs?service=git-upload-pack")) none
   checkEq "posts a review of 200 comments"
     (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" (bigReview 200)) chris
-  -- 1280 facts: three for the review, six a comment.
-  check "not one of 213, which is too many facts, and refused as unread"
+  -- 1664 facts: three scalars and two containers for the review, eight a comment.
+  check "not one of 208, which is too many facts, and refused as unread"
     (refusedFor (choose rr pt "POST" "api.github.com" "/repos/chrisflav/kleis/pulls/7/reviews"
-      (bigReview 213) (some "application/json")) "body_truncated")
+      (bigReview 208) (some "application/json")) "body_truncated")
+  checkEq "but one of 207"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" (bigReview 207)) chris
   checkEq "posts no review on a repository not listed"
     (post "POST" "/repos/acme/widgets/pulls/7/reviews" posted) none
   -- Each of these is a substring of the listed name or contains it, so a list written as a
@@ -495,5 +528,45 @@ def specTests : IO Unit := do
   checkEq "merges nothing" (post "PUT" "/repos/chrisflav/kleis/pulls/7/merge" "{}") none
   checkEq "and runs no GraphQL"
     (post "POST" "/graphql" "{\"query\":\"query { viewer { login } }\"}") none
+
+  group "bodies built to be expensive are refused quickly"
+  -- Each shape at the default prefix and at the example's 2 MiB, through the platform's review
+  -- route on GitHub and a job's on the platform. `choose` decodes the whole body, as the
+  -- proxy does up to its prefix.
+  let mut slowest : Nat := 0
+  for bytes in [65536, 2097152] do
+    for (name, body) in costlyBodies bytes do
+      for (label, t, host, path) in [
+          ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews"),
+          ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review")] do
+        let t0 ← IO.monoMsNow
+        let refused ← IO.lazyPure fun _ =>
+          (spentOn (choose rr t "POST" host path body (some "application/json"))).isNone
+        let ms := (← IO.monoMsNow) - t0
+        slowest := max slowest ms
+        check s!"{name}, {bytes} bytes, to {label}: refused in {ms} ms" (refused && ms < 2000)
+  for (label, t, host, path, limit) in [
+      ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews", 1664),
+      ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review", 1856)] do
+    for (name, body) in costlyWithin limit do
+      let t0 ← IO.monoMsNow
+      let decided ← IO.lazyPure fun _ =>
+        match choose rr t "POST" host path body (some "application/json") with
+        | .ok c => (c.reason.splitOn "body_truncated").length == 1
+        | .error _ => false
+      let ms := (← IO.monoMsNow) - t0
+      slowest := max slowest ms
+      check s!"{name} within the limit, to {label}: read and decided in {ms} ms" (decided && ms < 2000)
+  for (label, t, host, path, body) in [
+      ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews", bigReview 207),
+      ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review",
+        agentReview 205)] do
+    let t0 ← IO.monoMsNow
+    let allowed ← IO.lazyPure fun _ =>
+      (spentOn (choose rr t "POST" host path body (some "application/json"))).isSome
+    let ms := (← IO.monoMsNow) - t0
+    slowest := max slowest ms
+    check s!"a review at the limit, to {label}: allowed in {ms} ms" (allowed && ms < 2000)
+  check s!"the slowest of them took {slowest} ms" (slowest < 2000)
 
 end KleisTests

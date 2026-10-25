@@ -25,7 +25,7 @@ extensions = ["github", "zulip", "caldav", "mail", "diff-reviewer"]
 # request review with more than a few dozen inline comments, both a job's
 # submission to diff-reviewer and the platform's review on GitHub; this admits
 # the platform's largest, 200 comments.  How many facts a body becomes is each
-# manifest's `max_body_facts` (1280 for GitHub, 1536 for diff-reviewer); a
+# manifest's `max_body_facts` (1664 for GitHub, 1856 for diff-reviewer); a
 # `max_body_facts` here is read, but a manifest's own value is what applies.
 [limits]
 max_decode_prefix = 2097152

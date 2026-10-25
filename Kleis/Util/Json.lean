@@ -1,5 +1,6 @@
 import Kleis.Util.Str
 import LeanBiscuit
+import Std.Data.HashSet
 
 /-!
 # JSON
@@ -9,9 +10,10 @@ the policy layer reasons about, the daemon's control API, and the audit log.
 
 Written here rather than taken from `Lean.Data.Json` for the same reason
 `lean-biscuit` writes its own protobuf: everything the policy layer touches has
-to be pure and total, and the recursion has to be bounded by something the
-input determines.  Here that bound is the length of the source — a value cannot
-nest more deeply than there are characters to open it with.
+to be pure and total, and the recursion has to be bounded.  Here the bound
+is the length of the source for the elements of an array or object, which are
+read one after another, and `parse`'s `maxDepth` for nesting, which is what the
+stack grows with.
 
 Numbers keep their source text.  Biscuit datalog has integers and no floats, so
 a number that is not an integer would have to be rounded or rejected; keeping
@@ -148,16 +150,20 @@ private def number (p : P) : Except String (String × P) :=
 
 mutual
 
-/-- Read any value. -/
-private def value (p : P) (fuel : Nat) : Except String (Json × P) := do
+/-- Read any value. `depth` is how many more arrays and objects may open inside it. -/
+private def value (p : P) (fuel depth : Nat) : Except String (Json × P) := do
   match fuel with
   | 0 => throw "JSON nested too deeply"
   | fuel + 1 =>
     let p := skipWs p
     match peek? p with
     | none => throw "the input ended where a value was expected"
-    | some '{' => object { p with pos := p.pos + 1 } fuel
-    | some '[' => array { p with pos := p.pos + 1 } fuel
+    | some '{' => match depth with
+      | 0 => throw "JSON nested too deeply"
+      | depth + 1 => object { p with pos := p.pos + 1 } fuel depth
+    | some '[' => match depth with
+      | 0 => throw "JSON nested too deeply"
+      | depth + 1 => array { p with pos := p.pos + 1 } fuel depth
     | some '"' => do
       let (s, p) ← stringBody { p with pos := p.pos + 1 }
       pure (.str s, p)
@@ -169,38 +175,38 @@ private def value (p : P) (fuel : Nat) : Except String (Json × P) := do
       pure (.num n, p)
 
 /-- Read the rest of an array, the `[` already consumed. -/
-private def array (p : P) (fuel : Nat) : Except String (Json × P) := do
+private def array (p : P) (fuel depth : Nat) : Except String (Json × P) := do
   let p := skipWs p
   match peek? p with
   | some ']' => pure (.arr [], { p with pos := p.pos + 1 })
   | _ => do
-    let (elems, p) ← arrayItems p fuel []
+    let (elems, p) ← arrayItems p fuel depth []
     pure (.arr elems, p)
 
 /-- Read array elements separated by commas. -/
-private def arrayItems (p : P) (fuel : Nat) (acc : List Json) :
+private def arrayItems (p : P) (fuel depth : Nat) (acc : List Json) :
     Except String (List Json × P) := do
   match fuel with
   | 0 => throw "JSON nested too deeply"
   | fuel + 1 =>
-    let (v, p) ← value p fuel
+    let (v, p) ← value p fuel depth
     let p := skipWs p
     match peek? p with
-    | some ',' => arrayItems { p with pos := p.pos + 1 } fuel (v :: acc)
+    | some ',' => arrayItems { p with pos := p.pos + 1 } fuel depth (v :: acc)
     | some ']' => pure ((v :: acc).reverse, { p with pos := p.pos + 1 })
     | _ => throw s!"expected `,` or `]` at offset {p.pos}"
 
 /-- Read the rest of an object, the `{` already consumed. -/
-private def object (p : P) (fuel : Nat) : Except String (Json × P) := do
+private def object (p : P) (fuel depth : Nat) : Except String (Json × P) := do
   let p := skipWs p
   match peek? p with
   | some '}' => pure (.obj [], { p with pos := p.pos + 1 })
   | _ => do
-    let (fields, p) ← objectFields p fuel []
+    let (fields, p) ← objectFields p fuel depth []
     pure (.obj fields, p)
 
 /-- Read object members separated by commas. -/
-private def objectFields (p : P) (fuel : Nat) (acc : List (String × Json)) :
+private def objectFields (p : P) (fuel depth : Nat) (acc : List (String × Json)) :
     Except String (List (String × Json) × P) := do
   match fuel with
   | 0 => throw "JSON nested too deeply"
@@ -210,19 +216,21 @@ private def objectFields (p : P) (fuel : Nat) (acc : List (String × Json)) :
     let (k, p) ← stringBody p
     let p := skipWs p
     let p ← expect p ':'
-    let (v, p) ← value p fuel
+    let (v, p) ← value p fuel depth
     let p := skipWs p
     match peek? p with
-    | some ',' => objectFields { p with pos := p.pos + 1 } fuel ((k, v) :: acc)
+    | some ',' => objectFields { p with pos := p.pos + 1 } fuel depth ((k, v) :: acc)
     | some '}' => pure (((k, v) :: acc).reverse, { p with pos := p.pos + 1 })
     | _ => throw s!"expected `,` or `}}` at offset {p.pos}"
 
 end
 
-/-- Parse a complete JSON document. -/
-def parse (s : String) : Except String Json := do
+/-- Parse a complete JSON document, refusing one whose arrays and objects nest more than
+`maxDepth` deep: the reader recurses once per level, so the bound on the stack is this and not
+the length of the input. -/
+def parse (s : String) (maxDepth : Nat := 256) : Except String Json := do
   let src := s.toList.toArray
-  let (v, p) ← value ⟨src, 0⟩ (src.size + 1)
+  let (v, p) ← value ⟨src, 0⟩ (src.size + 1) maxDepth
   let p := skipWs p
   if p.pos < p.src.size then throw s!"trailing input at offset {p.pos}" else pure v
 
@@ -236,8 +244,10 @@ that read one while the origin acted on the other would be deciding about a
 request nobody sent.  A body that does this is not one to read at all. -/
 partial def hasDuplicateKeys : Json → Bool
   | .obj fields =>
-    let names := fields.map (·.1)
-    names.length != names.eraseDups.length || fields.any (hasDuplicateKeys ·.2)
+    -- A set, not `eraseDups`: that is quadratic in the keys, and an object can have as many
+    -- keys as its body has room for.
+    let names : Std.HashSet String := fields.foldl (fun s (k, _) => s.insert k) {}
+    names.size != fields.length || fields.any (hasDuplicateKeys ·.2)
   | .arr l => l.any hasDuplicateKeys
   | _ => false
 

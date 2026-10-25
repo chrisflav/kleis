@@ -167,10 +167,13 @@ ref_update($ref) <-
   $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref";
 ```
 
-Flattening is bounded by `maxBodyFacts` (default a few hundred, well under
-biscuit's `maxFacts`). Exceeding it emits `body_truncated(true)` and *nothing
-else from the body*, and the authorizer refuses on that fact (§4.2): a body too
-big to reason about is a refusal rather than a blind spot.
+Flattening is bounded by `maxBodyFacts` (default a few hundred), which counts
+every fact it would emit — one per scalar, two per array or object, so empty
+containers are not free — and by a nesting depth of 64. Exceeding either emits
+`body_truncated(true)` and *nothing else from the body*, not even the whole-body
+term, and the authorizer refuses on that fact (§4.2): a body too big to reason
+about is a refusal rather than a blind spot. The authorizer's `maxFacts` is
+sized from the manifest's `maxBodyFacts`, so a body within it always fits.
 
 A body has three states, not two, and the third was learned the hard way:
 
