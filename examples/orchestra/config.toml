@@ -20,6 +20,16 @@ passthrough = ["*"]
 # manifest comes from the extension; do not also copy github.toml into services/.
 extensions = ["github", "zulip", "caldav", "mail", "diff-reviewer"]
 
+# How much of a request body any manifest may have read: the smaller of this and
+# the manifest's own `max_decode_prefix`.  The default, 64 KiB, refuses a pull
+# request review with more than a few dozen inline comments, both a job's
+# submission to diff-reviewer and the platform's review on GitHub; this admits
+# some 500 comments, about 2 MiB.  How many facts a body becomes is each
+# manifest's `max_body_facts` (4096 for GitHub and diff-reviewer); a
+# `max_body_facts` here is read, but a manifest's own value is what applies.
+[limits]
+max_decode_prefix = 4194304
+
 # The orchestrator makes a token per job: through /.kleis/v1/derive from one of
 # the specs below (specs/*.kleis), or through /.kleis/v1/tokens naming grants.  It
 # may name only these grants and specs, state only `task_*` facts, and ask for at

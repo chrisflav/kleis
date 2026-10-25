@@ -91,9 +91,12 @@ Then add a `kleis` block to orchestra's `config.json`; see orchestra's
 requests with agents and posts what its operator approves.  It queues a job on
 orchestra per pull request, as an API client; the agent reads the job and the
 diff from the platform and submits its review there, with the
-`diff-reviewer agent` command.  The platform posts the approved review to
-GitHub as Christian.  Two specs, and the agent token and the PAT are not
-interchangeable:
+`diff-reviewer agent` command.  The platform posts reviews to GitHub as
+Christian: for a repository in `direct` mode it posts a submission at once, as
+a COMMENT review only, and an approving or change-requesting review only when
+a person clicks Post.  That is enforced by the platform, not by kleis, which
+cannot tell those requests apart and allows every review event.  Two specs,
+and the agent token and the PAT are not interchangeable:
 
 - `specs/reviewer.kleis`, the job's.  On the platform (the `diff-reviewer`
   extension's account): read the job and the diff, and submit a review, only
@@ -102,10 +105,13 @@ interchangeable:
   platform is reachable: no `/api/v1/`, no login.  On GitHub, the grant
   `orchestra-reviewer-github`: clone, fetch and read, GraphQL queries, and no
   write at all — no push, even to the job's fork, no pull request, review,
-  comment or label.
+  comment or label.  Its GraphQL queries go out on the App's token, as a
+  worker's do, so a review job can read whatever the installation can see.
 - `specs/diff-reviewer-poster.kleis`, the platform's own.  On
-  `github/chrisflav`: read the pull requests of the repositories in its list
-  through the REST API, review them and comment on their diffs.  Every request
+  `github/chrisflav`: read the repositories in its list through the REST API,
+  review their pull requests and comment on their diffs.  Reading is every GET
+  and HEAD under a listed repository's `/repos/{owner}/{name}/…` — contents,
+  commits, issues, workflow runs — not only its pull requests.  Every request
   must name a listed repository, so any other repository is refused, and so is
   everything about none — `/user`, `/search`, `/rate_limit`, GraphQL — which
   would reach the rest of what the token can see.  It is not an issuer's spec:
@@ -119,9 +125,11 @@ repository the App is installed on — the upstream counts as its fork, where a
 pull request needs no head from anywhere.  The review grant has no write rule
 to inherit.
 
-```sh
-cp specs/reviewer.kleis specs/diff-reviewer-poster.kleis "$KLEIS_HOME/config/specs/"
+The credentials go in before the specs: a spec naming a credential that is not
+there does not load.  kleisd refuses to start on it, and a running one keeps
+the configuration it had, so copying the specs first only logs a failed reload.
 
+```sh
 # The platform's agent token (its DIFF_REVIEWER_AGENT_TOKEN_FILE), bound to the
 # platform's host; the account the reviewer spec names.
 kleis credential add diff-reviewer/agent --service diff-reviewer \
@@ -129,14 +137,22 @@ kleis credential add diff-reviewer/agent --service diff-reviewer \
 # Christian's token, which approved reviews are posted with.
 printf '%s' "$PAT" | kleis credential add github/chrisflav --service github --secret -
 
+cp specs/reviewer.kleis specs/diff-reviewer-poster.kleis "$KLEIS_HOME/config/specs/"
+
 # The platform's token. It goes in the platform's HTTPS_PROXY
 # (http://kleis:<token>@<kleis>:8080), with `kleis ca` in its CA bundle; its
 # DIFF_REVIEWER_GITHUB_TOKEN_FILE holds the placeholder `kleis`.
 kleis token issue --spec diff-reviewer-poster --bearer diff-reviewer --ttl 90d
 ```
 
-`config.toml` enables the `diff-reviewer` extension and lets the `orchestra`
-issuer derive `reviewer`.  On the orchestra side the platform is an API client,
+`config.toml` enables the `diff-reviewer` extension, lets the `orchestra`
+issuer derive `reviewer`, and raises `[limits] max_decode_prefix` to 4 MiB.
+A body is refused, not relayed unread, when it is larger than the smaller of
+that and its manifest's `max_decode_prefix`, or becomes more facts than the
+manifest's `max_body_facts`.  The GitHub and diff-reviewer manifests set
+4 MiB and 4096, which admits a review of some 500 inline comments, about
+2 MiB; with the default 64 KiB a review of a few dozen comments is refused,
+both a job's submission and the platform's post.  On the orchestra side the platform is an API client,
 `<config>/clients/diff-reviewer.json`, and the client names the spec:
 
 ```json
@@ -147,7 +163,9 @@ issuer derive `reviewer`.  On the orchestra side the platform is an API client,
 Each job the platform queues carries `upstream` and `issue_number`, which
 orchestra states as `task_upstream` and `task_issue`; the sandbox gets
 `~/.config/diff-reviewer/agent.json` from `/.kleis/v1/setup`, with the
-placeholder token `kleis`.  The repositories are in three places that must
+placeholder token `kleis`.  Its `url` is `https://` and the account's host,
+with no port: an account's hosts are names, so the platform has to be served
+on 443.  The repositories are in three places that must
 agree: the platform's registered repositories, the client's
 `queue_policy.repos`, and the list in `diff-reviewer-poster.kleis`
 (`reviewed([...])`), which kleis rereads when it changes.
@@ -175,3 +193,5 @@ agree: the platform's registered repositories, the client's
 - **The poster's list** is matched exactly: `reviewed(["chrisflav/kleis"])`
   does not admit `/repos/ChrisFlav/kleis`, which GitHub would.  That refuses;
   it never admits more.
+- **Large bodies are slow to decide.**  A body at the GitHub manifest's 4096
+  facts takes some four seconds to decide, and any GitHub bearer may send one.

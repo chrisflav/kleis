@@ -197,7 +197,12 @@ def assemble (i : Input) : AuthorizerBuilder :=
                        scopes := [] }],
          kind := .deny }]
     externs := standard
-    limits := {} }
+    -- Room for the body the manifest lets through: up to `max_body_facts` leaves and
+    -- two facts per container, beside the request's own. Biscuit's default of 1000
+    -- would refuse a body well inside a manifest's `max_body_facts` — a pull request
+    -- review with a few hundred inline comments — as "too many facts". A body of
+    -- empty containers, which cost no leaves, still meets this limit and is refused.
+    limits := { maxFacts := 1000 + 3 * i.manifest.maxBodyFacts } }
 
 /-- The credentials the evaluation derived with `use_credential(name)`, from
 facts whose every origin is trusted: the authorizer — grant and manifest — and

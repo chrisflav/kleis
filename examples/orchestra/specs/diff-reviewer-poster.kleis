@@ -1,7 +1,15 @@
 # What the diff-reviewer platform itself may do on GitHub, as Christian: list and read the pull
-# requests of the repositories it reviews, and post the reviews its operator approved. It is not
-# an orchestra task: its token is issued by hand and held by the platform process, which sends
+# requests of the repositories it reviews, and post reviews of them. It is not an orchestra task:
+# its token is issued by hand and held by the platform process, which sends
 # `Authorization: Bearer kleis` to api.github.com through this proxy.
+#
+# Which reviews: for a repository in `direct` mode the platform posts a job's submission at once,
+# as COMMENT only; APPROVE and REQUEST_CHANGES it posts only when a person clicks Post. kleis
+# allows every review event, because it cannot tell the second request from the first: that rule
+# is enforced by the platform, not here.
+#
+# `read` is every GET and HEAD under a listed repository's /repos/{owner}/{name}/…: contents,
+# commits, issues, workflow runs, whatever the token can read there, not only pull requests.
 #
 # The repositories are the one list below, kept by the operator. Every request must name one of
 # them: one about any other repository is refused, and so is one about none (`/user`, `/search`,

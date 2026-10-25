@@ -16,8 +16,13 @@ name  = "github"
 hosts = ["github.com", "api.github.com", "codeload.github.com"]
 modes = ["rewrite", "connect"]
 
-max_body_facts   = 512
-max_decode_prefix = 1048576
+# How much of a body is read, and into how many facts. A body past either is
+# refused, not relayed unread. Sized for a pull request review of some 500 inline
+# comments, about 2 MiB: one fact per scalar, five or so per comment.  The
+# daemon's own `[limits] max_decode_prefix` (64 KiB unless set) also bounds the
+# first, whichever is smaller.  Deciding on a body this large takes seconds.
+max_body_facts    = 4096
+max_decode_prefix = 4194304
 
 # What a request is about, for routing credentials (a grant's `credential_route`):
 # `owner/repo`, the repository being created, or the organisation.

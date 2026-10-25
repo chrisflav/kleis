@@ -144,6 +144,23 @@ private def taskToken (spec : String) (facts : List String)
     1700000000 (fixedKey 9)
   pure t
 
+/-- A review with `n` inline comments, each with a body of `size` bytes: the shape the platform
+posts to GitHub. -/
+private def bigReview (n : Nat) (size : Nat := 3000) : String :=
+  let comment (i : Nat) := "{\"path\":\"Mathlib/Foo/Bar" ++ toString i ++ ".lean\",\"start_line\":" ++
+    toString i ++ ",\"line\":" ++ toString (i + 1) ++ ",\"side\":\"RIGHT\",\"body\":\"" ++
+    String.ofList (List.replicate size 'x') ++ "\"}"
+  "{\"commit_id\":\"abc\",\"event\":\"COMMENT\",\"body\":\"b\",\"comments\":[" ++
+    ",".intercalate ((List.range n).map comment) ++ "]}"
+
+/-- A submission to the platform with `n` inline comments, in the agent API's shape. -/
+private def agentReview (n : Nat) (size : Nat := 3000) : String :=
+  let comment (i : Nat) := "{\"file\":\"Mathlib/Foo/Bar" ++ toString i ++ ".lean\",\"start_line\":" ++
+    toString i ++ ",\"end_line\":" ++ toString (i + 1) ++ ",\"category\":\"style\"," ++
+    "\"severity\":\"minor\",\"body\":\"" ++ String.ofList (List.replicate size 'x') ++ "\"}"
+  "{\"headSha\":\"abc\",\"prType\":null,\"review\":{\"decision\":\"comment\",\"body\":\"b\"," ++
+    "\"comments\":[" ++ ",".intercalate ((List.range n).map comment) ++ "]}}"
+
 def specTests : IO Unit := do
   group "the shipped extensions load and agree with their manifests"
   for (n, h) in [("github", []), ("zulip", ["z.example"]), ("caldav", ["d.example"]), ("mail", []),
@@ -342,6 +359,10 @@ def specTests : IO Unit := do
   checkEq "nor another repository's pull request of that number"
     (dr "GET" "/api/agent/v1/repos/other/proj/pulls/7") none
   checkEq "nor its fork's" (dr "POST" "/api/agent/v1/repos/bot/proj/pulls/7/review" review) none
+  checkEq "nor another repository of its upstream's owner"
+    (dr "POST" "/api/agent/v1/repos/up/other/pulls/7/review" review) none
+  checkEq "a review of 300 comments is submitted"
+    (dr "POST" s!"{own}/review" (agentReview 300)) agentToken
   checkEq "nor the scripts' API" (dr "GET" "/api/v1/jobs") none
   checkEq "nor the login" (dr "POST" "/api/login" "{\"password\": \"x\"}") none
   check "the agent token goes to no other server"
@@ -436,8 +457,20 @@ def specTests : IO Unit := do
     checkEq s!"reads nothing about no repository: {path}" (post "GET" path) none
   checkEq "clones nothing, not even a listed repository"
     (spentOn (choose rr pt "GET" "github.com" "/chrisflav/kleis.git/info/refs?service=git-upload-pack")) none
+  checkEq "posts a review of 300 comments"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" (bigReview 300)) chris
   checkEq "posts no review on a repository not listed"
     (post "POST" "/repos/acme/widgets/pulls/7/reviews" posted) none
+  -- Each of these is a substring of the listed name or contains it, so a list written as a
+  -- string rather than a set would let some through.
+  for repo in ["chrisflav/kleis-fork", "chrisflav/klei", "hrisflav/kleis", "ChrisFlav/kleis",
+               "chrisflav/kleis.git", "chrisflav/kleis/x"] do
+    checkEq s!"nor on {repo}" (post "POST" s!"/repos/{repo}/pulls/7/reviews" posted) none
+  -- No route emits two repositories for one request, so only a world given a second one
+  -- reaches the `reject`: an allowed review, with an unlisted repository beside it.
+  checkEq "a request about an unlisted repository beside a listed one is refused"
+    (spentOn (choose rr pt "POST" "api.github.com" "/repos/chrisflav/kleis/pulls/7/reviews" posted
+      (some "application/json") [Facts.fact "repository" [.str "acme", .str "widgets"]])) none
   checkEq "nor reads one" (post "GET" "/repos/acme/widgets/pulls") none
   checkEq "comments on no issue"
     (post "POST" "/repos/chrisflav/kleis/issues/7/comments" "{\"body\":\"x\"}") none

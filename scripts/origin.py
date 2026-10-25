@@ -108,8 +108,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.split("/")[1:2] in (["orgs"], ["users"], ["app"], ["lookups"]):
             if self._github_app() is None:
                 self._json(404, {"message": "Not Found"})
-        elif self.path.startswith("/echo") or self.path.startswith("/api/"):
-            # `/api/` stands in for an extension's service, the diff-reviewer platform.
+        elif self.path.split("?")[0].split("/")[1:2] in (["echo"], ["api"], ["repos"]):
+            # `/api/` stands in for the diff-reviewer platform, `/repos/` for GitHub's API.
             self._echo(body)
         else:
             self._git(body)
