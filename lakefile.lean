@@ -11,7 +11,7 @@ package kleis where
 -- DESIGN.md are stated over, and a dependency that moved underneath them would
 -- make those statements about something else.
 require «lean-biscuit» from git
-  "https://github.com/chrisflav/lean-biscuit" @ "7fbe9020beebcb1b385ca6d31c8711ffb6361e26"
+  "https://github.com/chrisflav/lean-biscuit" @ "669c5c8961eb10dbc6b61e6567b3c4c0b01004bb"
 
 /-- Compile a C shim under `ffi/` into a static library of the same name. -/
 private def ffiStaticLib (pkg : Package) (name : String) : FetchM (Job System.FilePath) := do
