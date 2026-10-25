@@ -432,7 +432,10 @@ def specTests : IO Unit := do
     (post "POST" "/repos/chrisflav/kleis/pulls/7/comments" "{\"body\":\"c\"}") chris
   checkEq "lists its open pull requests" (post "GET" "/repos/chrisflav/kleis/pulls?state=open") chris
   checkEq "reads one" (post "GET" "/repos/chrisflav/kleis/pulls/7") chris
-  checkEq "reads about no repository" (post "GET" "/rate_limit") chris
+  for path in ["/user", "/user/repos", "/search/issues?q=x", "/rate_limit", "/users/someone"] do
+    checkEq s!"reads nothing about no repository: {path}" (post "GET" path) none
+  checkEq "clones nothing, not even a listed repository"
+    (spentOn (choose rr pt "GET" "github.com" "/chrisflav/kleis.git/info/refs?service=git-upload-pack")) none
   checkEq "posts no review on a repository not listed"
     (post "POST" "/repos/acme/widgets/pulls/7/reviews" posted) none
   checkEq "nor reads one" (post "GET" "/repos/acme/widgets/pulls") none

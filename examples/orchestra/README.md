@@ -104,9 +104,12 @@ interchangeable:
   write at all — no push, even to the job's fork, no pull request, review,
   comment or label.
 - `specs/diff-reviewer-poster.kleis`, the platform's own.  On
-  `github/chrisflav`: read the repositories in its list, review their pull
-  requests and comment on their diffs, and `api_read`.  Any other repository is
-  refused.  It is not an issuer's spec: orchestra cannot derive it.
+  `github/chrisflav`: read the pull requests of the repositories in its list
+  through the REST API, review them and comment on their diffs.  Every request
+  must name a listed repository, so any other repository is refused, and so is
+  everything about none — `/user`, `/search`, `/rate_limit`, GraphQL — which
+  would reach the rest of what the token can see.  It is not an issuer's spec:
+  orchestra cannot derive it.
 
 Why the job does not get `orchestra-github` with `read_only`: that grant takes
 pushing away from a read-only job (`task_writable`), but its other writes turn
