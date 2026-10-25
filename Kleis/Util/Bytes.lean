@@ -34,15 +34,21 @@ def take (b : Bytes) (n : Nat) : Bytes := slice b 0 n
 /-- Everything after the first `n` bytes. -/
 def drop (b : Bytes) (n : Nat) : Bytes := slice b n b.size
 
+/-- Does `b` hold `pre` at offset `at_`?  Compared in place: nothing is copied. -/
+def matchesAt (b : Bytes) (pre : Bytes) (at_ : Nat) : Bool :=
+  let rec go (k : Nat) : Bool :=
+    if h : k < pre.size then b.get! (at_ + k) == pre[k] && go (k + 1) else true
+  termination_by pre.size - k
+  at_ + pre.size ≤ b.size && go 0
+
 /-- Does `b` start with `prefix`? -/
-def startsWith (b : Bytes) (pre : Bytes) : Bool :=
-  pre.size ≤ b.size && (take b pre.size).toList == pre.toList
+def startsWith (b : Bytes) (pre : Bytes) : Bool := matchesAt b pre 0
 
 /-- The index of the first occurrence of `needle` at or after `from`.
 
-Naive search: the needles here are two to four bytes (`\r\n`, `\r\n\r\n`, a
-pkt-line length), so the worst case never arises in practice and a table would
-cost more than it saves. -/
+Naive search, compared in place: the needles here are short (`\r\n`,
+`\r\n\r\n`, a multipart boundary), so it costs the buffer's length times the
+needle's, and a table would cost more than it saves. -/
 def indexOf? (b : Bytes) (needle : Bytes) (from_ : Nat := 0) : Option Nat :=
   if needle.size == 0 then some from_
   else if needle.size > b.size then none
@@ -50,7 +56,7 @@ def indexOf? (b : Bytes) (needle : Bytes) (from_ : Nat := 0) : Option Nat :=
     let last := b.size - needle.size
     let rec go (i : Nat) : Option Nat :=
       if i > last then none
-      else if startsWith (drop b i) needle then some i
+      else if matchesAt b needle i then some i
       else go (i + 1)
     termination_by last + 1 - i
     go from_

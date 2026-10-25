@@ -60,20 +60,50 @@ def splitAtFraming (framing : Http.Framing) (raw : Bytes) : Bytes × Bytes :=
     | _ => (raw, ByteArray.empty)
   | .untilClose => (raw, ByteArray.empty)
 
-/-- Decode the entity bytes available in `raw` under a framing. -/
-private def entityOf (framing : Http.Framing) (raw : Bytes) (limit : Nat) :
-    Except String (Bytes × Bool × Bool) :=
+/-- What has been read of a body so far, kept so that each read costs what it
+brought and no more: the bytes are appended once, the chunked framing is read
+once, and nothing is rescanned from the start. -/
+private structure Progress where
+  /-- The body's bytes as they arrived, framing included, never past its end. -/
+  raw : Bytes := ByteArray.empty
+  /-- What arrived after the end. -/
+  excess : Bytes := ByteArray.empty
+  /-- The chunked framing, read so far. -/
+  chunked : Http.Chunked.Reader := {}
+  /-- Whether the framing has ended. -/
+  ended : Bool := false
+
+/-- Take in the next bytes the client sent. -/
+private def Progress.feed (p : Progress) (framing : Http.Framing) (chunk : Bytes) :
+    Except String Progress := do
+  if p.ended then return { p with excess := p.excess ++ chunk }
   match framing with
-  | .empty => .ok (ByteArray.empty, true, true)
+  | .empty => return { p with ended := true, excess := p.excess ++ chunk }
   | .length n =>
-    let have_ := min raw.size n
-    .ok (Bytes.take raw have_, have_ ≥ n, raw.size ≥ n)
+    let k := min chunk.size (n - min n p.raw.size)
+    let raw := p.raw ++ Bytes.take chunk k
+    return { p with raw, excess := Bytes.drop chunk k, ended := raw.size ≥ n }
   | .chunked =>
-    match Http.Chunked.decode raw limit with
-    | .done body _ complete => .ok (body, complete, complete)
-    | .need => .ok (ByteArray.empty, false, false)
+    match p.chunked.feed chunk with
     | .error e => throw e
-  | .untilClose => .ok (raw, false, false)
+    | .ok (r, some k) =>
+      return { p with raw := p.raw ++ Bytes.take chunk k, excess := Bytes.drop chunk k
+                      chunked := r, ended := true }
+    | .ok (r, none) => return { p with raw := p.raw ++ chunk, chunked := r }
+  | .untilClose => return { p with raw := p.raw ++ chunk }
+
+/-- The entity bytes in hand, and whether they are the whole body. -/
+private def Progress.entity (p : Progress) (framing : Http.Framing) : Bytes × Bool :=
+  match framing with
+  | .empty => (ByteArray.empty, true)
+  | .length _ => (p.raw, p.ended)
+  -- Data let go past the limit means the entity is not the body, ended or not.
+  | .chunked => (p.chunked.entity, p.ended && !p.chunked.overflow)
+  | .untilClose => (p.raw, false)
+
+/-- The most reads one body prefix may take.  A client that sends a byte at a
+time runs out of them, and its body is relayed undecoded. -/
+def maxPrefixReads : Nat := 16384
 
 /-- Read from the client until the decoder is satisfied, the framing ends, or
 the cap is reached.
@@ -81,51 +111,59 @@ the cap is reached.
 `already` is whatever was read past the head while looking for it — a client
 that pipelines the body into the same packet as the request line, which every
 git client does.  Anything past the end of the body is returned as `excess`,
-never as part of the body. -/
+never as part of the body.
+
+The decoder is asked again only once at least what it asked for has arrived, and
+then at least twice what it was last shown, so however small the client's reads
+and however little a decoder asks for at a time, it reads the prefix a bounded
+number of times over: the total is linear in the prefix. -/
 def readBodyPrefix (s : Net.Stream) (framing : Http.Framing) (decoder : Wire.Decoder)
     (already : Bytes) (cap : Nat) :
     IO (BodyPrefix × Option LeanBiscuit.Datalog.Value) := do
   if framing == .empty then return ({ BodyPrefix.empty with excess := already }, none)
-  let rec go (received : Bytes) (fuel : Nat) :
-      IO (BodyPrefix × Option LeanBiscuit.Datalog.Value) := do
-    let (raw, excess) := splitAtFraming framing received
-    let (entity, complete, framingDone) ← match entityOf framing raw cap with
-      | .ok r => pure r
-      | .error e => throw (IO.userError s!"malformed request body: {e}")
-    let seen : BodyPrefix := { raw, entity, complete, framingDone, excess }
-    -- Ask the decoder what it makes of what we have.  An out-of-process
-    -- decoder is only worth starting once, so it waits for the whole prefix.
-    let verdict : Wire.Decoded := match decoder with
-      | .pure d => d.step entity complete
-      | .exec _ _ =>
-        if complete || entity.size ≥ cap then .opaque else .need (entity.size + 1)
-      | .opaque => .opaque
-    match verdict with
-    | .done value _ => return (seen, some value)
-    | .opaque =>
-      match decoder with
-      -- Only a whole body: a decoder run on a prefix cut off at the cap would answer for
-      -- bytes it never saw, and nothing would mark the answer as partial.
-      | .exec command args =>
-        if complete then return (seen, ← Wire.runExec command args entity) else return (seen, none)
-      | _ => return (seen, none)
-    | .need atLeast =>
-      if complete then return (seen, none)
-      if entity.size ≥ cap || raw.size ≥ cap * 2 then
-        -- Past the cap the body is relayed but not understood, and the
-        -- authorizer's truncation guard turns that into a refusal for any
-        -- policy that depended on it.
-        return (seen, none)
-      match fuel with
-      | 0 => return (seen, none)
-      | fuel + 1 => do
-        let want := max 4096 (atLeast - entity.size)
-        let chunk ← s.read (min want 65536)
-        -- A client that goes away mid-body has sent a truncated request, which is
-        -- not one to decide on or forward as if it were whole.
-        if chunk.size == 0 then throw (IO.userError "the client closed mid-body")
-        go (received ++ chunk) fuel
-  go already 4096
+  let malformed (e : String) := IO.userError s!"malformed request body: {e}"
+  let mut p : Progress := { chunked := { limit := cap } }
+  p ← match p.feed framing already with
+    | .ok q => pure q
+    | .error e => throw (malformed e)
+  -- How many entity bytes to have before asking the decoder again.
+  let mut target := 0
+  for _ in [0:maxPrefixReads] do
+    let (entity, complete) := p.entity framing
+    let seen : BodyPrefix := { raw := p.raw, entity, complete, framingDone := p.ended
+                               excess := p.excess }
+    let atCap := entity.size ≥ cap || p.raw.size ≥ cap * 2
+    if complete || atCap || entity.size ≥ target then
+      -- An out-of-process decoder is only worth starting once, so it waits for
+      -- the whole prefix.
+      let verdict : Wire.Decoded := match decoder with
+        | .pure d => d.step entity complete
+        | .exec _ _ => if complete || atCap then .opaque else .need (entity.size + 1)
+        | .opaque => .opaque
+      match verdict with
+      | .done value _ => return (seen, some value)
+      | .opaque =>
+        match decoder with
+        -- Only a whole body: a decoder run on a prefix cut off at the cap would answer
+        -- for bytes it never saw, and nothing would mark the answer as partial.
+        | .exec command args =>
+          if complete then return (seen, ← Wire.runExec command args entity)
+          else return (seen, none)
+        | _ => return (seen, none)
+      | .need atLeast =>
+        -- Past the cap the body is relayed but not understood, and the authorizer's
+        -- truncation guard turns that into a refusal for any policy that depended on it.
+        if complete || atCap then return (seen, none)
+        target := min cap (max atLeast (2 * entity.size))
+    let chunk ← s.read (min 65536 (max 4096 (target - min target entity.size)))
+    -- A client that goes away mid-body has sent a truncated request, which is not one
+    -- to decide on or forward as if it were whole.
+    if chunk.size == 0 then throw (IO.userError "the client closed mid-body")
+    p ← match p.feed framing chunk with
+      | .ok q => pure q
+      | .error e => throw (malformed e)
+  let (entity, complete) := p.entity framing
+  return ({ raw := p.raw, entity, complete, framingDone := p.ended, excess := p.excess }, none)
 
 /-- Relay the rest of a body from one side to the other, returning whatever was
 read past its end.
@@ -153,24 +191,28 @@ def relayBody (from_ to : Net.Stream) (framing : Http.Framing) (sent : BodyPrefi
         goLength (remaining - chunk.size) fuel
     goLength (n - min n sent.raw.size) 1000000
   | .chunked => do
-    let rec goChunked (seen : Bytes) (fuel : Nat) : IO Bytes := do
+    -- Read once, from where the prefix left off, holding no more than a line of the
+    -- framing: the data is let go as it is relayed.
+    let start ← match ({} : Http.Chunked.Reader).feed sent.raw with
+      | .ok (r, none) => pure r
+      | .ok (_, some _) => return ByteArray.empty
+      | .error e => throw (IO.userError s!"malformed chunked body: {e}")
+    let rec goChunked (r : Http.Chunked.Reader) (fuel : Nat) : IO Bytes := do
       match fuel with
       | 0 => throw (IO.userError "the chunked body did not end")
       | fuel + 1 => do
         let chunk ← from_.read 65536
         if chunk.size == 0 then throw (IO.userError "the connection closed mid-body")
-        let all := seen ++ chunk
-        match Http.Chunked.scan all with
-        | .done consumed =>
+        match r.feed chunk with
+        | .ok (_, some upTo) =>
           -- The body ends inside this read: relay up to the end and no further.
-          let upTo := consumed - seen.size
           to.write (Bytes.take chunk upTo)
           return Bytes.drop chunk upTo
         | .error e => throw (IO.userError s!"malformed chunked body: {e}")
-        | .need =>
+        | .ok (r, none) =>
           to.write chunk
-          goChunked all fuel
-    goChunked sent.raw 1000000
+          goChunked r fuel
+    goChunked start 1000000
   | .untilClose => do
     let rec goClose (fuel : Nat) : IO Bytes := do
       match fuel with

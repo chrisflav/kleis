@@ -175,6 +175,18 @@ term, and the authorizer refuses on that fact (§4.2): a body too big to reason
 about is a refusal rather than a blind spot. The authorizer's `maxFacts` is
 sized from the manifest's `maxBodyFacts`, so a body within it always fits.
 
+Every step before that is linear in the bytes, because a bearer chooses them.
+The body is read as it arrives, once: chunked framing by a reader that carries
+its place from one read to the next and holds no more than a line of it, and the
+decoder asked again only when at least what it wanted has arrived and at least
+twice what it last saw, so a client sending a byte at a time, or a decoder
+asking for a little more each time, costs a bounded number of passes over the
+prefix (and a client out of `maxPrefixReads` reads is relayed undecoded). JSON
+nests at most 128 deep in the reader and long numbers stay text; form names are
+grouped in a map; GraphQL and multipart are read without rescanning. What is
+left superlinear is the datalog engine itself, in the number of facts — which
+`maxBodyFacts` bounds.
+
 A body has three states, not two, and the third was learned the hard way:
 
 | Facts | Meaning |

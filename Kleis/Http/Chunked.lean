@@ -112,6 +112,106 @@ private def decodeFrom (buf : Bytes) (limit : Nat) : Nat → Bytes → Nat → D
 def decode (buf : Bytes) (limit : Nat) : Decoded :=
   decodeFrom buf limit 0 ByteArray.empty (buf.size + 1)
 
+/-! ## Reading as the bytes arrive
+
+`scan` and `decode` start from the beginning of their buffer, which is right for
+a buffer that is whole and wrong for one that grows a read at a time: asked
+again after every read, they cost the square of the body.  A `Reader` carries
+where it is from one read to the next instead, so each byte is looked at once,
+and it holds no more than one header or trailer line of the framing — the data
+it either keeps, up to a limit, or lets go. -/
+
+/-- Where a reader is in the framing. -/
+inductive Phase where
+  /-- In a chunk-size line, this much of it seen. -/
+  | size (line : Bytes)
+  /-- In a chunk's data, this many bytes of it still to come. -/
+  | data (left : Nat)
+  /-- In the two bytes after a chunk's data, this many still to come. -/
+  | gap (left : Nat)
+  /-- In the trailer section: the current line so far, and how many more lines it may have. -/
+  | trailer (line : Bytes) (left : Nat)
+  /-- Past the end. -/
+  | finished
+  deriving Inhabited
+
+/-- A chunked body being read. -/
+structure Reader where
+  /-- Where it is. -/
+  phase : Phase := .size ByteArray.empty
+  /-- The entity bytes kept so far: the data of each chunk, up to `limit`. -/
+  entity : Bytes := ByteArray.empty
+  /-- How many entity bytes to keep. -/
+  limit : Nat := 0
+  /-- Whether data past `limit` was let go, so that `entity` is not the whole body. -/
+  overflow : Bool := false
+  deriving Inhabited
+
+/-- Is the body over? -/
+def Reader.finished (r : Reader) : Bool :=
+  match r.phase with
+  | .finished => true
+  | _ => false
+
+/-- Read a chunk-size line: the size, with any extension after `;` ignored. -/
+private def sizeOf? (line : Bytes) : Option Nat :=
+  let text := Bytes.toStringLossy line
+  Str.ofHex? (Str.trim ((text.splitOn ";").headD text))
+
+/-- Feed the reader the next bytes. On the end of the body, also the number of
+these bytes that belonged to it: the rest are whatever the client sent next. -/
+def Reader.feed (r : Reader) (buf : Bytes) : Except String (Reader × Option Nat) := do
+  let mut r := r
+  let mut i := 0
+  -- Each pass consumes at least one byte, or ends.
+  for _ in [0:buf.size + 1] do
+    if i ≥ buf.size then break
+    match r.phase with
+    | .finished => break
+    | .data left =>
+      let n := min left (buf.size - i)
+      let keep := min n (r.limit - min r.limit r.entity.size)
+      if keep > 0 then r := { r with entity := r.entity ++ Bytes.slice buf i (i + keep) }
+      if keep < n then r := { r with overflow := true }
+      i := i + n
+      r := { r with phase := if left == n then .gap 2 else .data (left - n) }
+    | .gap left =>
+      let n := min left (buf.size - i)
+      i := i + n
+      r := { r with phase := if left == n then .size ByteArray.empty else .gap (left - n) }
+    | .size line =>
+      match Bytes.indexOfByte? buf 10 i with
+      | none =>
+        let line := line ++ Bytes.drop buf i
+        if line.size > maxChunkLine then throw "chunk size line too long"
+        r := { r with phase := .size line }
+        i := buf.size
+      | some nl =>
+        let line := line ++ Bytes.slice buf i nl
+        if line.size > maxChunkLine then throw "chunk size line too long"
+        i := nl + 1
+        match sizeOf? line with
+        | none => throw "malformed chunk size line"
+        | some 0 => r := { r with phase := .trailer ByteArray.empty maxTrailers }
+        | some n => r := { r with phase := .data n }
+    | .trailer line left =>
+      match Bytes.indexOfByte? buf 10 i with
+      | none =>
+        let line := line ++ Bytes.drop buf i
+        if line.size > maxChunkLine then throw "trailer line too long"
+        r := { r with phase := .trailer line left }
+        i := buf.size
+      | some nl =>
+        let line := line ++ Bytes.slice buf i nl
+        if line.size > maxChunkLine then throw "trailer line too long"
+        i := nl + 1
+        if (Bytes.trim line).size == 0 then
+          return ({ r with phase := .finished }, some i)
+        match left with
+        | 0 => throw "too many trailer fields"
+        | left + 1 => r := { r with phase := .trailer ByteArray.empty left }
+  return (r, if r.finished then some i else none)
+
 /-- Frame a payload as a single chunk followed by the terminator. -/
 def encodeAll (body : Bytes) : Bytes :=
   if body.size == 0 then Bytes.ofString "0\r\n\r\n"

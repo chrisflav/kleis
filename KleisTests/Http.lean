@@ -80,6 +80,44 @@ def httpTests : IO Unit := do
     check "and says it is not complete" (!complete)
   | _ => check "a chunked body decodes to a limit" false
 
+  group "chunked, read as it arrives"
+  -- Fed in pieces of every size, the reader agrees with `decode` and `scan`.
+  let feedAll (r : Http.Chunked.Reader) (data : Bytes) (piece : Nat) :
+      Except String (Http.Chunked.Reader × Option Nat) := do
+    let mut r := r
+    let mut i := 0
+    for _ in [0:data.size + 1] do
+      if i ≥ data.size then break
+      let chunk := Kleis.Bytes.slice data i (i + piece)
+      let (r', ended) ← r.feed chunk
+      r := r'
+      if let some k := ended then return (r, some (i + k))
+      i := i + chunk.size
+    return (r, none)
+  let trailing := body ++ Bytes.ofString "GET / HTTP/1.1\r\n"
+  for piece in [1, 2, 3, 7, 1000] do
+    match feedAll { limit := 1000 } trailing piece with
+    | .ok (r, some n) =>
+      checkEq s!"pieces of {piece}: the entity" (Kleis.Bytes.toStringLossy r.entity) "hello world"
+      checkEq s!"pieces of {piece}: where the body ends" n body.size
+      check s!"pieces of {piece}: nothing let go" (!r.overflow)
+    | _ => check s!"pieces of {piece}: the body is read to its end" false
+  match feedAll { limit := 3 } body 1 with
+  | .ok (r, some _) =>
+    checkEq "past the limit the data is let go" r.entity.size 3
+    check "and it says so" r.overflow
+  | _ => check "a body past the limit is still read to its end" false
+  match feedAll {} (Bytes.ofString "5\r\nhel") 1 with
+  | .ok (_, none) => check "a partial body asks for more" true
+  | _ => check "a partial body asks for more" false
+  check "a size line that is not hex is refused"
+    (({} : Http.Chunked.Reader).feed (Bytes.ofString "zz\r\n")).toOption.isNone
+  check "so is one too long"
+    (({} : Http.Chunked.Reader).feed (Bytes.ofString (String.ofList (List.replicate 9000 '0')))).toOption.isNone
+  match feedAll {} (Bytes.ofString "0\r\nx-a: 1\r\nx-b: 2\r\n\r\n") 1 with
+  | .ok (_, some n) => checkEq "trailers are read to the empty line" n 21
+  | _ => check "trailers are read to the empty line" false
+
   group "http writing"
   let out := Http.simpleResponse 403 "text/plain" "no\n"
   let text := Kleis.Bytes.toStringLossy out

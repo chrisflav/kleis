@@ -569,4 +569,95 @@ def specTests : IO Unit := do
     check s!"a review at the limit, to {label}: allowed in {ms} ms" (allowed && ms < 2000)
   check s!"the slowest of them took {slowest} ms" (slowest < 2000)
 
+  group "every shape, read, decoded and decided in time"
+  -- What a bearer can make kleis do with one body, at the default prefix and at the
+  -- example's 2 MiB: read it, a few bytes at a time, decode it, and decide on it.  The
+  -- bounds are generous for CI; what was measured is in the manifests' comments.
+  let rep (n : Nat) (t : String) : String := String.join (List.replicate n t)
+  let oid := String.ofList (List.replicate 40 'a')
+  let shapes (n : Nat) : List (String × String × String × String × Option String) :=
+    let api := "api.github.com"
+    let keys := (List.range (n / 9)).map fun i => "\"k" ++ toString i ++ "\":0"
+    let width := n / 60 / 8
+    let level := ",".intercalate ((List.range width).map fun i => "\"a" ++ toString i ++ "\":1")
+    [("digits", api, "/repos/up/proj/forks", "[" ++ rep (n - 2) "7" ++ "]", some "application/json"),
+     ("floats", api, "/repos/up/proj/forks", "[" ++ ",".intercalate (List.replicate (n / 9) "1.5e-300") ++ "]",
+       some "application/json"),
+     ("\\u escapes", api, "/repos/up/proj/forks", "[\"" ++ rep ((n - 4) / 6) "\\u00e9" ++ "\"]",
+       some "application/json"),
+     ("surrogate pairs", api, "/repos/up/proj/forks", "[\"" ++ rep ((n - 4) / 12) "\\ud83d\\ude00" ++ "\"]",
+       some "application/json"),
+     ("a long string", api, "/repos/up/proj/forks", "[\"" ++ rep (n - 4) "x" ++ "\"]", some "application/json"),
+     ("non-ASCII", api, "/repos/up/proj/forks", "[\"" ++ rep ((n - 4) / 4) "😀" ++ "\"]", some "application/json"),
+     ("many keys", api, "/repos/up/proj/forks", "{" ++ ",".intercalate keys ++ "}", some "application/json"),
+     ("one key repeated", api, "/repos/up/proj/forks", "{" ++ ",".intercalate (List.replicate (n / 6) "\"k\":0") ++ "}",
+       some "application/json"),
+     ("wide and 60 deep", api, "/repos/up/proj/forks", rep 60 ("{" ++ level ++ ",\"z\":") ++ "1" ++ rep 60 "}",
+       some "application/json"),
+     ("form, distinct names", "github.com", "/up/proj/x",
+       "&".intercalate ((List.range (n / 8)).map fun i => "k" ++ toString i ++ "=v"),
+       some "application/x-www-form-urlencoded"),
+     ("form, one name", "github.com", "/up/proj/x", rep (n / 4) "k=v&", some "application/x-www-form-urlencoded"),
+     ("form, escapes", "github.com", "/up/proj/x", "k=" ++ rep (n / 3) "%41", some "application/x-www-form-urlencoded"),
+     ("multipart", "github.com", "/up/proj/x",
+       "--bb\r\n" ++ rep (n / 50) "content-disposition: form-data; name=\"x\"\r\n\r\nv\r\n--bb\r\n",
+       some "multipart/form-data"),
+     ("multipart, long boundary", "github.com", "/up/proj/x", "--" ++ rep (n / 2) "b" ++ "\r\n" ++ rep (n / 2 - 4) "b",
+       some "multipart/form-data"),
+     ("GraphQL, many operations", api, "/graphql", "{\"query\":\"" ++ rep (n / 12) "query{a{b}} " ++ "\"}",
+       some "application/json"),
+     ("GraphQL, deep", api, "/graphql", "{\"query\":\"query" ++ rep (n / 2 - 20) "{" ++ rep (n / 2 - 20) "}" ++ "\"}",
+       some "application/json"),
+     ("GraphQL, strings", api, "/graphql", "{\"query\":\"query{a(x:" ++ rep (n / 4) "\\\"\\\"" ++ ")}\"}",
+       some "application/json"),
+     ("GraphQL, comments", api, "/graphql", "{\"query\":\"" ++ rep (n / 4) "#\\r\\n" ++ "query{a}\"}",
+       some "application/json"),
+     ("push, many updates", "github.com", "/up/proj.git/git-receive-pack",
+       Bytes.toStringLossy (pushBody ((List.range (n / 100)).map fun i =>
+         (String.ofList (List.replicate 40 '0'), "refs/heads/b" ++ toString i))),
+       some "application/x-git-receive-pack-request"),
+     ("push, tiny lines", "github.com", "/up/proj.git/git-receive-pack", rep (n / 5) "0005x" ++ "0000",
+       some "application/x-git-receive-pack-request"),
+     ("fetch, many wants", "github.com", "/up/proj.git/git-upload-pack",
+       rep (n / 50) ("0032want " ++ oid ++ "\n") ++ "0000", some "application/x-git-upload-pack-request"),
+     ("fetch v2, many arguments", "github.com", "/up/proj.git/git-upload-pack",
+       "0014command=fetch\n" ++ rep (n / 50) ("0032want " ++ oid ++ "\n") ++ "0000",
+       some "application/x-git-upload-pack-request"),
+     ("the platform, a form", "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review",
+       "&".intercalate ((List.range (n / 8)).map fun i => "k" ++ toString i ++ "=v"),
+       some "application/x-www-form-urlencoded")]
+  for (n, bound) in [(65536, 250), (2097152, 2000)] do
+    for (name, host, path, body, ct) in shapes n do
+      let t0 ← IO.monoMsNow
+      let decided ← IO.lazyPure fun _ =>
+        match choose rr rt "POST" host path body ct with
+        | .ok _ => true
+        | .error _ => false
+      let ms := (← IO.monoMsNow) - t0
+      check s!"{name}, {n} bytes: decided in {ms} ms" (decided && ms < bound)
+  -- Reading: the bytes arrive a few at a time, and the decoder is asked as they do.
+  let feed (data : Bytes) (piece : Nat) : IO Net.Stream := do
+    let pos ← IO.mkRef 0
+    pure { read := fun _ => do
+             let p ← pos.get
+             let e := min data.size (p + piece)
+             pos.set e
+             pure (data.extract p e)
+           write := fun _ => pure (), close := pure (), describe := "test" }
+  for (n, bound) in [(65536, 250), (2097152, 2000)] do
+    let chunked := Bytes.ofString (rep (n / 6) "1\r\nx\r\n" ++ "0\r\n\r\n")
+    let pkts := Bytes.ofString (rep (n / 5) "0005x")
+    for (name, data, framing, decoder, piece) in [
+        ("chunked JSON, 1-byte chunks, 32-byte reads", chunked, Http.Framing.chunked,
+          Wire.Decoder.pure Wire.jsonDecoder, 32),
+        ("chunked JSON, 1-byte chunks, 64 KiB reads", chunked, .chunked, .pure Wire.jsonDecoder, 65536),
+        ("push without a flush, 16-byte reads", pkts, .length pkts.size, .pure Wire.gitReceivePackDecoder, 16),
+        ("push without a flush, 512-byte reads", pkts, .length pkts.size,
+          .pure Wire.gitReceivePackDecoder, 512)] do
+      let stream ← feed data piece
+      let t0 ← IO.monoMsNow
+      let _ ← Proxy.readBodyPrefix stream framing decoder ByteArray.empty n
+      let ms := (← IO.monoMsNow) - t0
+      check s!"{name}, {n} bytes: read in {ms} ms" (ms < bound)
+
 end KleisTests

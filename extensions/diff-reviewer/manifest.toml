@@ -17,15 +17,17 @@
 name  = "diff-reviewer"
 modes = ["connect"]
 
-# Nothing here reads a body, and no decoder is bound to one. A body labelled
-# JSON is decoded by its media type all the same, and one past either limit is
-# refused, so these admit the largest review the platform takes: 200 inline
-# comments, at nine facts each (file, start_line, end_line, body, suggestion,
-# category, severity, and two for the comment itself) and up to some 10 KiB of
-# text.  The daemon's own `[limits] max_decode_prefix` (64 KiB unless set) also
-# bounds the first.  Measured worst cases, bodies built for it of every shape
-# (deep, wide, empty containers, many keys, scalars): up to 0.2 s for one within
-# these limits, up to 0.5 s for one of 2 MiB refused as past them.
+# No rule here reads a body, but every one is read as JSON, whatever its media
+# type: unbound, a body labelled as a form or as multipart would be decoded by
+# that label instead, by a decoder nobody chose for this service.  A body that is
+# not JSON is undecodable and refused.  One past either limit is refused too, so
+# these admit the largest review the platform takes: 200 inline comments, at
+# nine facts each (file, start_line, end_line, body, suggestion, category,
+# severity, and two for the comment itself) and up to some 10 KiB of text.  The
+# daemon's own `[limits] max_decode_prefix` (64 KiB unless set) also bounds the
+# first.  Measured worst cases, for the whole path over bodies built for it of
+# every shape: 2 MiB, under 0.75 s; 64 KiB, under 65 ms, except that a body near
+# `max_body_facts` takes up to 0.15 s to decide whatever its size.
 max_body_facts    = 1856
 max_decode_prefix = 2097152
 
@@ -37,6 +39,11 @@ strip    = ["cookie"]
 kind     = "header"
 name     = "Authorization"
 template = "Bearer {{secret}}"
+
+[[decoder]]
+media   = ["*"]
+decoder = "json"
+match   = "POST|PUT|PATCH|DELETE * /{rest*}"
 
 # ---------------------------------------------------------------- reading
 

@@ -1,4 +1,5 @@
 import Kleis.Wire.Decoder
+import Std.Data.HashMap
 
 /-!
 # Form decoders
@@ -22,10 +23,16 @@ open LeanBiscuit.Datalog (Value ValueKey)
 /-- Group repeated names, keeping order.  A name seen once maps to its value; a
 name seen more than once maps to the array of its values. -/
 private def groupPairs (pairs : List (String × String)) : Value :=
-  let names := pairs.foldl (init := ([] : List String)) fun acc (k, _) =>
-    if acc.contains k then acc else acc ++ [k]
-  .map (names.map fun n =>
-    let vs := (pairs.filter fun (k, _) => k == n).map (·.2)
+  -- One pass, with a map from each name to its values (reversed): a list searched per
+  -- name would cost the square of the number of names.
+  let (order, values) := pairs.foldl
+    (init := ((#[] : Array String), (∅ : Std.HashMap String (List String))))
+    fun (order, values) (k, v) =>
+      match values[k]? with
+      | some vs => (order, values.insert k (v :: vs))
+      | none => (order.push k, values.insert k [v])
+  .map (order.toList.map fun n =>
+    let vs := (values.getD n []).reverse
     (ValueKey.str n, match vs with
       | [v] => Value.str v
       | _ => Value.array (vs.map Value.str)))
@@ -100,7 +107,9 @@ def multipartDecoder : PureDecoder where
     | none => .need (buf.size + 1)
     | some j =>
       let sep := Bytes.take buf j
-      if sep.size < 3 then .opaque
+      -- A boundary is at most 70 characters (RFC 2046), and searching for a longer one
+      -- would cost its length at every byte of the body.
+      if sep.size < 3 || sep.size > 72 then .opaque
       else
         let parts := multipartParts buf sep 0 256 []
         .done (.map [(.str "parts", .array parts),

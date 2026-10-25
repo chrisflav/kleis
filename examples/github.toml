@@ -22,9 +22,11 @@ modes = ["rewrite", "connect"]
 # start_side, body — a suggestion is in the body — and two for the comment
 # itself), and up to some 10 KiB of text.  The daemon's own `[limits]
 # max_decode_prefix` (64 KiB unless set) also bounds the first, whichever is
-# smaller.  Measured worst cases, bodies built for it of every shape (deep,
-# wide, empty containers, many keys, scalars, ref updates): up to 0.2 s for one
-# within these limits, up to 0.5 s for one of 2 MiB refused as past them.
+# smaller.  Measured worst cases for the whole path — reading, a few bytes at a
+# time, decoding and deciding — over bodies built for it of every shape (JSON,
+# forms, multipart, GraphQL, git, chunked framing): 2 MiB, under 0.75 s; 64 KiB,
+# under 65 ms, except that a body near `max_body_facts` takes up to 0.15 s to
+# decide whatever its size: that is the datalog engine, and grows with the limit.
 max_body_facts    = 1664
 max_decode_prefix = 2097152
 

@@ -334,7 +334,8 @@ def arr? (j : Json) (k : String) : List Json := (j.field? k >>= asArray?).getD [
 
 open LeanBiscuit.Datalog
 
-/-! A number that is not an integer becomes its source text as a string:
+/-! A number that is not an integer, or not one biscuit can hold, becomes its source text as a
+string:
 biscuit datalog has no floating point type, and rounding a price or a version
 into an integer would be a silent lie in a policy decision.  A rule that wants
 to compare such a field has the text and can say so. -/
@@ -345,8 +346,10 @@ mutual
 def toValue : Json → Value
   | .null => .null
   | .bool b => .bool b
-  | .num n => match n.toInt? with
-    | some i => .integer i
+  -- Biscuit's integers are 64-bit: a number outside that range, or one too long to be an
+  -- integer at all, is kept as its text, which is also not worth the cost of reading.
+  | .num n => match (if n.length ≤ 20 then n.toInt? else none) with
+    | some i => if -9223372036854775808 ≤ i && i ≤ 9223372036854775807 then .integer i else .str n
     | none => .str n
   | .str s => .str s
   | .arr l => .array (toValueList l)
