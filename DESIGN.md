@@ -183,10 +183,22 @@ twice what it last saw, so a client sending a byte at a time, or a decoder
 asking for a little more each time, costs a bounded number of passes over the
 prefix. A client out of `maxPrefixReads` (16384) reads — one writing a large
 body in pieces of under about 128 bytes — is relayed undecoded, and so refused
-by any grant reading the body. The chunked framing is read strictly: CRLF ends
-every line and follows every chunk's data. A request or response head is
-searched once as it arrives, from where the last search stopped, and parsed
-once it has ended. JSON nests at most 128 deep in the reader and long numbers
+by any grant reading the body. A request or response head is searched once as
+it arrives, from where the last search stopped, and parsed once it has ended.
+
+The framing is read strictly, so that where a message ends never depends on how
+its bytes arrived or on which reading a downstream server prefers. A head's lines
+end in CRLF and nothing else: a bare LF or a bare CR is refused, and only
+`CRLF CRLF` ends it. A chunk size is one to sixteen hexadecimal digits, with no
+space around it, optionally followed by `;` and an extension of no control
+characters; CRLF ends every size and trailer line and follows every chunk's data;
+a trailer is a `name:value` field, and the section ends at an exactly empty line
+— a line of spaces is neither. And a chunked request body is not forwarded as it
+arrived: kleis writes it again (`Chunked.Reader.emitted`), one chunk per run of
+data in its own size lines, no extension, and a bare terminator. Trailers are
+read, checked and dropped: no policy decides on them, so sending them on would
+put fields past the grant that it never saw, and a server that read them
+differently from kleis would be reading a request kleis did not decide on. JSON nests at most 128 deep in the reader and long numbers
 stay text; a form stops at 4096 pairs; GraphQL and multipart are read without
 rescanning. What is left superlinear is the datalog engine itself, in the number
 of facts — which `maxBodyFacts` bounds: a body near that limit takes up to about
@@ -301,14 +313,23 @@ something its parent would not (§10.3).
 
 ### The guards the authorizer adds
 
-Two **checks**, not policies. A check is order-independent — it must pass
+Three **checks**, not policies. A check is order-independent — it must pass
 whichever `allow` matched — whereas a policy appended after the grant's would
 never be reached once an earlier `allow` had matched:
 
 ```
 check if body_truncated(false);     // a body too large to flatten
 check if body_undecodable(false);   // a body a configured decoder could not read
+reject if operation("unrouted");    // a request no route of the manifest matches
 ```
+
+`operation("unrouted")` is what a request to a managed service gets when no route
+of its manifest matches; no manifest may emit it. It is there so that a request is
+never without an operation: a narrowing (`reject if request_service("github"),
+operation($op), !["fetch"].contains($op)`) has something to reject, where a
+request with no `operation` fact at all would have passed it. And it is refused
+outright, so a grant that tests only facts every request has cannot allow, by
+not mentioning it, a request nobody has said the meaning of.
 
 And one policy, appended last, so that a grant whose policies all fail to match
 denies rather than falling through:

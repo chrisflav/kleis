@@ -9,7 +9,7 @@
 #
 # What it covers: every read, issues created, edited and deleted, comments, artifacts — a claim is
 # a `session` artifact, an attached pull request a `github-pr` one, a context note a `context` one
-# — and labels. A request no route matches gets no `operation` fact and is refused.
+# — and labels. A request no route matches gets `operation("unrouted")` and is refused.
 #
 # Note on TOML: a key written after a `[[route]]` header belongs to *that* table.
 

@@ -11,7 +11,7 @@
 #
 # What it covers: every read (`GET`), sending, editing and reacting to messages, read flags,
 # typing notifications, uploads, and the event queue a client long-polls. A request no route
-# matches gets no `operation` fact and is refused by a grant that requires one -- that is where
+# matches gets `operation("unrouted")` and is refused whatever the grant -- that is where
 # account, organisation and stream administration, `fetch_api_key` and the session-only `/json/`
 # endpoints go.
 #

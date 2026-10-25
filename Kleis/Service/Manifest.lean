@@ -219,6 +219,13 @@ private def datalogOf (source : String) : Except String (List Builder.Fact × Li
       throw "a manifest may not derive `use_credential`; only a grant chooses a credential"
     else .ok (r.facts, r.rules)
 
+/-- The operation of a request to a service that no route of its manifest matches.  No
+manifest may emit it, so it means exactly that, and the authorizer refuses it. -/
+def unroutedOperation : String := "unrouted"
+
+/-- `operation("unrouted")`. -/
+def unroutedFact : Builder.Fact := ⟨⟨"operation", [.str unroutedOperation]⟩⟩
+
 /-- Read a manifest from TOML source. -/
 def Manifest.ofToml (source : String) (dynamicHosts : Option (List String) := none) :
     Except String Manifest := do
@@ -252,6 +259,13 @@ def Manifest.ofToml (source : String) (dynamicHosts : Option (List String) := no
     if !hosts.contains h then
       throw s!"the credential is bound to `{h}`, which the manifest does not claim"
   let routes ← (j.arr? "route").mapM routeOf
+  for rt in routes do
+    for f in rt.emit do
+      let reserved := match f.predicate.terms with
+        | [.str o] => o == unroutedOperation
+        | _ => false
+      if f.predicate.name == "operation" && reserved then
+        throw s!"`operation(\"{unroutedOperation}\")` is reserved for a request no route matches"
   let (facts, rules) ← datalogOf ((j.str? "datalog").getD "")
   let decoders ← (j.arr? "decoder").mapM decoderOf
   pure {
@@ -310,7 +324,11 @@ def Manifest.decoderFor (m : Manifest) (contentType : Option String)
 request and its decoded body. -/
 def Manifest.contribute (m : Manifest) (r : Model.Request) (body : Option LeanBiscuit.Datalog.Value) :
     List Builder.Fact :=
-  m.facts ++ (m.routes.flatMap fun rt => (rt.apply r body).getD [])
+  let routed := m.routes.filterMap fun rt => rt.apply r body
+  -- A request no route matches is still about this service, and says so: without an
+  -- `operation` fact a narrowing over operations (`reject if …, operation($op), …`)
+  -- would have nothing to reject, and the request would pass it.
+  m.facts ++ (if routed.isEmpty then [unroutedFact] else routed.flatten)
 
 /-- The resources a set of facts says a request is about: each fact under one of
 the manifest's `resources` predicates, its string terms joined with `/`, in the

@@ -95,6 +95,19 @@ private def holdsWithoutRequest (token : Biscuit) : Bool :=
   | .error _ => false
   | .ok a => (Authorizer.authorizeWithState a).1 |>.isOk
 
+/-- Does a token hold against these facts alone?  How a narrowing is seen to refuse a
+request, apart from any grant. -/
+private def holdsWith (facts : List Builder.Fact) (token : Biscuit) : Bool :=
+  let builder : AuthorizerBuilder := {
+    facts := ⟨⟨"time", [.date 1700000100]⟩⟩ :: facts
+    rules := [], checks := [], scopes := []
+    policies := [{ queries := [{ head := ⟨"query", []⟩, body := [], expressions := [], scopes := [] }],
+                   kind := .allow }]
+    externs := Policy.standard, limits := {} }
+  match Authorizer.build builder token with
+  | .error _ => false
+  | .ok a => (Authorizer.authorizeWithState a).1 |>.isOk
+
 private def compileErr (src : String) : IO (Option String) := do
   let credentials : Array Credential.Record := #[
     account "mail/christian" "mail", account "zulip/nohosts" "zulip"]
@@ -699,5 +712,105 @@ def specTests : IO Unit := do
   let ms := (← IO.monoMsNow) - t0
   check s!"a 64 KiB response head, 16 bytes at a time: read in {ms} ms"
     (fetched.status == 200 && fetched.body.size == 2 && ms < 250)
+
+  group "a request no route matches"
+  let (_, ghm) ← shipped "github" []
+  let unroutedOf (method host path : String) : List String :=
+    let request : Model.Request := {
+      method, scheme := "https", host, port := 443
+      path := Str.pathOnly path, segments := Str.pathSegments path, query := Str.parseQuery path
+      headers := #[("host", host)], bodyPrefix := ByteArray.empty, bodyComplete := true
+      bodySize := some 0 }
+    (ghm.contribute request none).map (Builder.Predicate.print ·.predicate)
+  for (host, path) in [("github.com", "/up/proj/pull/7"),
+                       ("api.github.com", "/repositories/1/pulls/2/comments")] do
+    check s!"GET {host}{path} is operation(\"unrouted\")"
+      ((unroutedOf "GET" host path).contains "operation(\"unrouted\")")
+  check "a routed one is not" (!(unroutedOf "GET" "api.github.com" "/repos/up/proj").contains
+    "operation(\"unrouted\")")
+  let narrowedFetch ← match Narrow.compile rr ["github: only discover, fetch"] with
+    | .ok cs => pure cs
+    | .error e => throw (IO.userError e)
+  let tokF ← match specToken [] [] narrowedFetch with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let svc := Facts.fact "request_service" [.str "github"]
+  check "a narrowing to fetching rejects an unrouted GitHub request"
+    (!holdsWith [svc, Service.unroutedFact] tokF)
+  check "and still lets a fetch through" (holdsWith [svc, Facts.fact "operation" [.str "fetch"]] tokF)
+  -- A grant testing only what every request has used to allow an unrouted request; the
+  -- authorizer now refuses it whatever the grant.  This is the deliberate change.
+  let anyHostSrc := "name = \"any-github\"\nservice = \"github\"\ncredential = \"github/chrisflav\"\n" ++
+    "max_lifetime = \"1h\"\ndatalog = '''\ncheck if request_host($h);\nallow if grant(\"any-github\");\n'''\n"
+  let anyHost ← match Policy.Grant.ofToml anyHostSrc with
+    | .ok g => pure g
+    | .error e => throw (IO.userError e)
+  let regAny : Service.Registry := { rr with grants := rr.grants.push anyHost }
+  let tokAny ← match specToken [] ["any-github"] with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  checkEq "a permissive grant still allows a routed request"
+    (spentOn (choose regAny tokAny "GET" "api.github.com" "/repos/up/proj")) (some "github/chrisflav")
+  check "but no longer an unrouted one, and says why"
+    (match choose regAny tokAny "GET" "github.com" "/up/proj/pull/7" with
+     | .ok c => !c.outcome.allowed && (c.reason.splitOn "unrouted").length > 1
+     | .error _ => false)
+  check "and no manifest may emit operation(\"unrouted\") itself"
+    (Service.Manifest.ofToml ("name = \"x\"\nhosts = [\"x.example\"]\n[credential]\nprovider = \"static\"\n" ++
+      "[[route]]\nmatch = \"GET * /\"\nemit = ['operation(\"unrouted\")']\n")).toOption.isNone
+
+  group "a request's framing does not depend on how it arrives"
+  let feedIn (data : Bytes) (piece : Nat) : IO Net.Stream := do
+    let pos ← IO.mkRef 0
+    pure { read := fun _ => do
+             let p ← pos.get
+             let e := min data.size (p + piece)
+             pos.set e
+             pure (data.extract p e)
+           write := fun _ => pure (), close := pure (), describe := "test" }
+  let drain (s : Net.Stream) : IO Bytes := do
+    let mut acc := ByteArray.empty
+    for _ in [0:100000] do
+      let c ← s.read 1000000
+      if c.size == 0 then break
+      acc := acc ++ c
+    return acc
+  let second := "GET /b HTTP/1.1\r\nHost: x\r\n\r\n"
+  for (name, first, expectRest) in [
+      ("a head", "GET /a HTTP/1.1\r\nHost: x\r\nX-A: 1\r\n\r\n", some second),
+      ("a head and an empty line", "GET /a HTTP/1.1\r\nHost: x\r\n\r\n\r\n", some ("\r\n" ++ second)),
+      ("a bare-LF head", "GET /a HTTP/1.1\nHost: x\n\n", none)] do
+    let data := Bytes.ofString (first ++ second)
+    let mut same := true
+    for piece in [1, 2, 3, 4, 5, 7, 13, 100000] do
+      for pre in [0, 1, 3, 10, 17] do
+        let already := data.extract 0 (min pre data.size)
+        let stream ← feedIn (data.extract (min pre data.size) data.size) piece
+        let got ← try
+            match ← Proxy.readHead stream {} already 0 with
+            | some (_, rest) => pure (some (Kleis.Bytes.toStringLossy (rest ++ (← drain stream))))
+            | none => pure none
+          catch _ => pure none
+        if got != expectRest then same := false
+    check s!"{name}, pipelined, read in pieces of every size: the same split every time" same
+  -- A chunked body as kleis sends it on: its own framing, whatever the client's.
+  let client := Bytes.ofString ("5;ext=1\r\n[1,2]\r\n" ++ "3\r\nabc\r\n0\r\nx-a: 1\r\n\r\nGET /next")
+  for piece in [1, 4, 9, 1000] do
+    let stream ← feedIn client piece
+    let (head_, _) ← Proxy.readBodyPrefix stream .chunked .opaque ByteArray.empty 1000
+    let sent ← IO.mkRef ByteArray.empty
+    let origin : Net.Stream := { read := fun _ => pure ByteArray.empty
+                                 write := fun b => sent.modify (· ++ b), close := pure (), describe := "origin" }
+    let after ← Proxy.relayBody stream origin .chunked head_
+    let wire := head_.raw ++ (← sent.get)
+    let rest := Kleis.Bytes.toStringLossy (head_.excess ++ after ++ (← drain stream))
+    check s!"pieces of {piece}: the origin gets kleis's framing, and the next request is not in it"
+      (match Http.Chunked.decode wire 100 with
+       | .done e n true => Kleis.Bytes.toStringLossy e == "[1,2]abc" && n == wire.size
+       | _ => false)
+    check s!"pieces of {piece}: no extension and no trailer reach it"
+      (((Kleis.Bytes.toStringLossy wire).splitOn "ext").length == 1
+        && ((Kleis.Bytes.toStringLossy wire).splitOn "x-a").length == 1)
+    checkEq s!"pieces of {piece}: what followed the body is handed back" rest "GET /next"
 
 end KleisTests
