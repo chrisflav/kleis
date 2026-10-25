@@ -546,41 +546,30 @@ def specTests : IO Unit := do
   -- Each shape at the default prefix and at the example's 2 MiB, through the platform's review
   -- route on GitHub and a job's on the platform. `choose` decodes the whole body, as the
   -- proxy does up to its prefix.
-  let mut slowest : Nat := 0
   for bytes in [65536, 2097152] do
     for (name, body) in costlyBodies bytes do
       for (label, t, host, path) in [
           ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews"),
           ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review")] do
-        let t0 ← IO.monoMsNow
-        let refused ← IO.lazyPure fun _ =>
-          (spentOn (choose rr t "POST" host path body (some "application/json"))).isNone
-        let ms := (← IO.monoMsNow) - t0
-        slowest := max slowest ms
-        check s!"{name}, {bytes} bytes, to {label}: refused in {ms} ms" (refused && ms < 2000)
+        checkTimed s!"{name}, {bytes} bytes, to {label}: refused in time" 2000 do
+          IO.lazyPure fun _ =>
+            (spentOn (choose rr t "POST" host path body (some "application/json"))).isNone
   for (label, t, host, path, limit) in [
       ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews", 1664),
       ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review", 1856)] do
     for (name, body) in costlyWithin limit do
-      let t0 ← IO.monoMsNow
-      let decided ← IO.lazyPure fun _ =>
-        match choose rr t "POST" host path body (some "application/json") with
-        | .ok c => (c.reason.splitOn "body_truncated").length == 1
-        | .error _ => false
-      let ms := (← IO.monoMsNow) - t0
-      slowest := max slowest ms
-      check s!"{name} within the limit, to {label}: read and decided in {ms} ms" (decided && ms < 2000)
+      checkTimed s!"{name} within the limit, to {label}: read and decided in time" 2000 do
+        IO.lazyPure fun _ =>
+          match choose rr t "POST" host path body (some "application/json") with
+          | .ok c => (c.reason.splitOn "body_truncated").length == 1
+          | .error _ => false
   for (label, t, host, path, body) in [
       ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews", bigReview 207),
       ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review",
         agentReview 205)] do
-    let t0 ← IO.monoMsNow
-    let allowed ← IO.lazyPure fun _ =>
-      (spentOn (choose rr t "POST" host path body (some "application/json"))).isSome
-    let ms := (← IO.monoMsNow) - t0
-    slowest := max slowest ms
-    check s!"a review at the limit, to {label}: allowed in {ms} ms" (allowed && ms < 2000)
-  check s!"the slowest of them took {slowest} ms" (slowest < 2000)
+    checkTimed s!"a review at the limit, to {label}: allowed in time" 2000 do
+      IO.lazyPure fun _ =>
+        (spentOn (choose rr t "POST" host path body (some "application/json"))).isSome
 
   group "every shape, read, decoded and decided in time"
   -- What a bearer can make kleis do with one body, at the default prefix and at the
@@ -641,13 +630,11 @@ def specTests : IO Unit := do
        some "application/x-www-form-urlencoded")]
   for (n, bound) in [(65536, 250), (2097152, 2000)] do
     for (name, host, path, body, ct) in shapes n do
-      let t0 ← IO.monoMsNow
-      let decided ← IO.lazyPure fun _ =>
-        match choose rr rt "POST" host path body ct with
-        | .ok _ => true
-        | .error _ => false
-      let ms := (← IO.monoMsNow) - t0
-      check s!"{name}, {n} bytes: decided in {ms} ms" (decided && ms < bound)
+      checkTimed s!"{name}, {n} bytes: decided in time" bound do
+        IO.lazyPure fun _ =>
+          match choose rr rt "POST" host path body ct with
+          | .ok _ => true
+          | .error _ => false
   -- The form decoder itself, which github.com and the platform no longer reach by a
   -- body's label, but other services do.
   for (n, bound) in [(65536, 250), (2097152, 2000)] do
@@ -656,13 +643,11 @@ def specTests : IO Unit := do
         ("one name", rep (n / 4) "k=v&"),
         ("escapes", "k=" ++ rep (n / 3) "%41")] do
       let bytes := Bytes.ofString body
-      let t0 ← IO.monoMsNow
-      let answered ← IO.lazyPure fun _ => match Wire.formDecoder.step bytes true with
-        | .done _ _ => true
-        | .opaque => true
-        | .need _ => false
-      let ms := (← IO.monoMsNow) - t0
-      check s!"a form of {name}, {n} bytes: decoded or refused in {ms} ms" (answered && ms < bound)
+      checkTimed s!"a form of {name}, {n} bytes: decoded or refused in time" bound do
+        IO.lazyPure fun _ => match Wire.formDecoder.step bytes true with
+          | .done _ _ => true
+          | .opaque => true
+          | .need _ => false
   check "a form within the pair limit is read"
     (match Wire.formDecoder.step (Bytes.ofString "a=1&b=2&a=3") true with
      | .done _ _ => true | _ => false)
@@ -690,28 +675,24 @@ def specTests : IO Unit := do
         ("push without a flush, 16-byte reads", pkts, .length pkts.size, .pure Wire.gitReceivePackDecoder, 16),
         ("push without a flush, 512-byte reads", pkts, .length pkts.size,
           .pure Wire.gitReceivePackDecoder, 512)] do
-      let stream ← feed data piece
-      let t0 ← IO.monoMsNow
-      let _ ← Proxy.readBodyPrefix stream framing decoder ByteArray.empty n
-      let ms := (← IO.monoMsNow) - t0
-      check s!"{name}, {n} bytes: read in {ms} ms" (ms < bound)
+      checkTimed s!"{name}, {n} bytes: read in time" bound do
+        let stream ← feed data piece
+        let _ ← Proxy.readBodyPrefix stream framing decoder ByteArray.empty n
+        pure true
   -- A head, a request's or a response's, arriving 16 bytes at a time: searched once, and
   -- parsed once it has ended.
   let filler := rep 65000 "a"
   let requestHead := Bytes.ofString ("GET / HTTP/1.1\r\nhost: x\r\nx-pad: " ++ filler ++ "\r\n\r\n")
-  let stream ← feed requestHead 16
-  let t0 ← IO.monoMsNow
-  let head ← Proxy.readHead stream { maxHeadSize := 65536 } ByteArray.empty (timeoutSeconds := 0)
-  let ms := (← IO.monoMsNow) - t0
-  check s!"a 64 KiB request head, 16 bytes at a time: read in {ms} ms" (head.isSome && ms < 250)
+  checkTimed "a 64 KiB request head, 16 bytes at a time: read in time" 250 do
+    let stream ← feed requestHead 16
+    let head ← Proxy.readHead stream { maxHeadSize := 65536 } ByteArray.empty (timeoutSeconds := 0)
+    pure head.isSome
   let responseHead := Bytes.ofString ("HTTP/1.1 200 OK\r\nx-pad: " ++ filler ++
     "\r\ncontent-length: 2\r\n\r\nok")
-  let stream ← feed responseHead 16
-  let t0 ← IO.monoMsNow
-  let fetched ← Net.readResponse stream "GET" 1024
-  let ms := (← IO.monoMsNow) - t0
-  check s!"a 64 KiB response head, 16 bytes at a time: read in {ms} ms"
-    (fetched.status == 200 && fetched.body.size == 2 && ms < 250)
+  checkTimed "a 64 KiB response head, 16 bytes at a time: read in time" 250 do
+    let stream ← feed responseHead 16
+    let fetched ← Net.readResponse stream "GET" 1024
+    pure (fetched.status == 200 && fetched.body.size == 2)
 
   group "a request no route matches"
   let (_, ghm) ← shipped "github" []

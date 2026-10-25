@@ -66,11 +66,8 @@ def factsTests : IO Unit := do
   check "nesting past it does not" (Json.parse (deep 101) (maxDepth := 100)).toOption.isNone
   check "a million levels is refused, not a stack overflow" (Json.parse (deep 1000000)).toOption.isNone
   let wide := "{" ++ ",".intercalate ((List.range 100000).map fun i => "\"k" ++ toString i ++ "\":1") ++ "}"
-  let t0 ← IO.monoMsNow
-  let dup ← IO.lazyPure fun _ => (Json.parse wide).toOption.map (·.hasDuplicateKeys)
-  let ms := (← IO.monoMsNow) - t0
-  check s!"an object of 100 000 keys is read and checked for duplicates in {ms} ms"
-    (dup == some false && ms < 2000)
+  checkTimed "an object of 100 000 keys is read and checked for duplicates" 2000 do
+    IO.lazyPure fun _ => (Json.parse wide).toOption.map (·.hasDuplicateKeys) == some false
   check "and a duplicate is still found"
     ((Json.parse "{\"a\":1,\"b\":2,\"a\":3}").toOption.map (·.hasDuplicateKeys) == some true)
 
