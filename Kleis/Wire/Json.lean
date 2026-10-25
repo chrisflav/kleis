@@ -25,7 +25,9 @@ def jsonDecoder : PureDecoder where
              "application/scim+json"]
   step := fun buf complete =>
     if !complete then .need (buf.size + 1)
-    else match Json.parse (Bytes.toStringLossy buf) with
+    -- Deeper than anything `Facts.flatten` reads (`Facts.maxBodyDepth`), so a body between
+    -- the two is refused as truncated, past both as undecodable: refused either way.
+    else match Json.parse (Bytes.toStringLossy buf) (maxDepth := 128) with
       | .ok j => if j.hasDuplicateKeys then .opaque else .done j.toValue buf.size
       | .error _ => .opaque
 

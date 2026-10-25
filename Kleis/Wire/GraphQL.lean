@@ -61,7 +61,7 @@ well as a line feed (the spec's LineTerminator) — ending it only at `\n` would
 private def notLineEnd (c : Char) : Bool := c != '\n' && c != '\r'
 
 /-- Skip whitespace, commas, the byte-order mark and `#` comments. -/
-private def skipIgnored (s : List Char) : List Char :=
+private def skipIgnored (s : List Char) (budget : Nat) : List Char :=
   let rec go (s : List Char) (fuel : Nat) : List Char :=
     match fuel, s with
     | 0, _ => s
@@ -71,7 +71,7 @@ private def skipIgnored (s : List Char) : List Char :=
         go rest fuel
       else if c == '#' then go (rest.dropWhile notLineEnd) fuel
       else s
-  go s (s.length + 1)
+  go s budget
 
 /-- Skip a string whose opening quote has been consumed. -/
 private def skipString : List Char → Option (List Char)
@@ -91,9 +91,10 @@ private def skipBlockString : List Char → Option (List Char)
 /-- Skip a balanced bracketed group whose opening bracket has been consumed,
 with `depth` brackets still open.  Strings are skipped whole, so a bracket
 inside one is not counted. -/
-private def skipBalanced (s : List Char) (depth : Nat) : Option (List Char) :=
+private def skipBalanced (s : List Char) (depth : Nat) (budget : Nat) : Option (List Char) :=
   -- Fuel rather than a measure: each step consumes at least one character, so
-  -- the input's length is always enough.
+  -- the document's length is always enough.  It is passed in, computed once: the
+  -- length of what remains, taken at every token, would cost the square of it.
   let rec go (s : List Char) (depth : Nat) (fuel : Nat) : Option (List Char) :=
     if depth == 0 then some s else
     match fuel with
@@ -108,7 +109,7 @@ private def skipBalanced (s : List Char) (depth : Nat) : Option (List Char) :=
         if c == '{' || c == '(' || c == '[' then go rest (depth + 1) fuel
         else if c == '}' || c == ')' || c == ']' then go rest (depth - 1) fuel
         else go rest depth fuel
-  go s depth (s.length + 1)
+  go s depth budget
 
 /-- Read a name. -/
 private def readName (s : List Char) : Option (String × List Char) :=
@@ -122,57 +123,60 @@ private def readName (s : List Char) : Option (String × List Char) :=
 
 /-- Skip a definition's header — name, variable definitions, type condition,
 directives — and its selection set, returning what follows it. -/
-private def skipDefinitionBody (s : List Char) (fuel : Nat) : Option (List Char) :=
+private def skipDefinitionBody (s : List Char) (budget fuel : Nat) : Option (List Char) :=
   match fuel with
   | 0 => none
   | fuel + 1 =>
-    match skipIgnored s with
-    | '{' :: rest => skipBalanced rest 1
-    | '(' :: rest => (skipBalanced rest 1).bind (skipDefinitionBody · fuel)
-    | '@' :: rest => (readName rest).bind fun (_, more) => skipDefinitionBody more fuel
-    | ':' :: rest => skipDefinitionBody rest fuel
-    | '$' :: rest => skipDefinitionBody rest fuel
-    | '!' :: rest => skipDefinitionBody rest fuel
-    | '[' :: rest => (skipBalanced rest 1).bind (skipDefinitionBody · fuel)
-    | '=' :: rest => skipDefinitionBody rest fuel
-    | '"' :: '"' :: '"' :: rest => (skipBlockString rest).bind (skipDefinitionBody · fuel)
-    | '"' :: rest => (skipString rest).bind (skipDefinitionBody · fuel)
+    match skipIgnored s budget with
+    | '{' :: rest => skipBalanced rest 1 budget
+    | '(' :: rest => (skipBalanced rest 1 budget).bind (skipDefinitionBody · budget fuel)
+    | '@' :: rest => (readName rest).bind fun (_, more) => skipDefinitionBody more budget fuel
+    | ':' :: rest => skipDefinitionBody rest budget fuel
+    | '$' :: rest => skipDefinitionBody rest budget fuel
+    | '!' :: rest => skipDefinitionBody rest budget fuel
+    | '[' :: rest => (skipBalanced rest 1 budget).bind (skipDefinitionBody · budget fuel)
+    | '=' :: rest => skipDefinitionBody rest budget fuel
+    | '"' :: '"' :: '"' :: rest => (skipBlockString rest).bind (skipDefinitionBody · budget fuel)
+    | '"' :: rest => (skipString rest).bind (skipDefinitionBody · budget fuel)
     | other =>
       match readName other with
-      | some (_, more) => skipDefinitionBody more fuel
+      | some (_, more) => skipDefinitionBody more budget fuel
       | none =>
         -- A number in a default value, which no other branch reads.
         match other with
-        | c :: more => if c.isDigit || c == '-' || c == '.' then skipDefinitionBody more fuel
-                       else none
+        | c :: more =>
+          if c.isDigit || c == '-' || c == '.' then skipDefinitionBody more budget fuel
+          else none
         | [] => none
 
 /-- The operations defined at the top level of a document, or `none` if it is
 not one this reader can follow. -/
 def operations (document : String) : Option (List Operation) :=
+  let chars := document.toList
+  let budget := chars.length + 1
   let rec go (s : List Char) (acc : List Operation) (fuel : Nat) : Option (List Operation) :=
     match fuel with
     | 0 => none
     | fuel + 1 =>
-      match skipIgnored s with
+      match skipIgnored s budget with
       | [] => some acc.reverse
       | '{' :: rest =>
         -- The query shorthand: a bare selection set is an anonymous query.
-        (skipBalanced rest 1).bind fun more => go more (⟨"query", ""⟩ :: acc) fuel
+        (skipBalanced rest 1 budget).bind fun more => go more (⟨"query", ""⟩ :: acc) fuel
       | other => do
         let (keyword, more) ← readName other
         if keyword == "query" || keyword == "mutation" || keyword == "subscription" then
-          let afterKeyword := skipIgnored more
+          let afterKeyword := skipIgnored more budget
           let (name, afterName) := match readName afterKeyword with
             | some (n, r) => (n, r)
             | none => ("", afterKeyword)
-          let next ← skipDefinitionBody afterName 10000
+          let next ← skipDefinitionBody afterName budget 10000
           go next (⟨keyword, name⟩ :: acc) fuel
         else if keyword == "fragment" then
-          let next ← skipDefinitionBody more 10000
+          let next ← skipDefinitionBody more budget 10000
           go next acc fuel
         else none
-  go document.toList [] 10000
+  go chars [] 10000
 
 /-- Render the operations as the JSON the decoder adds. -/
 def operationsJson (ops : List Operation) : Json :=

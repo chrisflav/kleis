@@ -103,10 +103,109 @@ private def compileErr (src : String) : IO (Option String) := do
     | .ok _ => none
     | .error e => some e
 
+/-- The facts a manifest's routes emit for a request, printed. -/
+private def routeFacts (m : Service.Manifest) (method host path : String) : List String :=
+  let request : Model.Request := {
+    method, scheme := "https", host, port := 443
+    path := Str.pathOnly path, segments := Str.pathSegments path, query := Str.parseQuery path
+    headers := #[("host", host)], bodyPrefix := ByteArray.empty, bodyComplete := true
+    bodySize := some 0 }
+  (m.routes.flatMap fun rt => (rt.apply request none).getD []).map (Builder.Predicate.print ·.predicate)
+
+/-- The orchestra example's review specs, against the shipped GitHub and diff-reviewer
+extensions, with the accounts they name made up. -/
+private def reviewRegistry : IO Service.Registry := do
+  let credentials : Array Credential.Record := #[
+    account "diff-reviewer/agent" "diff-reviewer" ["reviews.example"],
+    account "github/orchestra-app" "github", account "github/orchestra-pat" "github",
+    account "github/chrisflav" "github"]
+  let exts ← [("github", []), ("diff-reviewer", ["reviews.example"])].mapM fun (n, h) => shipped n h
+  let grant ← match Policy.Grant.ofToml
+      (← IO.FS.readFile "examples/orchestra/grants/orchestra-reviewer-github.toml") with
+    | .ok g => pure g
+    | .error e => throw (IO.userError e)
+  let env : Spec.Env := { extensions := exts, credentials, grants := #[grant] }
+  let compiled ← ["reviewer", "diff-reviewer-poster"].mapM fun n => do
+    match Spec.load (← IO.FS.readFile s!"examples/orchestra/specs/{n}.kleis") env with
+    | .ok s => pure s
+    | .error e => throw (IO.userError s!"{n}: {e}")
+  pure { manifests := (exts.map (·.2)).toArray
+         grants := #[grant] ++ (compiled.flatMap fun s => s.accounts.map (·.grant)).toArray
+         extensions := (exts.map (·.1)).toArray
+         specs := compiled.toArray }
+
+/-- A task token from a spec, as `/.kleis/v1/derive` writes it: the task's facts in the
+authority block. -/
+private def taskToken (spec : String) (facts : List String)
+    (issuedBy : Option String := some "orchestra") : Except String Biscuit := do
+  let facts ← facts.mapM Token.factOfSource
+  let (t, _) ← Token.issue (fixedKey 7)
+    { grants := [], specs := [spec], bearer := "orchestra:t-1", lifetime := 3600, issuedBy, extraFacts := facts }
+    1700000000 (fixedKey 9)
+  pure t
+
+/-- A review with `n` inline comments, in the shape the platform posts to GitHub: six fields
+each, and a body of `size` bytes with a suggestion in it. -/
+private def bigReview (n : Nat) (size : Nat := 8000) : String :=
+  let comment (i : Nat) := "{\"path\":\"Mathlib/Foo/Bar" ++ toString i ++ ".lean\",\"start_line\":" ++
+    toString i ++ ",\"line\":" ++ toString (i + 1) ++ ",\"side\":\"RIGHT\"," ++
+    "\"start_side\":\"RIGHT\",\"body\":\"" ++ String.ofList (List.replicate size 'x') ++
+    "\\n```suggestion\\nexact h\\n```\"}"
+  "{\"commit_id\":\"abc\",\"event\":\"COMMENT\",\"body\":\"b\",\"comments\":[" ++
+    ",".intercalate ((List.range n).map comment) ++ "]}"
+
+/-- A submission to the platform with `n` inline comments, in the agent API's shape: seven
+fields each, a body and a suggestion of `size` bytes between them. -/
+private def agentReview (n : Nat) (size : Nat := 8000) : String :=
+  let text (k : Nat) := String.ofList (List.replicate k 'x')
+  let comment (i : Nat) := "{\"file\":\"Mathlib/Foo/Bar" ++ toString i ++ ".lean\",\"start_line\":" ++
+    toString i ++ ",\"end_line\":" ++ toString (i + 1) ++ ",\"category\":\"style\"," ++
+    "\"severity\":\"minor\",\"body\":\"" ++ text (size - size / 3) ++ "\",\"suggestion\":\"" ++
+    text (size / 3) ++ "\"}"
+  "{\"headSha\":\"abc\",\"prType\":null,\"review\":{\"decision\":\"comment\",\"body\":\"b\"," ++
+    "\"comments\":[" ++ ",".intercalate ((List.range n).map comment) ++ "]}}"
+
+/-- Whether a request was refused, and the reason says `needle`. -/
+private def refusedFor (c : Except String Policy.Choice) (needle : String) : Bool :=
+  match c with
+  | .ok c => !c.outcome.allowed && (c.reason.splitOn needle).length > 1
+  | .error _ => false
+
+/-- Bodies built to be expensive to decide, each about `bytes` long: its name, and the body. -/
+private def costlyBodies (bytes : Nat) : List (String × String) :=
+  let rep (k : Nat) (t : String) : String := String.join (List.replicate k t)
+  let list (unit : String) : String :=
+    let k := bytes / (unit.length + 1)
+    "[" ++ ",".intercalate (List.replicate k unit) ++ "]"
+  [("deep arrays", rep (bytes / 2) "[" ++ rep (bytes / 2) "]"),
+   ("deep objects", rep (bytes / 6) "{\"a\":" ++ "1" ++ rep (bytes / 6) "}"),
+   ("empty arrays", list "[]"),
+   ("empty objects", list "{}"),
+   ("mixed containers", list "[{\"a\":[[]]},{}]"),
+   ("scalars", list "1"),
+   ("keys", "{" ++ ",".intercalate ((List.range (bytes / 10)).map fun i =>
+      "\"k" ++ toString i ++ "\":1") ++ "}"),
+   ("ref updates", "{\"updates\":" ++ list "{\"ref\":\"refs/heads/x\",\"create\":true,\"delete\":true}" ++ "}"),
+   ("labels", "{\"labels\":" ++ list "\"x\"" ++ "}")]
+
+/-- Bodies built to be expensive to decide that stay just within `facts` facts, so they are
+read and evaluated rather than refused as truncated. -/
+private def costlyWithin (facts : Nat) : List (String × String) :=
+  let list (k : Nat) (unit : String) : String := "[" ++ ",".intercalate (List.replicate k unit) ++ "]"
+  let n := facts - 3
+  [("scalars", list n "1"),
+   ("strings", list n "\"x\""),
+   ("trues", list n "true"),
+   ("empty arrays", list (n / 2 - 1) "[]"),
+   ("keys", "{" ++ ",".intercalate ((List.range n).map fun i => "\"k" ++ toString i ++ "\":1") ++ "}"),
+   ("ref updates", "{\"updates\":" ++
+      list (n / 6) "{\"ref\":\"refs/heads/x\",\"create\":true,\"delete\":true}" ++ "}"),
+   ("nesting 63 deep", String.join (List.replicate 63 "[") ++ "1" ++ String.join (List.replicate 63 "]"))]
+
 def specTests : IO Unit := do
   group "the shipped extensions load and agree with their manifests"
   for (n, h) in [("github", []), ("zulip", ["z.example"]), ("caldav", ["d.example"]), ("mail", []),
-                 ("taxis", ["t.example"])] do
+                 ("taxis", ["t.example"]), ("diff-reviewer", ["r.example"])] do
     let ok ← try let _ ← shipped n h; pure true catch _ => pure false
     check s!"{n}" ok
 
@@ -257,5 +356,348 @@ def specTests : IO Unit := do
   check "a setup path may not climb out of home"
     (!Service.safeRelativePath "../.ssh/authorized_keys" && !Service.safeRelativePath "/etc/passwd"
       && !Service.safeRelativePath "a/../../b" && Service.safeRelativePath ".config/zulip/x.zuliprc")
+
+  group "the diff-reviewer extension"
+  let (_, drm) ← shipped "diff-reviewer" ["reviews.example"]
+  let agent := "/api/agent/v1/repos/acme/widgets/pulls/7"
+  let about := ["repository(\"acme\", \"widgets\")", "pull(7)"]
+  checkEq "the job is a read of that pull request"
+    (routeFacts drm "GET" "reviews.example" agent) (["operation(\"read\")"] ++ about)
+  checkEq "so is its diff"
+    (routeFacts drm "GET" "reviews.example" s!"{agent}/diff") (["operation(\"read\")"] ++ about)
+  checkEq "a review is submit_review"
+    (routeFacts drm "POST" "reviews.example" s!"{agent}/review") (["operation(\"submit_review\")"] ++ about)
+  for (m, path) in [("GET", "/api/v1/jobs"), ("POST", "/api/v1/jobs/3/post"), ("POST", "/api/login"),
+                    ("GET", "/"), ("GET", "/api/agent/v1/repos/acme/widgets/pulls"),
+                    ("GET", "/api/agent/v1/repos/acme/widgets/pulls/seven"),
+                    ("GET", s!"{agent}/review"), ("POST", agent), ("POST", s!"{agent}/diff"),
+                    ("PUT", s!"{agent}/review"), ("DELETE", s!"{agent}/review"),
+                    ("GET", s!"{agent}/diff/more")] do
+    checkEq s!"{m} {path} is matched by nothing" (routeFacts drm m "reviews.example" path) []
+
+  group "the reviewer"
+  let rr ← reviewRegistry
+  -- Read-only, and given tools anyway: none of them reaches GitHub through this spec.
+  let task := ["task_fork(\"bot\", \"proj\")", "task_upstream(\"up\", \"proj\")", "task_issue(7)",
+    "task_tool(\"create_pr\")", "task_tool(\"comment\")", "task_tool(\"label_issue\")",
+    "task_tool(\"merge_pr\")", "task_pr_labels([\"orchestra\"])", "task_label_any(true)"]
+  let rt ← match taskToken "reviewer" task with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let dr (method path : String) (body : String := "") (t := rt) :=
+    spentOn (choose rr t method "reviews.example" path body
+      (if body.isEmpty then none else some "application/json"))
+  let review := "{\"headSha\": \"abc\", \"prType\": null, \"review\": " ++
+    "{\"decision\": \"comment\", \"body\": \"b\", \"comments\": []}}"
+  let own := "/api/agent/v1/repos/up/proj/pulls/7"
+  let agentToken := some "diff-reviewer/agent"
+  checkEq "reads its own pull request's job, on the agent token" (dr "GET" own) agentToken
+  checkEq "and its diff" (dr "GET" s!"{own}/diff") agentToken
+  checkEq "submits its review" (dr "POST" s!"{own}/review" review) agentToken
+  checkEq "not a review nobody can read" (dr "POST" s!"{own}/review" "{\"headSha\":") none
+  checkEq "not another pull request's job" (dr "GET" "/api/agent/v1/repos/up/proj/pulls/8") none
+  checkEq "nor a review of it" (dr "POST" "/api/agent/v1/repos/up/proj/pulls/8/review" review) none
+  checkEq "nor another repository's pull request of that number"
+    (dr "GET" "/api/agent/v1/repos/other/proj/pulls/7") none
+  checkEq "nor its fork's" (dr "POST" "/api/agent/v1/repos/bot/proj/pulls/7/review" review) none
+  checkEq "nor another repository of its upstream's owner"
+    (dr "POST" "/api/agent/v1/repos/up/other/pulls/7/review" review) none
+  checkEq "a review of 200 comments is submitted"
+    (dr "POST" s!"{own}/review" (agentReview 200)) agentToken
+  -- 1856 facts: four scalars and three containers for the submission, nine a comment.
+  check "one of 206 is too many facts, and refused as unread"
+    (refusedFor (choose rr rt "POST" "reviews.example" s!"{own}/review" (agentReview 206)
+      (some "application/json")) "body_truncated")
+  checkEq "nor the scripts' API" (dr "GET" "/api/v1/jobs") none
+  checkEq "nor the login" (dr "POST" "/api/login" "{\"password\": \"x\"}") none
+  check "the agent token goes to no other server"
+    (spentOn (choose rr rt "GET" "other.example" own)).isNone
+  let factless ← match taskToken "reviewer" [] with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  checkEq "a token without the task's pull request reaches no job" (dr "GET" own (t := factless)) none
+  let wrongIssuer ← match taskToken "reviewer" task (issuedBy := some "somebody") with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let oid := String.ofList (List.replicate 40 'a')
+  let gh (method host path : String) (body : String := "") (t := rt) :=
+    spentOn (choose rr t method host path body (if body.isEmpty then none else some "application/json"))
+  let push (repo : String) (t := rt) :=
+    spentOn (choose rr t "POST" "github.com" s!"/{repo}.git/git-receive-pack"
+      (Bytes.toStringLossy (pushBody [(oid, "refs/heads/x")]))
+      (some "application/x-git-receive-pack-request"))
+  let pat := some "github/orchestra-pat"
+  checkEq "fetches the upstream on the operator's token"
+    (gh "GET" "github.com" "/up/proj.git/info/refs?service=git-upload-pack") pat
+  checkEq "reads its pull request through the API" (gh "GET" "api.github.com" "/repos/up/proj/pulls/7") pat
+  checkEq "reads a public repository anonymously"
+    (gh "GET" "api.github.com" "/repos/torvalds/linux") (some "-")
+  checkEq "runs a GraphQL query"
+    (gh "POST" "api.github.com" "/graphql" "{\"query\":\"query { viewer { login } }\"}")
+    (some "github/orchestra-app")
+  checkEq "but not under another issuer's name"
+    (gh "GET" "api.github.com" "/repos/up/proj/pulls/7" (t := wrongIssuer)) none
+  checkEq "pushes nowhere: not to its fork" (push "bot/proj") none
+  checkEq "nor to the upstream" (push "up/proj") none
+  checkEq "nor starts a push"
+    (gh "GET" "github.com" "/bot/proj.git/info/refs?service=git-receive-pack") none
+  let writes : List (String × String × String) := [
+    ("POST", "/repos/up/proj/pulls/7/reviews", "{\"event\":\"COMMENT\",\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/pulls/7/reviews", "{\"event\":\"APPROVE\"}"),
+    ("POST", "/repos/up/proj/pulls/7/comments", "{\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/pulls/7/comments/9/replies", "{\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/issues/7/comments", "{\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/issues/7/labels", "{\"labels\":[\"orchestra\"]}"),
+    ("PUT", "/repos/up/proj/issues/7/labels", "{\"labels\":[\"orchestra\"]}"),
+    ("DELETE", "/repos/up/proj/issues/7/labels/orchestra", ""),
+    ("POST", "/repos/up/proj/labels", "{\"name\":\"orchestra\"}"),
+    ("POST", "/repos/up/proj/pulls", "{\"head\":\"bot:x\",\"base\":\"main\"}"),
+    ("POST", "/repos/bot/proj/pulls", "{\"head\":\"x\",\"base\":\"main\"}"),
+    ("PATCH", "/repos/up/proj/pulls/7", "{\"title\":\"t\"}"),
+    ("PUT", "/repos/up/proj/pulls/7/merge", "{}"),
+    ("POST", "/orgs/bot/repos", "{\"name\":\"new\"}"),
+    ("POST", "/graphql", "{\"query\":\"mutation { addComment(input: {}) { clientMutationId } }\"}")]
+  for (m, path, body) in writes do
+    checkEq s!"refuses {m} {path}" (gh m "api.github.com" path body) none
+  -- A repository the App is installed on is worked on directly: fork and upstream are one.
+  let direct ← match taskToken "reviewer"
+      ["task_fork(\"up\", \"proj\")", "task_upstream(\"up\", \"proj\")", "task_issue(7)",
+       "task_tool(\"create_pr\")", "task_tool(\"comment\")"] with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  checkEq "with its fork its upstream, it still cannot push there" (push "up/proj" (t := direct)) none
+  checkEq "nor open a pull request there"
+    (gh "POST" "api.github.com" "/repos/up/proj/pulls" "{\"head\":\"x\",\"base\":\"main\"}"
+      (t := direct)) none
+  checkEq "nor review" (gh "POST" "api.github.com" "/repos/up/proj/pulls/7/reviews"
+    "{\"event\":\"COMMENT\",\"body\":\"x\"}" (t := direct)) none
+  checkEq "but reads it" (gh "GET" "api.github.com" "/repos/up/proj/pulls/7" (t := direct))
+    (some "github/orchestra-app")
+  match Card.setup rr rt with
+  | .error e => check "setup" false e
+  | .ok (_, files) =>
+    match files.find? (·.path == ".config/diff-reviewer/agent.json") with
+    | none => check "setup writes the agent's config" false (toString (files.map (·.path)))
+    | some f =>
+      checkEq "setup writes the agent's config, with the placeholder token" f.content
+        "{\"url\": \"https://reviews.example\", \"token\": \"kleis\"}\n"
+
+  group "the diff-reviewer platform, posting"
+  let pt ← match taskToken "diff-reviewer-poster" [] (issuedBy := none) with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let post (method path : String) (body : String := "") :=
+    spentOn (choose rr pt method "api.github.com" path body
+      (if body.isEmpty then none else some "application/json"))
+  let chris := some "github/chrisflav"
+  let posted := "{\"commit_id\":\"abc\",\"event\":\"COMMENT\",\"body\":\"b\",\"comments\":" ++
+    "[{\"path\":\"a.lean\",\"line\":3,\"side\":\"RIGHT\",\"body\":\"c\"}]}"
+  checkEq "posts a review on a listed repository, on Christian's token"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" posted) chris
+  checkEq "and an inline comment"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/comments" "{\"body\":\"c\"}") chris
+  checkEq "lists its open pull requests" (post "GET" "/repos/chrisflav/kleis/pulls?state=open") chris
+  checkEq "reads one" (post "GET" "/repos/chrisflav/kleis/pulls/7") chris
+  for path in ["/user", "/user/repos", "/search/issues?q=x", "/rate_limit", "/users/someone"] do
+    checkEq s!"reads nothing about no repository: {path}" (post "GET" path) none
+  checkEq "clones nothing, not even a listed repository"
+    (spentOn (choose rr pt "GET" "github.com" "/chrisflav/kleis.git/info/refs?service=git-upload-pack")) none
+  checkEq "posts a review of 200 comments"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" (bigReview 200)) chris
+  -- 1664 facts: three scalars and two containers for the review, eight a comment.
+  check "not one of 208, which is too many facts, and refused as unread"
+    (refusedFor (choose rr pt "POST" "api.github.com" "/repos/chrisflav/kleis/pulls/7/reviews"
+      (bigReview 208) (some "application/json")) "body_truncated")
+  checkEq "but one of 207"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" (bigReview 207)) chris
+  checkEq "posts no review on a repository not listed"
+    (post "POST" "/repos/acme/widgets/pulls/7/reviews" posted) none
+  -- Each of these is a substring of the listed name or contains it, so a list written as a
+  -- string rather than a set would let some through.
+  for repo in ["chrisflav/kleis-fork", "chrisflav/klei", "hrisflav/kleis", "ChrisFlav/kleis",
+               "chrisflav/kleis.git", "chrisflav/kleis/x"] do
+    checkEq s!"nor on {repo}" (post "POST" s!"/repos/{repo}/pulls/7/reviews" posted) none
+  -- No route emits two repositories for one request, so only a world given a second one
+  -- reaches the `reject`: an allowed review, with an unlisted repository beside it.
+  checkEq "a request about an unlisted repository beside a listed one is refused"
+    (spentOn (choose rr pt "POST" "api.github.com" "/repos/chrisflav/kleis/pulls/7/reviews" posted
+      (some "application/json") [Facts.fact "repository" [.str "acme", .str "widgets"]])) none
+  checkEq "nor reads one" (post "GET" "/repos/acme/widgets/pulls") none
+  checkEq "comments on no issue"
+    (post "POST" "/repos/chrisflav/kleis/issues/7/comments" "{\"body\":\"x\"}") none
+  checkEq "merges nothing" (post "PUT" "/repos/chrisflav/kleis/pulls/7/merge" "{}") none
+  checkEq "and runs no GraphQL"
+    (post "POST" "/graphql" "{\"query\":\"query { viewer { login } }\"}") none
+
+  group "bodies built to be expensive are refused quickly"
+  -- Each shape at the default prefix and at the example's 2 MiB, through the platform's review
+  -- route on GitHub and a job's on the platform. `choose` decodes the whole body, as the
+  -- proxy does up to its prefix.
+  let mut slowest : Nat := 0
+  for bytes in [65536, 2097152] do
+    for (name, body) in costlyBodies bytes do
+      for (label, t, host, path) in [
+          ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews"),
+          ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review")] do
+        let t0 ← IO.monoMsNow
+        let refused ← IO.lazyPure fun _ =>
+          (spentOn (choose rr t "POST" host path body (some "application/json"))).isNone
+        let ms := (← IO.monoMsNow) - t0
+        slowest := max slowest ms
+        check s!"{name}, {bytes} bytes, to {label}: refused in {ms} ms" (refused && ms < 2000)
+  for (label, t, host, path, limit) in [
+      ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews", 1664),
+      ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review", 1856)] do
+    for (name, body) in costlyWithin limit do
+      let t0 ← IO.monoMsNow
+      let decided ← IO.lazyPure fun _ =>
+        match choose rr t "POST" host path body (some "application/json") with
+        | .ok c => (c.reason.splitOn "body_truncated").length == 1
+        | .error _ => false
+      let ms := (← IO.monoMsNow) - t0
+      slowest := max slowest ms
+      check s!"{name} within the limit, to {label}: read and decided in {ms} ms" (decided && ms < 2000)
+  for (label, t, host, path, body) in [
+      ("GitHub", pt, "api.github.com", "/repos/chrisflav/kleis/pulls/7/reviews", bigReview 207),
+      ("diff-reviewer", rt, "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review",
+        agentReview 205)] do
+    let t0 ← IO.monoMsNow
+    let allowed ← IO.lazyPure fun _ =>
+      (spentOn (choose rr t "POST" host path body (some "application/json"))).isSome
+    let ms := (← IO.monoMsNow) - t0
+    slowest := max slowest ms
+    check s!"a review at the limit, to {label}: allowed in {ms} ms" (allowed && ms < 2000)
+  check s!"the slowest of them took {slowest} ms" (slowest < 2000)
+
+  group "every shape, read, decoded and decided in time"
+  -- What a bearer can make kleis do with one body, at the default prefix and at the
+  -- example's 2 MiB: read it, a few bytes at a time, decode it, and decide on it.  The
+  -- bounds are generous for CI; what was measured is in the manifests' comments.
+  let rep (n : Nat) (t : String) : String := String.join (List.replicate n t)
+  let oid := String.ofList (List.replicate 40 'a')
+  let shapes (n : Nat) : List (String × String × String × String × Option String) :=
+    let api := "api.github.com"
+    let keys := (List.range (n / 9)).map fun i => "\"k" ++ toString i ++ "\":0"
+    let width := n / 60 / 8
+    let level := ",".intercalate ((List.range width).map fun i => "\"a" ++ toString i ++ "\":1")
+    [("digits", api, "/repos/up/proj/forks", "[" ++ rep (n - 2) "7" ++ "]", some "application/json"),
+     ("floats", api, "/repos/up/proj/forks", "[" ++ ",".intercalate (List.replicate (n / 9) "1.5e-300") ++ "]",
+       some "application/json"),
+     ("\\u escapes", api, "/repos/up/proj/forks", "[\"" ++ rep ((n - 4) / 6) "\\u00e9" ++ "\"]",
+       some "application/json"),
+     ("surrogate pairs", api, "/repos/up/proj/forks", "[\"" ++ rep ((n - 4) / 12) "\\ud83d\\ude00" ++ "\"]",
+       some "application/json"),
+     ("a long string", api, "/repos/up/proj/forks", "[\"" ++ rep (n - 4) "x" ++ "\"]", some "application/json"),
+     ("non-ASCII", api, "/repos/up/proj/forks", "[\"" ++ rep ((n - 4) / 4) "😀" ++ "\"]", some "application/json"),
+     ("many keys", api, "/repos/up/proj/forks", "{" ++ ",".intercalate keys ++ "}", some "application/json"),
+     ("one key repeated", api, "/repos/up/proj/forks", "{" ++ ",".intercalate (List.replicate (n / 6) "\"k\":0") ++ "}",
+       some "application/json"),
+     ("wide and 60 deep", api, "/repos/up/proj/forks", rep 60 ("{" ++ level ++ ",\"z\":") ++ "1" ++ rep 60 "}",
+       some "application/json"),
+     ("form, distinct names", "github.com", "/up/proj/x",
+       "&".intercalate ((List.range (n / 8)).map fun i => "k" ++ toString i ++ "=v"),
+       some "application/x-www-form-urlencoded"),
+     ("form, one name", "github.com", "/up/proj/x", rep (n / 4) "k=v&", some "application/x-www-form-urlencoded"),
+     ("form, escapes", "github.com", "/up/proj/x", "k=" ++ rep (n / 3) "%41", some "application/x-www-form-urlencoded"),
+     ("multipart", "github.com", "/up/proj/x",
+       "--bb\r\n" ++ rep (n / 50) "content-disposition: form-data; name=\"x\"\r\n\r\nv\r\n--bb\r\n",
+       some "multipart/form-data"),
+     ("multipart, long boundary", "github.com", "/up/proj/x", "--" ++ rep (n / 2) "b" ++ "\r\n" ++ rep (n / 2 - 4) "b",
+       some "multipart/form-data"),
+     ("GraphQL, many operations", api, "/graphql", "{\"query\":\"" ++ rep (n / 12) "query{a{b}} " ++ "\"}",
+       some "application/json"),
+     ("GraphQL, deep", api, "/graphql", "{\"query\":\"query" ++ rep (n / 2 - 20) "{" ++ rep (n / 2 - 20) "}" ++ "\"}",
+       some "application/json"),
+     ("GraphQL, strings", api, "/graphql", "{\"query\":\"query{a(x:" ++ rep (n / 4) "\\\"\\\"" ++ ")}\"}",
+       some "application/json"),
+     ("GraphQL, comments", api, "/graphql", "{\"query\":\"" ++ rep (n / 4) "#\\r\\n" ++ "query{a}\"}",
+       some "application/json"),
+     ("push, many updates", "github.com", "/up/proj.git/git-receive-pack",
+       Bytes.toStringLossy (pushBody ((List.range (n / 100)).map fun i =>
+         (String.ofList (List.replicate 40 '0'), "refs/heads/b" ++ toString i))),
+       some "application/x-git-receive-pack-request"),
+     ("push, tiny lines", "github.com", "/up/proj.git/git-receive-pack", rep (n / 5) "0005x" ++ "0000",
+       some "application/x-git-receive-pack-request"),
+     ("fetch, many wants", "github.com", "/up/proj.git/git-upload-pack",
+       rep (n / 50) ("0032want " ++ oid ++ "\n") ++ "0000", some "application/x-git-upload-pack-request"),
+     ("fetch v2, many arguments", "github.com", "/up/proj.git/git-upload-pack",
+       "0014command=fetch\n" ++ rep (n / 50) ("0032want " ++ oid ++ "\n") ++ "0000",
+       some "application/x-git-upload-pack-request"),
+     ("the platform, a form", "reviews.example", "/api/agent/v1/repos/up/proj/pulls/7/review",
+       "&".intercalate ((List.range (n / 8)).map fun i => "k" ++ toString i ++ "=v"),
+       some "application/x-www-form-urlencoded")]
+  for (n, bound) in [(65536, 250), (2097152, 2000)] do
+    for (name, host, path, body, ct) in shapes n do
+      let t0 ← IO.monoMsNow
+      let decided ← IO.lazyPure fun _ =>
+        match choose rr rt "POST" host path body ct with
+        | .ok _ => true
+        | .error _ => false
+      let ms := (← IO.monoMsNow) - t0
+      check s!"{name}, {n} bytes: decided in {ms} ms" (decided && ms < bound)
+  -- The form decoder itself, which github.com and the platform no longer reach by a
+  -- body's label, but other services do.
+  for (n, bound) in [(65536, 250), (2097152, 2000)] do
+    for (name, body) in [
+        ("distinct names", "&".intercalate ((List.range (n / 8)).map fun i => "k" ++ toString i ++ "=v")),
+        ("one name", rep (n / 4) "k=v&"),
+        ("escapes", "k=" ++ rep (n / 3) "%41")] do
+      let bytes := Bytes.ofString body
+      let t0 ← IO.monoMsNow
+      let answered ← IO.lazyPure fun _ => match Wire.formDecoder.step bytes true with
+        | .done _ _ => true
+        | .opaque => true
+        | .need _ => false
+      let ms := (← IO.monoMsNow) - t0
+      check s!"a form of {name}, {n} bytes: decoded or refused in {ms} ms" (answered && ms < bound)
+  check "a form within the pair limit is read"
+    (match Wire.formDecoder.step (Bytes.ofString "a=1&b=2&a=3") true with
+     | .done _ _ => true | _ => false)
+  check "one past it is not"
+    (match Wire.formDecoder.step (Bytes.ofString (rep (Wire.maxFormPairs + 1) "k=v&")) true with
+     | .opaque => true | _ => false)
+  check "a form body to github.com is read as JSON, and refused"
+    (spentOn (choose rr rt "POST" "github.com" "/up/proj/x" "k=v" (some "application/x-www-form-urlencoded"))).isNone
+  -- Reading: the bytes arrive a few at a time, and the decoder is asked as they do.
+  let feed (data : Bytes) (piece : Nat) : IO Net.Stream := do
+    let pos ← IO.mkRef 0
+    pure { read := fun _ => do
+             let p ← pos.get
+             let e := min data.size (p + piece)
+             pos.set e
+             pure (data.extract p e)
+           write := fun _ => pure (), close := pure (), describe := "test" }
+  for (n, bound) in [(65536, 250), (2097152, 2000)] do
+    let chunked := Bytes.ofString (rep (n / 6) "1\r\nx\r\n" ++ "0\r\n\r\n")
+    let pkts := Bytes.ofString (rep (n / 5) "0005x")
+    for (name, data, framing, decoder, piece) in [
+        ("chunked JSON, 1-byte chunks, 32-byte reads", chunked, Http.Framing.chunked,
+          Wire.Decoder.pure Wire.jsonDecoder, 32),
+        ("chunked JSON, 1-byte chunks, 64 KiB reads", chunked, .chunked, .pure Wire.jsonDecoder, 65536),
+        ("push without a flush, 16-byte reads", pkts, .length pkts.size, .pure Wire.gitReceivePackDecoder, 16),
+        ("push without a flush, 512-byte reads", pkts, .length pkts.size,
+          .pure Wire.gitReceivePackDecoder, 512)] do
+      let stream ← feed data piece
+      let t0 ← IO.monoMsNow
+      let _ ← Proxy.readBodyPrefix stream framing decoder ByteArray.empty n
+      let ms := (← IO.monoMsNow) - t0
+      check s!"{name}, {n} bytes: read in {ms} ms" (ms < bound)
+  -- A head, a request's or a response's, arriving 16 bytes at a time: searched once, and
+  -- parsed once it has ended.
+  let filler := rep 65000 "a"
+  let requestHead := Bytes.ofString ("GET / HTTP/1.1\r\nhost: x\r\nx-pad: " ++ filler ++ "\r\n\r\n")
+  let stream ← feed requestHead 16
+  let t0 ← IO.monoMsNow
+  let head ← Proxy.readHead stream { maxHeadSize := 65536 } ByteArray.empty (timeoutSeconds := 0)
+  let ms := (← IO.monoMsNow) - t0
+  check s!"a 64 KiB request head, 16 bytes at a time: read in {ms} ms" (head.isSome && ms < 250)
+  let responseHead := Bytes.ofString ("HTTP/1.1 200 OK\r\nx-pad: " ++ filler ++
+    "\r\ncontent-length: 2\r\n\r\nok")
+  let stream ← feed responseHead 16
+  let t0 ← IO.monoMsNow
+  let fetched ← Net.readResponse stream "GET" 1024
+  let ms := (← IO.monoMsNow) - t0
+  check s!"a 64 KiB response head, 16 bytes at a time: read in {ms} ms"
+    (fetched.status == 200 && fetched.body.size == 2 && ms < 250)
 
 end KleisTests

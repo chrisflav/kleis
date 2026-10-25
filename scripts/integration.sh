@@ -733,6 +733,140 @@ PY
 read -r SUB_PASS SUB_FAIL < "$DECL/counts" 2>/dev/null || { SUB_PASS=0; SUB_FAIL=1; }
 PASS=$SUB_PASS; FAIL=$SUB_FAIL
 echo
+echo "== an extension's service: the diff-reviewer platform, through its specs"
+# The shipped extension, the orchestra example's specs and grant as they are, and an account
+# bound to the TLS origin, which answers the agent API by echoing the request.  The platform's
+# own spec is for GitHub, which the origin stands in for at 127.0.0.1: the GitHub extension,
+# overridden in the configuration with api.github.com rewritten to that address.
+DR="$WORK/diff-reviewer"
+DR_PORT="$(free_port)"
+mkdir -p "$DR/home/config/specs" "$DR/home/config/grants" "$DR/home/config/credentials" "$DR/secrets" "$DR/issuers"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DR/secrets/root_key"
+printf 'agent-secret-55' > "$DR/secrets/agent"
+printf 'unused' > "$DR/secrets/github"
+cp "$ROOT/examples/orchestra/specs/reviewer.kleis" "$ROOT/examples/orchestra/specs/diff-reviewer-poster.kleis" \
+  "$DR/home/config/specs/"
+mkdir -p "$DR/home/config/extensions/github"
+for f in extension.toml manifest.toml; do
+  sed 's/api\.github\.com/127.0.0.1/g' "$ROOT/extensions/github/$f" > "$DR/home/config/extensions/github/$f"
+done
+printf 'pat-secret-66' > "$DR/secrets/pat"
+cp "$ROOT/examples/orchestra/grants/orchestra-reviewer-github.toml" "$DR/home/config/grants/"
+cat > "$DR/home/config/credentials/agent.toml" <<EOF2
+name        = "diff-reviewer/agent"
+service     = "diff-reviewer"
+hosts       = ["localhost"]
+secret_file = "$DR/secrets/agent"
+EOF2
+cat > "$DR/home/config/credentials/chrisflav.toml" <<EOF2
+name        = "github/chrisflav"
+service     = "github"
+secret_file = "$DR/secrets/pat"
+EOF2
+for c in orchestra-app orchestra-pat; do
+  printf 'name = "github/%s"\nservice = "github"\nsecret_file = "%s"\n' "$c" "$DR/secrets/github" \
+    > "$DR/home/config/credentials/$c.toml"
+done
+cat > "$DR/home/config/config.toml" <<EOF2
+listen = "127.0.0.1:$DR_PORT"
+mode = "connect"
+upstream_ca_file = "$WORK/origin.crt"
+extensions = ["github", "diff-reviewer"]
+
+[limits]
+max_decode_prefix = 2097152
+
+[[issuer]]
+name = "orchestra"
+grants = ["orchestra-*"]
+specs = ["reviewer"]
+facts = ["task_*"]
+max_ttl = "24h"
+token_file = "$DR/issuers/orchestra.token"
+EOF2
+(
+  export KLEIS_HOME="$DR/home" KLEIS_ROOT_KEY_FILE="$DR/secrets/root_key" KLEIS_EXTENSIONS_DIR="$ROOT/extensions"
+  unset KLEIS_STORE_KEY
+  "$KLEISD" --check > "$DR/check.log" 2>&1
+  check $? "the extension, both specs and the grant load" "$(tail -5 "$DR/check.log")"
+  "$KLEISD" > "$DR/kleisd.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DR_PORT/" && break
+    sleep 0.1
+  done
+  OUT="$(curl -s -H "Authorization: Bearer $(cat "$DR/issuers/orchestra.token")" \
+    -H 'content-type: application/json' \
+    -d '{"spec":"reviewer","ttl":"1h","bearer":"orchestra:t-1","facts":[
+         {"name":"task_upstream","terms":["acme","widgets"]},{"name":"task_issue","terms":[7]}]}' \
+    "http://127.0.0.1:$DR_PORT/.kleis/v1/derive")"
+  TASK="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"
+  [ -n "$TASK" ]; check $? "orchestra derives a reviewer token for one pull request" "$OUT"
+  SETUP="$(curl -s -H "Authorization: Bearer $TASK" "http://127.0.0.1:$DR_PORT/.kleis/v1/setup")"
+  echo "$SETUP" | python3 -c '
+import json, sys
+files = {f["path"]: f["content"] for f in json.load(sys.stdin)["files"]}
+assert json.loads(files[".config/diff-reviewer/agent.json"]) == {"url": "https://localhost", "token": "kleis"}
+' 2>/dev/null
+  check $? "setup writes the agent's config, with the placeholder token" "$SETUP"
+  agent() {
+    curl -s --proxy "http://kleis:$TASK@127.0.0.1:$DR_PORT" --proxy-basic --cacert "$("$KLEIS" ca)" \
+      -H "Authorization: Bearer kleis" -o "$DR/out" -w '%{http_code}' "$@"
+  }
+  API="https://localhost:$TLS_PORT/api/agent/v1/repos"
+  CODE="$(agent "$API/acme/widgets/pulls/7")"
+  [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer agent-secret-55"' "$DR/out" \
+    && ! grep -q 'Bearer kleis' "$DR/out"
+  check $? "the job of its own pull request is read on the agent token, the placeholder gone" "got $CODE: $(cat "$DR/out")"
+  CODE="$(agent "$API/acme/widgets/pulls/7/diff")"
+  [ "$CODE" = "200" ]; check $? "and its diff" "got $CODE: $(cat "$DR/out")"
+  CODE="$(agent -H 'content-type: application/json' \
+    -d '{"headSha":"abc","prType":null,"review":{"decision":"comment","body":"b","comments":[]}}' \
+    "$API/acme/widgets/pulls/7/review")"
+  [ "$CODE" = "200" ] && grep -q '"method": "POST"' "$DR/out"
+  check $? "its review is submitted" "got $CODE: $(cat "$DR/out")"
+  # The platform's largest, 200 comments, some 1.6 MB: past the default limits, inside the
+  # example's.
+  python3 -c '
+import json
+c = [{"file": f"F{i}.lean", "start_line": i, "end_line": i + 1, "category": "style",
+      "severity": "minor", "body": "x" * 5400, "suggestion": "y" * 2600} for i in range(200)]
+print(json.dumps({"headSha": "abc", "prType": None,
+                  "review": {"decision": "comment", "body": "b", "comments": c}}))' > "$DR/big-submission"
+  CODE="$(agent -H 'content-type: application/json' --data-binary @"$DR/big-submission" \
+    "$API/acme/widgets/pulls/7/review")"
+  [ "$CODE" = "200" ]; check $? "and a review of 200 comments" "got $CODE: $(head -c 300 "$DR/out")"
+  CODE="$(agent "$API/acme/widgets/pulls/8")"
+  [ "$CODE" = "403" ]; check $? "another pull request's job is refused" "got $CODE"
+  CODE="$(agent "$API/acme/other/pulls/7")"
+  [ "$CODE" = "403" ]; check $? "and another repository's" "got $CODE"
+  CODE="$(agent "https://localhost:$TLS_PORT/api/v1/jobs")"
+  [ "$CODE" = "403" ]; check $? "and the rest of the platform's API" "got $CODE"
+  POSTER="$("$KLEIS" token issue --spec diff-reviewer-poster --bearer diff-reviewer --ttl 1h)"
+  github() {
+    curl -s --proxy "http://kleis:$POSTER@127.0.0.1:$DR_PORT" --proxy-basic --cacert "$("$KLEIS" ca)" \
+      -H "Authorization: Bearer kleis" -o "$DR/out" -w '%{http_code}' "$@"
+  }
+  python3 -c '
+import json
+c = [{"path": f"F{i}.lean", "start_line": i, "line": i + 1, "side": "RIGHT", "start_side": "RIGHT",
+      "body": "x" * 8000 + "\n```suggestion\nexact h\n```"} for i in range(200)]
+print(json.dumps({"commit_id": "abc", "event": "COMMENT", "body": "b", "comments": c}))' > "$DR/big-review"
+  CODE="$(github -H 'content-type: application/json' --data-binary @"$DR/big-review" \
+    "https://127.0.0.1:$TLS_PORT/repos/chrisflav/kleis/pulls/7/reviews")"
+  [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer pat-secret-66"' "$DR/out" \
+    && ! grep -q 'Bearer kleis' "$DR/out"
+  check $? "the platform posts a review of 200 comments on a listed repository, with the PAT" \
+    "got $CODE: $(head -c 300 "$DR/out")"
+  CODE="$(github -H 'content-type: application/json' -d '{"event":"COMMENT","body":"b"}' \
+    "https://127.0.0.1:$TLS_PORT/repos/acme/widgets/pulls/7/reviews")"
+  [ "$CODE" = "403" ]; check $? "and none on a repository not listed" "got $CODE"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  echo "$PASS $FAIL" > "$DR/counts"
+)
+read -r SUB_PASS SUB_FAIL < "$DR/counts" 2>/dev/null || { SUB_FAIL=$((FAIL+1)); SUB_PASS=$PASS; }
+PASS=$SUB_PASS; FAIL=$SUB_FAIL
+echo
 echo "== the audit log"
 "$KLEIS" audit verify | grep -q 'chain intact'
 check $? "the audit chain is intact" "$("$KLEIS" audit verify)"

@@ -87,17 +87,26 @@ private def checkFraming (h : Headers) : Except String Unit := do
       if acc.contains v then acc else v :: acc
     if distinct.length > 1 then throw "conflicting Content-Length fields"
 
-/-- Locate the end of the header block: the first empty line. -/
-private def findHeadEnd? (buf : Bytes) : Option (Nat × Nat) :=
-  match Bytes.indexOf? buf (Bytes.ofString "\r\n\r\n") with
+/-- Locate the end of the header block: the first empty line, looking from `from_`.
+
+A caller reading a head as it arrives passes where the last search stopped, less the
+three bytes an end could straddle, so the bytes are searched once and not once per
+read. -/
+private def findHeadEnd? (buf : Bytes) (from_ : Nat) : Option (Nat × Nat) :=
+  match Bytes.indexOf? buf (Bytes.ofString "\r\n\r\n") from_ with
   | some i => some (i, i + 4)
-  | none => match Bytes.indexOf? buf (Bytes.ofString "\n\n") with
+  | none => match Bytes.indexOf? buf (Bytes.ofString "\n\n") from_ with
     | some i => some (i, i + 2)
     | none => none
 
-/-- Parse a request head. -/
-def readRequest (buf : Bytes) (limits : Limits := {}) : Parsed Request :=
-  match findHeadEnd? buf with
+/-- Where to resume looking for the end of a head in a buffer of which the first
+`searched` bytes held none. -/
+def resumeHeadSearch (searched : Nat) : Nat := searched - min searched 3
+
+/-- Parse a request head, once it has ended: nothing is parsed before. -/
+def readRequest (buf : Bytes) (limits : Limits := {}) (searchFrom : Nat := 0) :
+    Parsed Request :=
+  match findHeadEnd? buf searchFrom with
   | none =>
     if buf.size > limits.maxHeadSize then .error "header block too large" else .need
   | some (blockEnd, consumed) =>
@@ -124,8 +133,9 @@ def readRequest (buf : Bytes) (limits : Limits := {}) : Parsed Request :=
 
 /-- Parse a response head.  The request method is needed because it decides
 whether a body is present at all. -/
-def readResponse (buf : Bytes) (method : String) (limits : Limits := {}) : Parsed Response :=
-  match findHeadEnd? buf with
+def readResponse (buf : Bytes) (method : String) (limits : Limits := {})
+    (searchFrom : Nat := 0) : Parsed Response :=
+  match findHeadEnd? buf searchFrom with
   | none =>
     if buf.size > limits.maxHeadSize then .error "header block too large" else .need
   | some (blockEnd, consumed) =>

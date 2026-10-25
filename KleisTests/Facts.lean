@@ -45,6 +45,34 @@ def factsTests : IO Unit := do
   check "and it says it was not truncated" (bodyFacts.contains "body_truncated(false)")
   let truncated := (Facts.flatten "body" body 1).map render
   checkEq "past the cap, nothing but the flag" truncated ["body_truncated(true)"]
+  -- `body` above is 3 scalars and 4 containers: 3 + 2 × 4 = 11 facts.
+  check "every fact is charged, containers too"
+    ((Facts.flatten "body" body 11).map render |>.contains "body_truncated(false)")
+  checkEq "so one fewer is too few" ((Facts.flatten "body" body 10).map render) ["body_truncated(true)"]
+  let empties : Value := .array (List.replicate 100 (.array []))
+  checkEq "empty containers are not free"
+    ((Facts.flatten "body" empties 100).map render) ["body_truncated(true)"]
+  let nest (n : Nat) : Value := (List.range n).foldl (fun v _ => .array [v]) (.integer 1)
+  check s!"nesting {Facts.maxBodyDepth} deep is read"
+    ((Facts.flatten "body" (nest Facts.maxBodyDepth) 1000).map render |>.contains "body_truncated(false)")
+  checkEq "one deeper is not" ((Facts.flatten "body" (nest (Facts.maxBodyDepth + 1)) 1000).map render)
+    ["body_truncated(true)"]
+  checkEq "and a truncated body has no whole-body fact either"
+    ((Facts.ofBody empties 100).map render) ["body_truncated(true)"]
+
+  group "reading JSON"
+  let deep (n : Nat) : String := String.join (List.replicate n "[") ++ String.join (List.replicate n "]")
+  check "nesting within the bound parses" (Json.parse (deep 100) (maxDepth := 100)).toOption.isSome
+  check "nesting past it does not" (Json.parse (deep 101) (maxDepth := 100)).toOption.isNone
+  check "a million levels is refused, not a stack overflow" (Json.parse (deep 1000000)).toOption.isNone
+  let wide := "{" ++ ",".intercalate ((List.range 100000).map fun i => "\"k" ++ toString i ++ "\":1") ++ "}"
+  let t0 ← IO.monoMsNow
+  let dup ← IO.lazyPure fun _ => (Json.parse wide).toOption.map (·.hasDuplicateKeys)
+  let ms := (← IO.monoMsNow) - t0
+  check s!"an object of 100 000 keys is read and checked for duplicates in {ms} ms"
+    (dup == some false && ms < 2000)
+  check "and a duplicate is still found"
+    ((Json.parse "{\"a\":1,\"b\":2,\"a\":3}").toOption.map (·.hasDuplicateKeys) == some true)
 
   group "route patterns"
   match Facts.Pattern.parse "POST github.com /{owner}/{repo%.git}/git-receive-pack" with

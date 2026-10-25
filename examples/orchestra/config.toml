@@ -18,7 +18,17 @@ passthrough = ["*"]
 # The services kleis knows, from the extensions it ships (extensions/ in the
 # repository, /usr/share/kleis/extensions in the image).  With "github" here, the
 # manifest comes from the extension; do not also copy github.toml into services/.
-extensions = ["github", "zulip", "caldav", "mail"]
+extensions = ["github", "zulip", "caldav", "mail", "diff-reviewer"]
+
+# How much of a request body any manifest may have read: the smaller of this and
+# the manifest's own `max_decode_prefix`.  The default, 64 KiB, refuses a pull
+# request review with more than a few dozen inline comments, both a job's
+# submission to diff-reviewer and the platform's review on GitHub; this admits
+# the platform's largest, 200 comments.  How many facts a body becomes is each
+# manifest's `max_body_facts` (1664 for GitHub, 1856 for diff-reviewer); a
+# `max_body_facts` here is read, but a manifest's own value is what applies.
+[limits]
+max_decode_prefix = 2097152
 
 # The orchestrator makes a token per job: through /.kleis/v1/derive from one of
 # the specs below (specs/*.kleis), or through /.kleis/v1/tokens naming grants.  It
@@ -27,6 +37,6 @@ extensions = ["github", "zulip", "caldav", "mail"]
 [[issuer]]
 name    = "orchestra"
 grants  = ["orchestra-*"]
-specs   = ["worker", "secretary"]
+specs   = ["worker", "secretary", "reviewer"]
 facts   = ["task_*"]
 max_ttl = "24h"

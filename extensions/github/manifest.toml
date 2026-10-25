@@ -16,8 +16,22 @@ name  = "github"
 hosts = ["github.com", "api.github.com", "codeload.github.com"]
 modes = ["rewrite", "connect"]
 
-max_body_facts   = 512
-max_decode_prefix = 1048576
+# How much of a body is read, and into how many facts. A body past either is
+# refused, not relayed unread. Sized for the largest review diff-reviewer posts:
+# 200 inline comments, at eight facts each (path, start_line, line, side,
+# start_side, body — a suggestion is in the body — and two for the comment
+# itself), and up to some 10 KiB of text.  The daemon's own `[limits]
+# max_decode_prefix` (64 KiB unless set) also bounds the first, whichever is
+# smaller.  Measured worst cases for the whole path — the head and the body read
+# a few bytes at a time, decoded, decided — over bodies built for it of every
+# shape (JSON, forms, multipart, GraphQL, git, chunked framing): 2 MiB, about
+# 0.5 s and under 1 s; 64 KiB, under 15 ms.  A body near `max_body_facts` takes
+# longer to decide whatever its size, up to about 0.15 s (a fetch of some 1300
+# wants, 154 ms; multipart, 91 ms; a 200-comment review, about 0.18 s): that is
+# the datalog engine, and it grows with the limit.  A client writing a large
+# body in pieces of under about 128 bytes runs out of reads and is refused.
+max_body_facts    = 1664
+max_decode_prefix = 2097152
 
 # What a request is about, for routing credentials (a grant's `credential_route`):
 # `owner/repo`, the repository being created, or the organisation.
@@ -26,15 +40,19 @@ resources = ["repository", "new_repository", "organization"]
 # Rules deriving what a request means from the primitive and body facts.
 # A manifest may add facts and rules; it may never add a check or a policy.
 datalog = '''
+// A rule joining body facts with body facts is quadratic in the body, so it names the
+// operation first: then it costs nothing on a request it is not about.
 ref_update($ref) <-
   body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref";
 
 creates_ref($ref) <-
+  operation("push"),
   body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref",
   body($q, true), $q.length() == 3, $q.get(0) == "updates",
   $q.get(1) == $p.get(1), $q.get(2) == "create";
 
 deletes_ref($ref) <-
+  operation("push"),
   body($p, $ref), $p.length() == 3, $p.get(0) == "updates", $p.get(2) == "ref",
   body($q, true), $q.length() == 3, $q.get(0) == "updates",
   $q.get(1) == $p.get(1), $q.get(2) == "delete";
@@ -113,6 +131,13 @@ match   = "POST github.com /{owner}/{repo}/git-upload-pack"
 media   = ["*"]
 decoder = "json"
 match   = "POST|PUT|PATCH|DELETE api.github.com /{rest*}"
+
+# And so is every other write to github.com, which no route allows: read as JSON it is
+# refused as undecodable, rather than decoded by whatever media type it is labelled.
+[[decoder]]
+media   = ["*"]
+decoder = "json"
+match   = "POST|PUT|PATCH|DELETE github.com /{rest*}"
 
 # ---------------------------------------------------------------- git
 

@@ -1,4 +1,5 @@
 import Kleis.Wire.Decoder
+import Std.Data.HashMap
 
 /-!
 # Form decoders
@@ -22,28 +23,55 @@ open LeanBiscuit.Datalog (Value ValueKey)
 /-- Group repeated names, keeping order.  A name seen once maps to its value; a
 name seen more than once maps to the array of its values. -/
 private def groupPairs (pairs : List (String × String)) : Value :=
-  let names := pairs.foldl (init := ([] : List String)) fun acc (k, _) =>
-    if acc.contains k then acc else acc ++ [k]
-  .map (names.map fun n =>
-    let vs := (pairs.filter fun (k, _) => k == n).map (·.2)
+  -- One pass, with a map from each name to its values (reversed): a list searched per
+  -- name would cost the square of the number of names.
+  let (order, values) := pairs.foldl
+    (init := ((#[] : Array String), (∅ : Std.HashMap String (List String))))
+    fun (order, values) (k, v) =>
+      match values[k]? with
+      | some vs => (order, values.insert k (v :: vs))
+      | none => (order.push k, values.insert k [v])
+  .map (order.toList.map fun n =>
+    let vs := (values.getD n []).reverse
     (ValueKey.str n, match vs with
       | [v] => Value.str v
       | _ => Value.array (vs.map Value.str)))
 
-/-- Decode `application/x-www-form-urlencoded`. -/
+/-- The most pairs a form body may have.  Every pair is at least one fact, so this is
+more than any shipped manifest's `max_body_facts` lets through: a form with more could
+not be read anyway, and stopping here means a large one costs nothing to refuse. -/
+def maxFormPairs : Nat := 4096
+
+/-- The pairs of a form body, walked `&` to `&`, or `none` past `maxFormPairs`. -/
+private def formPairs (buf : Bytes) : Option (List (String × String)) :=
+  let rec go (i : Nat) (n : Nat) (acc : List (String × String)) (fuel : Nat) :
+      Option (List (String × String)) :=
+    match fuel with
+    | 0 => none
+    | fuel + 1 =>
+      if i > buf.size then some acc.reverse
+      else
+        let stop := (Bytes.indexOfByte? buf 38 i).getD buf.size
+        let part := Bytes.toStringLossy (Bytes.slice buf i stop)
+        if part.isEmpty then go (stop + 1) n acc fuel
+        else if n ≥ maxFormPairs then none
+        else
+          let pair := match Str.splitOnce? part "=" with
+            | some (k, v) => (Str.percentDecode k true, Str.percentDecode v true)
+            | none => (Str.percentDecode part true, "")
+          go (stop + 1) (n + 1) (pair :: acc) fuel
+  go 0 0 [] (buf.size + 2)
+
+/-- Decode `application/x-www-form-urlencoded`.  A form of more than `maxFormPairs`
+pairs is not read: it is opaque, which under a decoder a manifest bound is refused. -/
 def formDecoder : PureDecoder where
   name := "form"
   media := #["application/x-www-form-urlencoded"]
   step := fun buf complete =>
     if !complete then .need (buf.size + 1)
-    else
-      let text := Bytes.toStringLossy buf
-      let pairs := (text.splitOn "&").filterMap fun part =>
-        if part.isEmpty then none
-        else match Str.splitOnce? part "=" with
-          | some (k, v) => some (Str.percentDecode k true, Str.percentDecode v true)
-          | none => some (Str.percentDecode part true, "")
-      .done (groupPairs pairs) buf.size
+    else match formPairs buf with
+      | some pairs => .done (groupPairs pairs) buf.size
+      | none => .opaque
 
 /-- One parameter of a `Content-Disposition` field. -/
 private def dispositionParam (field : String) (name : String) : Option String :=
@@ -100,7 +128,9 @@ def multipartDecoder : PureDecoder where
     | none => .need (buf.size + 1)
     | some j =>
       let sep := Bytes.take buf j
-      if sep.size < 3 then .opaque
+      -- A boundary is at most 70 characters (RFC 2046), and searching for a longer one
+      -- would cost its length at every byte of the body.
+      if sep.size < 3 || sep.size > 72 then .opaque
       else
         let parts := multipartParts buf sep 0 256 []
         .done (.map [(.str "parts", .array parts),

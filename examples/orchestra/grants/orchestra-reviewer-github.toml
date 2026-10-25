@@ -1,0 +1,50 @@
+# What an orchestra review job may do on GitHub: read, and nothing else. The `reviewer` spec
+# includes it (specs/reviewer.kleis).
+#
+# Not `orchestra-github` with fewer facts. That grant keeps a read-only job from pushing
+# (`task_writable`), but every other write in it turns on a tool: a read-only job given
+# `create_pr` or `comment` may still open pull requests, comment and review — and with its fork
+# equal to its upstream, as for a repository the App is installed on, `fork($o, $r)` holds of the
+# upstream too, so `open_pr` there needs no head from a fork at all. Here there is no rule that
+# allows a write, whatever facts the token carries: a review job posts nothing to GitHub itself;
+# the platform posts what its operator approved (`diff-reviewer-poster`).
+#
+# Which credential: the job's upstream on the operator's token, its fork and GraphQL on the App's,
+# as in `orchestra-github`; anything else is read anonymously.
+
+name         = "orchestra-reviewer-github"
+service      = "github"
+max_lifetime = "24h"
+anonymous    = true
+credentials  = ["github/orchestra-app", "github/orchestra-pat"]
+
+datalog = '''
+check if issued_by("orchestra");
+
+// ---------------------------------------------------------------- credentials
+
+use_credential("github/orchestra-app") <- repository($o, $r), task_fork($o, $r);
+use_credential("github/orchestra-app") <- operation("graphql");
+use_credential("github/orchestra-pat") <- repository($o, $r), task_upstream($o, $r);
+
+// ---------------------------------------------------------------- reading
+
+// The ref advertisement for a fetch, not for a push.
+allowed("discover") <- operation("discover"), discover_service("git-upload-pack");
+allowed("fetch") <- operation("fetch");
+allowed("read") <- operation("read");
+allowed("download") <- operation("download");
+allowed("api_read") <- operation("api_read");
+// Queries only; see the reject below.
+allowed("graphql") <- operation("graphql");
+
+check if allowed($x);
+
+// ---------------------------------------------------------------- never
+
+// Every operation in a GraphQL document is read, so a mutation behind a query
+// is caught too.
+reject if graphql_operation($t), $t != "query";
+
+allow if grant("orchestra-reviewer-github");
+'''

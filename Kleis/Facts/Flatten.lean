@@ -30,9 +30,13 @@ Containers are described rather than duplicated.  Emitting a fact for every
 subtree would repeat every scalar once per ancestor; `body_kind` and `body_len`
 say what a rule actually needs to know about a node it is not descending into.
 
-The whole thing is bounded.  Past `limit` scalars nothing is emitted but
-`body_truncated(true)`, and the authorizer's preamble denies on that fact — a
-body too large to reason about is a refusal, not a blind spot.
+The whole thing is bounded, in what it emits and so in what the authorizer has
+to evaluate.  Every fact is charged against `limit`: one per scalar, two per
+container (its `body_kind` and its `body_len`), so a body of nothing but empty
+arrays costs what its facts cost.  Nesting is bounded too, by `maxBodyDepth`.
+Past either nothing is emitted but `body_truncated(true)`, and the authorizer's
+preamble denies on that fact — a body too large to reason about is a refusal,
+not a blind spot.
 -/
 
 namespace Kleis
@@ -44,6 +48,9 @@ open LeanBiscuit.Datalog (Value ValueKey)
 /-- A path into a value: string keys and array indices, outermost first. -/
 abbrev Path := List Builder.Term
 
+/-- How deeply a body's arrays and objects may nest before it is too deep to read. -/
+def maxBodyDepth : Nat := 64
+
 /-- What flattening accumulates: the leaves and the container descriptions
 found so far, in reverse, and how much budget is left. -/
 private structure Acc where
@@ -51,71 +58,90 @@ private structure Acc where
   leaves : List (Path × Value)
   /-- Container descriptions, reversed. -/
   shapes : List (Path × String × Nat)
-  /-- Remaining budget, in leaves. -/
+  /-- Remaining budget, in facts. -/
   budget : Nat
-  /-- Whether the budget ran out. -/
+  /-- Whether the budget or the depth ran out. -/
   truncated : Bool
 
 mutual
 
-/-- Walk one node. -/
-private def walk (path : Path) (v : Value) (a : Acc) : Acc :=
-  if a.budget == 0 then { a with truncated := true } else
+/-- Walk one node, `depth` containers below the top. -/
+private def walk (path : Path) (depth : Nat) (v : Value) (a : Acc) : Acc :=
+  if a.truncated || a.budget == 0 then { a with truncated := true } else
+  -- A container costs its two facts, and may not open past the depth bound.
+  let open_ (kind : String) (n : Nat) (a : Acc) : Option Acc :=
+    if depth ≥ maxBodyDepth || a.budget < 2 then none
+    else some { a with shapes := (path, kind, n) :: a.shapes, budget := a.budget - 2 }
   match v with
-  | .array l =>
-    let a := { a with shapes := (path, "array", l.length) :: a.shapes }
-    walkList path 0 l a
-  | .set l =>
-    let a := { a with shapes := (path, "set", l.length) :: a.shapes }
-    walkList path 0 l a
-  | .map entries =>
-    let a := { a with shapes := (path, "map", entries.length) :: a.shapes }
-    walkEntries path entries a
+  | .array l => match open_ "array" l.length a with
+    | some a => walkList path depth 0 l a
+    | none => { a with truncated := true }
+  | .set l => match open_ "set" l.length a with
+    | some a => walkList path depth 0 l a
+    | none => { a with truncated := true }
+  | .map entries => match open_ "map" entries.length a with
+    | some a => walkEntries path depth entries a
+    | none => { a with truncated := true }
   | scalar =>
     { a with leaves := (path, scalar) :: a.leaves, budget := a.budget - 1 }
 
-/-- Walk the elements of an array or set, indexed by position. -/
-private def walkList (path : Path) (i : Nat) : List Value → Acc → Acc
+/-- Walk the elements of an array or set, indexed by position, stopping at the first that
+does not fit. -/
+private def walkList (path : Path) (depth i : Nat) : List Value → Acc → Acc
   | [], a => a
   | x :: xs, a =>
-    let a := walk (path ++ [.integer (Int.ofNat i)]) x a
-    walkList path (i + 1) xs a
+    if a.truncated then a else
+    let a := walk (path ++ [.integer (Int.ofNat i)]) (depth + 1) x a
+    walkList path depth (i + 1) xs a
 
-/-- Walk the members of a map. -/
-private def walkEntries (path : Path) : List (ValueKey × Value) → Acc → Acc
+/-- Walk the members of a map, stopping at the first that does not fit. -/
+private def walkEntries (path : Path) (depth : Nat) : List (ValueKey × Value) → Acc → Acc
   | [], a => a
   | (k, v) :: xs, a =>
+    if a.truncated then a else
     let key : Builder.Term := match k with
       | .integer i => .integer i
       | .str s => .str s
-    let a := walk (path ++ [key]) v a
-    walkEntries path xs a
+    let a := walk (path ++ [key]) (depth + 1) v a
+    walkEntries path depth xs a
 
 end
 
-/-- Flatten a decoded body into facts, under the names `body`, `body_kind` and
-`body_len`, or into `body_truncated(true)` if it is too large.
-
-`pred` is `"body"` for a request and `"response_body"` for a response, so the
-two never join by accident. -/
-def flatten (pred : String) (v : Value) (limit : Nat) : List Fact :=
-  let a := walk [] v { leaves := [], shapes := [], budget := limit, truncated := false }
-  if a.truncated then [fact s!"{pred}_truncated" [.bool true]]
+/-- The flattening of a body, or `none` if it is past the bounds. -/
+private def flatten? (pred : String) (v : Value) (limit : Nat) : Option (List Fact) :=
+  let a := walk [] 0 v { leaves := [], shapes := [], budget := limit, truncated := false }
+  if a.truncated then none
   else
     let leaves := a.leaves.reverse.map fun (p, val) =>
       fact pred [.array p, ofValue val]
     let shapes := a.shapes.reverse.flatMap fun (p, kind, n) =>
       [ fact s!"{pred}_kind" [.array p, .str kind],
         fact s!"{pred}_len" [.array p, .integer (Int.ofNat n)] ]
-    leaves ++ shapes ++ [fact s!"{pred}_truncated" [.bool false]]
+    some (leaves ++ shapes ++ [fact s!"{pred}_truncated" [.bool false]])
 
-/-- The body facts for a request: the whole value, and its flattening. -/
-def ofBody (v : Value) (limit : Nat) : List Fact :=
-  fact "request_body" [ofValue v] :: flatten "body" v limit
+/-- Flatten a decoded body into facts, under the names `body`, `body_kind` and
+`body_len`, or into `body_truncated(true)` if it has more than `limit` of them or
+nests deeper than `maxBodyDepth`.
+
+`pred` is `"body"` for a request and `"response_body"` for a response, so the
+two never join by accident. -/
+def flatten (pred : String) (v : Value) (limit : Nat) : List Fact :=
+  (flatten? pred v limit).getD [fact s!"{pred}_truncated" [.bool true]]
+
+/-- The whole value as one fact, and its flattening; or, for a body past the bounds, only
+`…_truncated(true)`. The whole value is built only for a body within them: a term for a map
+costs time quadratic in its keys, and a body that is refused anyway is not worth it. -/
+private def whole (pred wholePred : String) (v : Value) (limit : Nat) : List Fact :=
+  match flatten? pred v limit with
+  | some flat => fact wholePred [ofValue v] :: flat
+  | none => [fact s!"{pred}_truncated" [.bool true]]
+
+/-- The body facts for a request. -/
+def ofBody (v : Value) (limit : Nat) : List Fact := whole "body" "request_body" v limit
 
 /-- The body facts for a response. -/
 def ofResponseBody (v : Value) (limit : Nat) : List Fact :=
-  fact "response_body" [ofValue v] :: flatten "response_body" v limit
+  whole "response_body" "response_body" v limit
 
 /-- What is emitted when no decoder was configured for the body's media type.
 

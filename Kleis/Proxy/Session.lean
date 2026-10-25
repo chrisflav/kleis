@@ -70,7 +70,7 @@ def readHead (s : Net.Stream) (limits : Http.Limits) (already : Bytes)
   -- and stopping it when the head arrives drops its hold on the stream at once —
   -- a sleeping task would keep both for the whole timeout on every connection,
   -- which anyone able to connect could use to exhaust them.
-  if timeoutSeconds == 0 then return ← go already 4096
+  if timeoutSeconds == 0 then return ← go already 0 4096
   let timer ← Std.Internal.UV.Timer.mk (UInt64.ofNat (timeoutSeconds * 1000)) false
   let fired ← timer.next
   -- The callback may run on libuv's own loop, where waiting for a socket operation —
@@ -79,10 +79,12 @@ def readHead (s : Net.Stream) (limits : Http.Limits) (already : Bytes)
   let _ ← IO.mapTask (t := fired.result?) fun r => do
     if r.isSome then
       let _ ← IO.asTask (prio := .dedicated) s.close
-  try go already 4096 finally timer.stop
+  try go already 0 4096 finally timer.stop
 where
-  go (buf : Bytes) (fuel : Nat) : IO (Option (Http.Request × Bytes)) := do
-    match Http.readRequest buf limits with
+  -- `searched` bytes of `buf` are known to hold no end of the head: each read is
+  -- searched once, and the head parsed once, when it has ended.
+  go (buf : Bytes) (searched fuel : Nat) : IO (Option (Http.Request × Bytes)) := do
+    match Http.readRequest buf limits (Http.resumeHeadSearch searched) with
     | .done r consumed => return some (r, Bytes.drop buf consumed)
     | .error e => throw (IO.userError e)
     | .need =>
@@ -95,7 +97,7 @@ where
           -- a partial head is not.
           if buf.size == 0 then return none
           else throw (IO.userError "the client closed mid-request")
-        go (buf ++ chunk) fuel
+        go (buf ++ chunk) buf.size fuel
 
 /-- Undo rewrite mode's path encoding: `/<scheme>/<host>/<rest>`. -/
 def unrewrite? (target : String) : Option (String × String × String) := do

@@ -3,19 +3,16 @@ import Kleis.Http.Reader
 /-!
 # Chunked transfer coding
 
-Two jobs, and they are deliberately separate.
+One reader, `Reader`, which is fed the bytes as they arrive and carries its place
+from one read to the next: each byte is looked at once, and it holds no more than
+one size or trailer line of the framing.  The data it keeps, up to a limit, or
+lets go.  `scan` (where does the body end?) and `decode` (what is its entity?)
+are that reader run over a buffer, so every caller agrees on where a body ends —
+the line between one message and the next, which a proxy must never draw
+differently from the origin.
 
-`decode` reassembles a body from a buffer, for the case where the body has to
-be *understood*: a decoder wants a prefix of the entity, not a prefix of its
-framing.
-
-`scan` finds where a body ends without reassembling it, for the case where the
-body is merely being relayed.  A push of a hundred megabytes goes through
-`scan`, and the proxy never holds more than one chunk header.
-
-Neither is `partial`.  Every chunk costs at least three bytes of framing — a
-size digit and a CRLF — so a buffer of `n` bytes holds fewer than `n` chunks,
-and that is the fuel both loops are given.
+The framing is read strictly: each line ends in CRLF, and each chunk's data is
+followed by exactly CRLF.  A body that is not so framed is refused, not guessed at.
 -/
 
 namespace Kleis
@@ -40,40 +37,6 @@ inductive Scan where
   | error (message : String)
   deriving Repr, Inhabited
 
-/-- Parse a chunk size line at `i`, returning the size and the index just past
-its line feed.  A chunk extension after `;` is ignored, as it must be. -/
-private def chunkHeader? (buf : Bytes) (i : Nat) : Option (Nat × Nat) := do
-  let nl ← Bytes.indexOfByte? buf 10 i
-  let line := Bytes.toStringLossy (Bytes.slice buf i nl)
-  let line := (line.splitOn ";").headD line
-  let size ← Str.ofHex? (Str.trim line)
-  pure (size, nl + 1)
-
-/-- Skip the trailer section, which ends at the first empty line. -/
-private def trailers (buf : Bytes) : Nat → Nat → Scan
-  | _, 0 => .error "too many trailer fields"
-  | i, fuel + 1 =>
-    match Bytes.indexOfByte? buf 10 i with
-    | none => if buf.size - i > maxChunkLine then .error "trailer line too long" else .need
-    | some nl =>
-      if (Bytes.trim (Bytes.slice buf i nl)).size == 0 then .done (nl + 1)
-      else trailers buf (nl + 1) fuel
-
-/-- Find the end of a chunked body, without copying it. -/
-private def scanFrom (buf : Bytes) : Nat → Nat → Scan
-  | _, 0 => .error "chunked body has too many chunks"
-  | i, fuel + 1 =>
-    match chunkHeader? buf i with
-    | none =>
-      if buf.size - i > maxChunkLine then .error "chunk size line too long" else .need
-    | some (0, afterHeader) => trailers buf afterHeader maxTrailers
-    | some (size, afterHeader) =>
-      let next := afterHeader + size + 2
-      if next > buf.size then .need else scanFrom buf next fuel
-
-/-- Find the end of a chunked body. -/
-def scan (buf : Bytes) : Scan := scanFrom buf 0 (buf.size + 1)
-
 /-- The result of reassembling a body. -/
 inductive Decoded where
   /-- Incomplete. -/
@@ -86,31 +49,121 @@ inductive Decoded where
   | error (message : String)
   deriving Repr, Inhabited
 
-/-- Reassemble a chunked body, stopping once `limit` entity bytes are in hand.
+/-! ## Reading as the bytes arrive -/
 
-Stopping early is the point: a decoder is given a prefix and either decides or
-asks for more, so the proxy never has to hold a whole push in memory to find
-out which refs it updates. -/
-private def decodeFrom (buf : Bytes) (limit : Nat) : Nat → Bytes → Nat → Decoded
-  | _, _acc, 0 => .error "chunked body has too many chunks"
-  | i, acc, fuel + 1 =>
-    if acc.size ≥ limit then .done acc i false
-    else match chunkHeader? buf i with
+/-- Where a reader is in the framing. -/
+inductive Phase where
+  /-- In a chunk-size line, this much of it seen. -/
+  | size (line : Bytes)
+  /-- In a chunk's data, this many bytes of it still to come. -/
+  | data (left : Nat)
+  /-- In the CRLF after a chunk's data, this many of its two bytes still to come. -/
+  | gap (left : Nat)
+  /-- In the trailer section: the current line so far, and how many more lines it may have. -/
+  | trailer (line : Bytes) (left : Nat)
+  /-- Past the end. -/
+  | finished
+  deriving Inhabited
+
+/-- A chunked body being read. -/
+structure Reader where
+  /-- Where it is. -/
+  phase : Phase := .size ByteArray.empty
+  /-- The entity bytes kept so far: the data of each chunk, up to `limit`. -/
+  entity : Bytes := ByteArray.empty
+  /-- How many entity bytes to keep. -/
+  limit : Nat := 0
+  /-- Whether data past `limit` was let go, so that `entity` is not the whole body. -/
+  overflow : Bool := false
+  deriving Inhabited
+
+/-- Is the body over? -/
+def Reader.finished (r : Reader) : Bool :=
+  match r.phase with
+  | .finished => true
+  | _ => false
+
+/-- Read a chunk-size line: the size, with any extension after `;` ignored. -/
+private def sizeOf? (line : Bytes) : Option Nat :=
+  let text := Bytes.toStringLossy line
+  Str.ofHex? (Str.trim ((text.splitOn ";").headD text))
+
+/-- Feed the reader the next bytes. On the end of the body, also the number of
+these bytes that belonged to it: the rest are whatever the client sent next. -/
+def Reader.feed (r : Reader) (buf : Bytes) : Except String (Reader × Option Nat) := do
+  let mut r := r
+  let mut i := 0
+  -- Each pass consumes at least one byte, or ends.
+  for _ in [0:buf.size + 1] do
+    if i ≥ buf.size then break
+    match r.phase with
+    | .finished => break
+    | .data left =>
+      let n := min left (buf.size - i)
+      let keep := min n (r.limit - min r.limit r.entity.size)
+      if keep > 0 then r := { r with entity := r.entity ++ Bytes.slice buf i (i + keep) }
+      if keep < n then r := { r with overflow := true }
+      i := i + n
+      r := { r with phase := if left == n then .gap 2 else .data (left - n) }
+    | .gap left =>
+      -- Exactly CRLF: anything else there is not this framing, and a reader that
+      -- skipped it would disagree with an origin that does not.
+      let want : UInt8 := if left == 2 then 13 else 10
+      if buf.get! i != want then throw "a chunk's data must be followed by CRLF"
+      i := i + 1
+      r := { r with phase := if left == 1 then .size ByteArray.empty else .gap (left - 1) }
+    | .size line =>
+      match Bytes.indexOfByte? buf 10 i with
       | none =>
-        if buf.size - i > maxChunkLine then .error "chunk size line too long" else .need
-      | some (0, afterHeader) =>
-        match trailers buf afterHeader maxTrailers with
-        | .done consumed => .done acc consumed true
-        | .need => .need
-        | .error e => .error e
-      | some (size, afterHeader) =>
-        let next := afterHeader + size + 2
-        if next > buf.size then .need
-        else decodeFrom buf limit next (acc ++ Bytes.slice buf afterHeader (afterHeader + size)) fuel
+        let line := line ++ Bytes.drop buf i
+        if line.size > maxChunkLine then throw "chunk size line too long"
+        r := { r with phase := .size line }
+        i := buf.size
+      | some nl =>
+        let line := line ++ Bytes.slice buf i nl
+        if line.size > maxChunkLine then throw "chunk size line too long"
+        if line.size == 0 || line.get! (line.size - 1) != 13 then
+          throw "a chunk size line must end in CRLF"
+        i := nl + 1
+        match sizeOf? line with
+        | none => throw "malformed chunk size line"
+        | some 0 => r := { r with phase := .trailer ByteArray.empty maxTrailers }
+        | some n => r := { r with phase := .data n }
+    | .trailer line left =>
+      match Bytes.indexOfByte? buf 10 i with
+      | none =>
+        let line := line ++ Bytes.drop buf i
+        if line.size > maxChunkLine then throw "trailer line too long"
+        r := { r with phase := .trailer line left }
+        i := buf.size
+      | some nl =>
+        let line := line ++ Bytes.slice buf i nl
+        if line.size > maxChunkLine then throw "trailer line too long"
+        if line.size == 0 || line.get! (line.size - 1) != 13 then
+          throw "a trailer line must end in CRLF"
+        i := nl + 1
+        if (Bytes.trim line).size == 0 then
+          return ({ r with phase := .finished }, some i)
+        match left with
+        | 0 => throw "too many trailer fields"
+        | left + 1 => r := { r with phase := .trailer ByteArray.empty left }
+  return (r, if r.finished then some i else none)
 
-/-- Reassemble a chunked body, up to `limit` entity bytes. -/
+/-- Find the end of a chunked body.  The same reader as everywhere else, so that what
+ends a body for the relay ends it for every other caller too. -/
+def scan (buf : Bytes) : Scan :=
+  match ({} : Reader).feed buf with
+  | .ok (_, some consumed) => .done consumed
+  | .ok (_, none) => .need
+  | .error e => .error e
+
+/-- Reassemble a chunked body, up to `limit` entity bytes: complete if the body ended
+within the limit, cut short (and not complete) once the limit is reached. -/
 def decode (buf : Bytes) (limit : Nat) : Decoded :=
-  decodeFrom buf limit 0 ByteArray.empty (buf.size + 1)
+  match ({ limit } : Reader).feed buf with
+  | .ok (r, some consumed) => .done r.entity consumed (!r.overflow)
+  | .ok (r, none) => if r.entity.size ≥ limit then .done r.entity buf.size false else .need
+  | .error e => .error e
 
 /-- Frame a payload as a single chunk followed by the terminator. -/
 def encodeAll (body : Bytes) : Bytes :=

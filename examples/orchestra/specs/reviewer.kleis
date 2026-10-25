@@ -1,0 +1,31 @@
+# What a diff-reviewer job may do: read the pull request it reviews and submit its review to the
+# platform, and read GitHub. It posts nothing to GitHub itself; the platform does, under the
+# `diff-reviewer-poster` spec. For a repository in `direct` mode the platform posts a submission at
+# once, as a COMMENT review only; an approving or change-requesting review it posts only when a
+# person clicks Post. That is the platform's to enforce, not kleis's: kleis sees a submission to the
+# platform, and cannot tell what the platform will do with it.
+#
+# The account is the platform's agent token, bound to the platform's host:
+#
+#   config/credentials/diff-reviewer-agent.toml
+#     name = "diff-reviewer/agent"
+#     service = "diff-reviewer"
+#     hosts = ["reviews.example"]
+#     secret_file = "/run/secrets/diff-reviewer-agent-token"
+#
+# Which pull request is the task's: the platform queues each job with `upstream` and
+# `issue_number`, and orchestra states them as `task_upstream(owner, name)` and `task_issue(n)` in
+# the token's authority block. A spec's `where` compares a field with a value written here, not
+# with a fact of the token, and `repository` has two terms, so the binding is written in datalog.
+spec reviewer
+  description "Reviews one pull request for the diff-reviewer platform."
+  max_ttl 24h
+
+  account diff-reviewer/agent
+    allow review
+    datalog '''
+      check if repository($o, $n), task_upstream($o, $n);
+      check if pull($p), task_issue($p);
+    '''
+
+  grant orchestra-reviewer-github
