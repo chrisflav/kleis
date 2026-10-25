@@ -138,7 +138,7 @@ private def reviewRegistry : IO Service.Registry := do
     | .ok g => pure g
     | .error e => throw (IO.userError e)
   let env : Spec.Env := { extensions := exts, credentials, grants := #[grant] }
-  let compiled ← ["reviewer", "diff-reviewer-poster"].mapM fun n => do
+  let compiled ← ["reviewer", "rubric-proposer", "diff-reviewer-poster"].mapM fun n => do
     match Spec.load (← IO.FS.readFile s!"examples/orchestra/specs/{n}.kleis") env with
     | .ok s => pure s
     | .error e => throw (IO.userError s!"{n}: {e}")
@@ -387,6 +387,21 @@ def specTests : IO Unit := do
                     ("PUT", s!"{agent}/review"), ("DELETE", s!"{agent}/review"),
                     ("GET", s!"{agent}/diff/more")] do
     checkEq s!"{m} {path} is matched by nothing" (routeFacts drm m "reviews.example" path) []
+  let job := "/api/agent/v1/repos/acme/widgets/proposals/0123456789abcdef"
+  let repoOnly := ["repository(\"acme\", \"widgets\")"]
+  checkEq "a proposal job is read_proposal of the repository, with no pull request"
+    (routeFacts drm "GET" "reviews.example" job) (["operation(\"read_proposal\")"] ++ repoOnly)
+  checkEq "a proposal is submit_proposal"
+    (routeFacts drm "POST" "reviews.example" job) (["operation(\"submit_proposal\")"] ++ repoOnly)
+  for (m, path) in [("GET", "/api/agent/v1/repos/acme/widgets/proposals"),
+                    ("POST", "/api/agent/v1/repos/acme/widgets/proposals"),
+                    ("GET", "/api/agent/v1/repos/acme/widgets/proposals/0123ABCD"),
+                    ("GET", "/api/agent/v1/repos/acme/widgets/proposals/not-a-job"),
+                    ("GET", "/api/agent/v1/repos/acme/widgets/proposals/" ++ String.ofList (List.replicate 65 'a')),
+                    ("PUT", job), ("DELETE", job), ("GET", s!"{job}/accept"), ("POST", s!"{job}/accept"),
+                    ("POST", "/api/v1/repos/acme/widgets/proposals"),
+                    ("POST", "/api/v1/repos/acme/widgets/proposals/0123456789abcdef/accept")] do
+    checkEq s!"{m} {path} is matched by nothing" (routeFacts drm m "reviews.example" path) []
 
   group "the reviewer"
   let rr ← reviewRegistry
@@ -421,6 +436,11 @@ def specTests : IO Unit := do
   check "one of 206 is too many facts, and refused as unread"
     (refusedFor (choose rr rt "POST" "reviews.example" s!"{own}/review" (agentReview 206)
       (some "application/json")) "body_truncated")
+  let proposal := "{\"rubric\": \"r\", \"notes\": null}"
+  checkEq "reads no proposal job, not even its own repository's"
+    (dr "GET" "/api/agent/v1/repos/up/proj/proposals/0123456789abcdef") none
+  checkEq "and submits no proposal"
+    (dr "POST" "/api/agent/v1/repos/up/proj/proposals/0123456789abcdef" proposal) none
   checkEq "nor the scripts' API" (dr "GET" "/api/v1/jobs") none
   checkEq "nor the login" (dr "POST" "/api/login" "{\"password\": \"x\"}") none
   check "the agent token goes to no other server"
@@ -494,6 +514,39 @@ def specTests : IO Unit := do
     | some f =>
       checkEq "setup writes the agent's config, with the placeholder token" f.content
         "{\"url\": \"https://reviews.example\", \"token\": \"kleis\"}\n"
+
+  group "the rubric proposer"
+  -- A proposal job is of a repository: an upstream, no issue, and, as for a reviewer, tools
+  -- it is given anyway.
+  let ptask := ["task_fork(\"bot\", \"proj\")", "task_upstream(\"up\", \"proj\")",
+    "task_tool(\"create_pr\")", "task_tool(\"comment\")", "task_tool(\"label_issue\")",
+    "task_tool(\"merge_pr\")", "task_pr_labels([\"orchestra\"])", "task_label_any(true)"]
+  let prt ← match taskToken "rubric-proposer" ptask with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let pr (method path : String) (body : String := "") (t := prt) :=
+    spentOn (choose rr t method "reviews.example" path body
+      (if body.isEmpty then none else some "application/json"))
+  let ownJob := "/api/agent/v1/repos/up/proj/proposals/0123456789abcdef"
+  checkEq "reads its repository's proposal job, on the agent token" (pr "GET" ownJob) agentToken
+  checkEq "submits its proposal" (pr "POST" ownJob proposal) agentToken
+  checkEq "not another repository's" (pr "GET" "/api/agent/v1/repos/other/proj/proposals/0123456789abcdef") none
+  checkEq "nor its fork's" (pr "POST" "/api/agent/v1/repos/bot/proj/proposals/0123456789abcdef" proposal) none
+  checkEq "nor another of its owner's" (pr "GET" "/api/agent/v1/repos/up/other/proposals/0123456789abcdef") none
+  for (m, path, body) in [("GET", "/api/agent/v1/repos/up/proj/pulls/7", ""),
+                          ("GET", "/api/agent/v1/repos/up/proj/pulls/7/diff", ""),
+                          ("POST", "/api/agent/v1/repos/up/proj/pulls/7/review", review)] do
+    checkEq s!"and no review route: {m} {path}" (pr m path body) none
+  checkEq "nor the platform's own API, where a person accepts a proposal"
+    (pr "POST" "/api/v1/repos/up/proj/proposals/0123456789abcdef/accept" "{}") none
+  let pfactless ← match taskToken "rubric-proposer" [] with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  checkEq "a token without the task's repository reaches no proposal" (pr "GET" ownJob (t := pfactless)) none
+  checkEq "reads its repository on GitHub" (gh "GET" "api.github.com" "/repos/up/proj" (t := prt)) pat
+  checkEq "and pushes nowhere" (push "bot/proj" (t := prt)) none
+  for (m, path, body) in writes do
+    checkEq s!"refuses {m} {path}" (gh m "api.github.com" path body (t := prt)) none
 
   group "the diff-reviewer platform, posting"
   let pt ← match taskToken "diff-reviewer-poster" [] (issuedBy := none) with

@@ -95,8 +95,10 @@ diff from the platform and submits its review there, with the
 Christian: for a repository in `direct` mode it posts a submission at once, as
 a COMMENT review only, and an approving or change-requesting review only when
 a person clicks Post.  That is enforced by the platform, not by kleis, which
-cannot tell those requests apart and allows every review event.  Two specs,
-and the agent token and the PAT are not interchangeable:
+cannot tell those requests apart and allows every review event.  It also has
+an agent propose a rubric for a repository, which a person then accepts or
+rejects on the platform.  Three specs, and the agent token and the PAT are not
+interchangeable:
 
 - `specs/reviewer.kleis`, the job's.  On the platform (the `diff-reviewer`
   extension's account): read the job and the diff, and submit a review, only
@@ -106,7 +108,15 @@ and the agent token and the PAT are not interchangeable:
   `orchestra-reviewer-github`: clone, fetch and read, GraphQL queries, and no
   write at all — no push, even to the job's fork, no pull request, review,
   comment or label.  Its GraphQL queries go out on the App's token, as a
-  worker's do, so a review job can read whatever the installation can see.
+  worker's do, so a review job can read whatever the installation can see.  A
+  review job reaches no rubric proposal: those routes name no pull request.
+- `specs/rubric-proposer.kleis`, a proposal job's.  On the platform: read the
+  repository's proposal job and submit a proposed rubric
+  (`/api/agent/v1/repos/{owner}/{name}/proposals/{job}`), only for its
+  repository — `repository` equal to its `task_upstream`; the platform binds
+  the request to the repository's live proposal job.  No review route: no
+  `/pulls/{pr}` job, diff or review.  On GitHub, the same read-only grant as a
+  review job's.
 - `specs/diff-reviewer-poster.kleis`, the platform's own.  On
   `github/chrisflav`: read the repositories in its list through the REST API,
   review their pull requests and comment on their diffs.  Reading is every GET
@@ -137,7 +147,8 @@ kleis credential add diff-reviewer/agent --service diff-reviewer \
 # Christian's token, which approved reviews are posted with.
 printf '%s' "$PAT" | kleis credential add github/chrisflav --service github --secret -
 
-cp specs/reviewer.kleis specs/diff-reviewer-poster.kleis "$KLEIS_HOME/config/specs/"
+cp specs/reviewer.kleis specs/rubric-proposer.kleis specs/diff-reviewer-poster.kleis \
+  "$KLEIS_HOME/config/specs/"
 
 # The platform's token. It goes in the platform's HTTPS_PROXY
 # (http://kleis:<token>@<kleis>:8080), with `kleis ca` in its CA bundle; its
@@ -146,28 +157,41 @@ kleis token issue --spec diff-reviewer-poster --bearer diff-reviewer --ttl 90d
 ```
 
 `config.toml` enables the `diff-reviewer` extension, lets the `orchestra`
-issuer derive `reviewer`, and raises `[limits] max_decode_prefix` to 2 MiB.
+issuer derive `reviewer` and `rubric-proposer`, and raises `[limits] max_decode_prefix` to 2 MiB.
 A body is refused, not relayed unread, when it is larger than the smaller of
 that and its manifest's `max_decode_prefix`, or becomes more facts than the
 manifest's `max_body_facts` — every scalar one, every array or object two — or
 nests more than 64 deep.  The manifests are sized for the platform's largest
 review, 200 inline comments: 2 MiB, and 1664 facts for GitHub, 1856 for
 diff-reviewer.  With the default 64 KiB a review of a few dozen comments is
-refused, both a job's submission and the platform's post.  On the orchestra side the platform is an API client,
-`<config>/clients/diff-reviewer.json`, and the client names the spec:
+refused, both a job's submission and the platform's post.
+
+On the orchestra side the platform is two API clients, because a task's spec is
+its client file's and not the request's: review jobs go through
+`<config>/clients/diff-reviewer.json`, rubric proposals through
+`<config>/clients/diff-reviewer-proposer.json` (the platform's
+`DIFF_REVIEWER_ORCHESTRA_PROPOSER_TOKEN_FILE`).  Each client names its spec:
 
 ```json
 {"token": "{{diff_reviewer_token}}", "read_only": true, "kleis_spec": "reviewer",
  "queue_policy": {"repos": ["chrisflav/kleis"], "max_budget": 3.0}}
 ```
 
-Each job the platform queues carries `upstream` and `issue_number`, which
-orchestra states as `task_upstream` and `task_issue`; the sandbox gets
+```json
+{"token": "{{diff_reviewer_proposer_token}}", "read_only": true,
+ "kleis_spec": "rubric-proposer",
+ "queue_policy": {"repos": ["chrisflav/kleis"], "max_budget": 3.0}}
+```
+
+Each review job the platform queues carries `upstream` and `issue_number`,
+which orchestra states as `task_upstream` and `task_issue`; a proposal job
+carries an `upstream` and no `issue_number`, so its token has `task_upstream`
+and no `task_issue`.  The sandbox gets
 `~/.config/diff-reviewer/agent.json` from `/.kleis/v1/setup`, with the
 placeholder token `kleis`.  Its `url` is `https://` and the account's host,
 with no port: an account's hosts are names, so the platform has to be served
-on 443.  The repositories are in three places that must
-agree: the platform's registered repositories, the client's
+on 443.  The repositories are in four places that must
+agree: the platform's registered repositories, both clients'
 `queue_policy.repos`, and the list in `diff-reviewer-poster.kleis`
 (`reviewed([...])`), which kleis rereads when it changes.
 

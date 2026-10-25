@@ -1,0 +1,23 @@
+# What a diff-reviewer rubric proposal job may do: read its repository's proposal job and submit
+# the proposed rubric to the platform, and read GitHub. It reaches no review job and no pull
+# request on the platform, and posts nothing to GitHub. An operator accepts or rejects what it
+# proposes on the platform.
+#
+# The account is the platform's agent token, the same one the `reviewer` spec names (see there).
+#
+# Which repository is the task's: the platform queues a proposal job through its second orchestra
+# client (`diff-reviewer-proposer.json`) with an `upstream` and no `issue_number`, and orchestra
+# states it as `task_upstream(owner, name)` in the token's authority block. The proposal routes
+# carry no `pull` fact, so the binding is to the repository alone; the platform binds the request
+# to the repository's live proposal job.
+spec rubric-proposer
+  description "Proposes a review rubric for one repository, for the diff-reviewer platform."
+  max_ttl 24h
+
+  account diff-reviewer/agent
+    allow propose
+    datalog '''
+      check if repository($o, $n), task_upstream($o, $n);
+    '''
+
+  grant orchestra-reviewer-github

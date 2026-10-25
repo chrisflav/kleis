@@ -37,6 +37,6 @@ max_decode_prefix = 2097152
 [[issuer]]
 name    = "orchestra"
 grants  = ["orchestra-*"]
-specs   = ["worker", "secretary", "reviewer"]
+specs   = ["worker", "secretary", "reviewer", "rubric-proposer"]
 facts   = ["task_*"]
 max_ttl = "24h"

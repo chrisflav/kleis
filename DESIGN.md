@@ -279,7 +279,8 @@ match = "PUT api.github.com /repos/{owner}/{repo}/pulls/{number:int}/merge"
 emit  = ['operation("merge_pr")', 'repository($owner, $repo)', 'pull_request($number)']
 ```
 
-Segment captures are `{name}`, typed with `:int` or `:date`, suffix-trimmed with
+Segment captures are `{name}`, typed with `:int`, `:date` or `:hex` (one to 64
+lowercase hexadecimal digits, a service's generated id), suffix-trimmed with
 `{repo%.git}`, and `{rest*}` swallows the tail. Captures may also come from
 headers, query parameters and body paths (`{ref<-body:["updates",0,"ref"]}`).
 A route that matches emits its facts with the captures substituted. No route
