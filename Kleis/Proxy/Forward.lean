@@ -118,21 +118,23 @@ private def relayResponse (ctx : Context) (origin client : Net.Stream) (method :
     IO (Option Relayed) := do
   let first ← origin.read 65536
   if first.size == 0 then return none
-  let rec readHead (buf : Bytes) (fuel : Nat) : IO (Http.Response × Bytes) := do
+  -- `searched` bytes of `buf` hold no end of the head, so each read is searched once.
+  let rec readHead (buf : Bytes) (searched fuel : Nat) : IO (Http.Response × Bytes) := do
     match fuel with
     | 0 => throw (IO.userError "the origin's response head never ended")
     | fuel + 1 =>
-      match Http.readResponse buf method { maxHeadSize := ctx.config.maxHeadSize } with
+      match Http.readResponse buf method { maxHeadSize := ctx.config.maxHeadSize }
+          (Http.resumeHeadSearch searched) with
       | .done r consumed =>
         if 100 ≤ r.status && r.status < 200 && r.status != 101 then
-          readHead (Bytes.drop buf consumed) fuel
+          readHead (Bytes.drop buf consumed) 0 fuel
         else pure (r, Bytes.drop buf consumed)
       | .error e => throw (IO.userError s!"the origin sent a malformed response: {e}")
       | .need => do
         let chunk ← origin.read 65536
         if chunk.size == 0 then throw (IO.userError "the origin closed mid-response")
-        readHead (buf ++ chunk) fuel
-  let (response, received) ← readHead first 4096
+        readHead (buf ++ chunk) buf.size fuel
+  let (response, received) ← readHead first 0 4096
   let switching := response.status == 101
   let delimited := response.framing != .untilClose && !switching
   let originCloses := (Http.Headers.tokens response.headers "connection").contains "close"

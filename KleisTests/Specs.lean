@@ -635,6 +635,29 @@ def specTests : IO Unit := do
         | .error _ => false
       let ms := (← IO.monoMsNow) - t0
       check s!"{name}, {n} bytes: decided in {ms} ms" (decided && ms < bound)
+  -- The form decoder itself, which github.com and the platform no longer reach by a
+  -- body's label, but other services do.
+  for (n, bound) in [(65536, 250), (2097152, 2000)] do
+    for (name, body) in [
+        ("distinct names", "&".intercalate ((List.range (n / 8)).map fun i => "k" ++ toString i ++ "=v")),
+        ("one name", rep (n / 4) "k=v&"),
+        ("escapes", "k=" ++ rep (n / 3) "%41")] do
+      let bytes := Bytes.ofString body
+      let t0 ← IO.monoMsNow
+      let answered ← IO.lazyPure fun _ => match Wire.formDecoder.step bytes true with
+        | .done _ _ => true
+        | .opaque => true
+        | .need _ => false
+      let ms := (← IO.monoMsNow) - t0
+      check s!"a form of {name}, {n} bytes: decoded or refused in {ms} ms" (answered && ms < bound)
+  check "a form within the pair limit is read"
+    (match Wire.formDecoder.step (Bytes.ofString "a=1&b=2&a=3") true with
+     | .done _ _ => true | _ => false)
+  check "one past it is not"
+    (match Wire.formDecoder.step (Bytes.ofString (rep (Wire.maxFormPairs + 1) "k=v&")) true with
+     | .opaque => true | _ => false)
+  check "a form body to github.com is read as JSON, and refused"
+    (spentOn (choose rr rt "POST" "github.com" "/up/proj/x" "k=v" (some "application/x-www-form-urlencoded"))).isNone
   -- Reading: the bytes arrive a few at a time, and the decoder is asked as they do.
   let feed (data : Bytes) (piece : Nat) : IO Net.Stream := do
     let pos ← IO.mkRef 0
@@ -659,5 +682,22 @@ def specTests : IO Unit := do
       let _ ← Proxy.readBodyPrefix stream framing decoder ByteArray.empty n
       let ms := (← IO.monoMsNow) - t0
       check s!"{name}, {n} bytes: read in {ms} ms" (ms < bound)
+  -- A head, a request's or a response's, arriving 16 bytes at a time: searched once, and
+  -- parsed once it has ended.
+  let filler := rep 65000 "a"
+  let requestHead := Bytes.ofString ("GET / HTTP/1.1\r\nhost: x\r\nx-pad: " ++ filler ++ "\r\n\r\n")
+  let stream ← feed requestHead 16
+  let t0 ← IO.monoMsNow
+  let head ← Proxy.readHead stream { maxHeadSize := 65536 } ByteArray.empty (timeoutSeconds := 0)
+  let ms := (← IO.monoMsNow) - t0
+  check s!"a 64 KiB request head, 16 bytes at a time: read in {ms} ms" (head.isSome && ms < 250)
+  let responseHead := Bytes.ofString ("HTTP/1.1 200 OK\r\nx-pad: " ++ filler ++
+    "\r\ncontent-length: 2\r\n\r\nok")
+  let stream ← feed responseHead 16
+  let t0 ← IO.monoMsNow
+  let fetched ← Net.readResponse stream "GET" 1024
+  let ms := (← IO.monoMsNow) - t0
+  check s!"a 64 KiB response head, 16 bytes at a time: read in {ms} ms"
+    (fetched.status == 200 && fetched.body.size == 2 && ms < 250)
 
 end KleisTests

@@ -26,8 +26,10 @@ modes = ["connect"]
 # severity, and two for the comment itself) and up to some 10 KiB of text.  The
 # daemon's own `[limits] max_decode_prefix` (64 KiB unless set) also bounds the
 # first.  Measured worst cases, for the whole path over bodies built for it of
-# every shape: 2 MiB, under 0.75 s; 64 KiB, under 65 ms, except that a body near
-# `max_body_facts` takes up to 0.15 s to decide whatever its size.
+# every shape: 2 MiB, about 0.5 s and under 1 s; 64 KiB, under 15 ms, except
+# that a body near `max_body_facts` takes up to about 0.18 s to decide whatever
+# its size (the datalog engine).  A client writing a large body in pieces of
+# under about 128 bytes runs out of reads and is refused.
 max_body_facts    = 1856
 max_decode_prefix = 2097152
 

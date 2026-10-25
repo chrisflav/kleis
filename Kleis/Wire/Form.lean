@@ -37,20 +37,41 @@ private def groupPairs (pairs : List (String × String)) : Value :=
       | [v] => Value.str v
       | _ => Value.array (vs.map Value.str)))
 
-/-- Decode `application/x-www-form-urlencoded`. -/
+/-- The most pairs a form body may have.  Every pair is at least one fact, so this is
+more than any shipped manifest's `max_body_facts` lets through: a form with more could
+not be read anyway, and stopping here means a large one costs nothing to refuse. -/
+def maxFormPairs : Nat := 4096
+
+/-- The pairs of a form body, walked `&` to `&`, or `none` past `maxFormPairs`. -/
+private def formPairs (buf : Bytes) : Option (List (String × String)) :=
+  let rec go (i : Nat) (n : Nat) (acc : List (String × String)) (fuel : Nat) :
+      Option (List (String × String)) :=
+    match fuel with
+    | 0 => none
+    | fuel + 1 =>
+      if i > buf.size then some acc.reverse
+      else
+        let stop := (Bytes.indexOfByte? buf 38 i).getD buf.size
+        let part := Bytes.toStringLossy (Bytes.slice buf i stop)
+        if part.isEmpty then go (stop + 1) n acc fuel
+        else if n ≥ maxFormPairs then none
+        else
+          let pair := match Str.splitOnce? part "=" with
+            | some (k, v) => (Str.percentDecode k true, Str.percentDecode v true)
+            | none => (Str.percentDecode part true, "")
+          go (stop + 1) (n + 1) (pair :: acc) fuel
+  go 0 0 [] (buf.size + 2)
+
+/-- Decode `application/x-www-form-urlencoded`.  A form of more than `maxFormPairs`
+pairs is not read: it is opaque, which under a decoder a manifest bound is refused. -/
 def formDecoder : PureDecoder where
   name := "form"
   media := #["application/x-www-form-urlencoded"]
   step := fun buf complete =>
     if !complete then .need (buf.size + 1)
-    else
-      let text := Bytes.toStringLossy buf
-      let pairs := (text.splitOn "&").filterMap fun part =>
-        if part.isEmpty then none
-        else match Str.splitOnce? part "=" with
-          | some (k, v) => some (Str.percentDecode k true, Str.percentDecode v true)
-          | none => some (Str.percentDecode part true, "")
-      .done (groupPairs pairs) buf.size
+    else match formPairs buf with
+      | some pairs => .done (groupPairs pairs) buf.size
+      | none => .opaque
 
 /-- One parameter of a `Content-Disposition` field. -/
 private def dispositionParam (field : String) (name : String) : Option String :=

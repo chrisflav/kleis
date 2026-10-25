@@ -114,6 +114,15 @@ def httpTests : IO Unit := do
     (({} : Http.Chunked.Reader).feed (Bytes.ofString "zz\r\n")).toOption.isNone
   check "so is one too long"
     (({} : Http.Chunked.Reader).feed (Bytes.ofString (String.ofList (List.replicate 9000 '0')))).toOption.isNone
+  for (name, framed) in [
+      ("a size line ending in a bare LF", "5\nhello\r\n0\r\n\r\n"),
+      ("data followed by something other than CRLF", "5\r\nhelloXY0\r\n\r\n"),
+      ("data followed by a bare LF", "5\r\nhello\n0\r\n\r\n"),
+      ("a trailer line ending in a bare LF", "0\r\nx-a: 1\n\r\n"),
+      ("a bare LF ending the trailers", "0\r\n\n")] do
+    check s!"{name} is refused"
+      ((feedAll {} (Bytes.ofString framed) 1).toOption.isNone
+        && (match Http.Chunked.scan (Bytes.ofString framed) with | .error _ => true | _ => false))
   match feedAll {} (Bytes.ofString "0\r\nx-a: 1\r\nx-b: 2\r\n\r\n") 1 with
   | .ok (_, some n) => checkEq "trailers are read to the empty line" n 21
   | _ => check "trailers are read to the empty line" false

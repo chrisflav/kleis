@@ -181,11 +181,17 @@ its place from one read to the next and holds no more than a line of it, and the
 decoder asked again only when at least what it wanted has arrived and at least
 twice what it last saw, so a client sending a byte at a time, or a decoder
 asking for a little more each time, costs a bounded number of passes over the
-prefix (and a client out of `maxPrefixReads` reads is relayed undecoded). JSON
-nests at most 128 deep in the reader and long numbers stay text; form names are
-grouped in a map; GraphQL and multipart are read without rescanning. What is
-left superlinear is the datalog engine itself, in the number of facts — which
-`maxBodyFacts` bounds.
+prefix. A client out of `maxPrefixReads` (16384) reads — one writing a large
+body in pieces of under about 128 bytes — is relayed undecoded, and so refused
+by any grant reading the body. The chunked framing is read strictly: CRLF ends
+every line and follows every chunk's data. A request or response head is
+searched once as it arrives, from where the last search stopped, and parsed
+once it has ended. JSON nests at most 128 deep in the reader and long numbers
+stay text; a form stops at 4096 pairs; GraphQL and multipart are read without
+rescanning. What is left superlinear is the datalog engine itself, in the number
+of facts — which `maxBodyFacts` bounds: a body near that limit takes up to about
+0.18 s to decide, against under 15 ms at 64 KiB and about 0.5 s at 2 MiB for
+anything else measured.
 
 A body has three states, not two, and the third was learned the hard way:
 

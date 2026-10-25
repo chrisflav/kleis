@@ -101,8 +101,9 @@ private def Progress.entity (p : Progress) (framing : Http.Framing) : Bytes × B
   | .chunked => (p.chunked.entity, p.ended && !p.chunked.overflow)
   | .untilClose => (p.raw, false)
 
-/-- The most reads one body prefix may take.  A client that sends a byte at a
-time runs out of them, and its body is relayed undecoded. -/
+/-- The most reads one body prefix may take.  A client writing a large body in pieces
+of under about 128 bytes (2 MiB over 16384 reads) runs out of them, and its body is
+relayed undecoded, which a grant reading it refuses. -/
 def maxPrefixReads : Nat := 16384
 
 /-- Read from the client until the decoder is satisfied, the framing ends, or

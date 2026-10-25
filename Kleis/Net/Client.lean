@@ -42,18 +42,18 @@ def Fetched.text (f : Fetched) : String := Bytes.toStringLossy f.body
 Only for the daemon's own calls, where the bodies are small JSON documents.
 The proxy never uses this: it streams. -/
 def readResponse (s : Stream) (method : String) (maxBody : Nat) : IO Fetched := do
-  let rec readHead (buf : Bytes) (fuel : Nat) : IO (Http.Response × Bytes) := do
+  let rec readHead (buf : Bytes) (searched fuel : Nat) : IO (Http.Response × Bytes) := do
     match fuel with
     | 0 => throw (IO.userError "the response head never ended")
     | fuel + 1 =>
-      match Http.readResponse buf method with
+      match Http.readResponse buf method {} (Http.resumeHeadSearch searched) with
       | .done r consumed => pure (r, Bytes.drop buf consumed)
       | .error e => throw (IO.userError s!"malformed response: {e}")
       | .need => do
         let chunk ← s.read 65536
         if chunk.size == 0 then throw (IO.userError "the connection closed mid-response")
-        readHead (buf ++ chunk) fuel
-  let (response, rest) ← readHead ByteArray.empty 4096
+        readHead (buf ++ chunk) buf.size fuel
+  let (response, rest) ← readHead ByteArray.empty 0 4096
   -- Read until the predicate says there is enough, or the peer stops.
   let drain (acc : Bytes) (enough : Bytes → Bool) : IO Bytes := do
     let rec go (acc : Bytes) (fuel : Nat) : IO Bytes := do

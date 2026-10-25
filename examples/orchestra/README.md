@@ -195,10 +195,16 @@ agree: the platform's registered repositories, the client's
   does not admit `/repos/ChrisFlav/kleis`, which GitHub would.  That refuses;
   it never admits more.
 - **Large bodies cost time.**  Measured worst cases for the whole path —
-  reading a body a few bytes at a time, decoding it and deciding on it — with
-  bodies built for it of every shape (JSON, forms, multipart, GraphQL, git
-  pushes and fetches, chunked framing): under 0.75 s at 2 MiB, under 65 ms at
-  64 KiB.  A body near a manifest's `max_body_facts` takes up to 0.15 s to
-  decide whatever its size; that is the datalog engine, and grows with the
-  limit, which is why the limits are sized for 200 comments and no more.  Any
-  bearer of the service may send one.
+  the head and the body read a few bytes at a time, decoded and decided on —
+  with bodies built for it of every shape (JSON, forms, multipart, GraphQL,
+  git pushes and fetches, chunked framing): about 0.5 s at 2 MiB, never above
+  1 s, and under 15 ms at 64 KiB.  A body near a manifest's `max_body_facts`
+  takes longer to decide whatever its size — an upload-pack request with some
+  1300 wants 154 ms, a multipart body 91 ms, a 200-comment review about
+  0.18 s.  That is the datalog engine, and it grows with the limit, which is
+  why the limits are sized for 200 comments and no more.  Any bearer of the
+  service may send one.
+- **Slow writers are refused.**  A body prefix may take at most
+  `maxPrefixReads` (16384) reads, so a client writing a large body in pieces
+  of under about 128 bytes runs out of them; its body is relayed undecoded,
+  which every grant reading it refuses.
