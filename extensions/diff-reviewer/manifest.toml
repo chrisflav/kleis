@@ -1,0 +1,55 @@
+# A service manifest for the diff-reviewer platform's agent API (github.com/chrisflav/diff-reviewer),
+# as the `diff-reviewer agent` subcommands use it.
+#
+# No `hosts`: a platform is per deployment, so the extension's hosts are dynamic and the manifest
+# claims every server an account is bound to. Routes match any host (`*`).
+#
+# The agent API authenticates with `Authorization: Bearer <agent token>`; the client sends whatever
+# its config holds (`kleis`), kleis removes it and attaches the account's.
+#
+# What it covers: the three agent endpoints, each about one pull request of one repository —
+# the job, its diff, and the review submitted for it. Nothing else on the server is matched: not
+# the scripts' API (`/api/v1/`), not the login, not the front end. A request no route matches
+# gets no `operation` fact and is refused.
+#
+# Note on TOML: a key written after a `[[route]]` header belongs to *that* table.
+
+name  = "diff-reviewer"
+modes = ["connect"]
+
+max_body_facts    = 512
+max_decode_prefix = 1048576
+
+[credential]
+provider = "static"
+strip    = ["cookie"]
+
+[[credential.inject]]
+kind     = "header"
+name     = "Authorization"
+template = "Bearer {{secret}}"
+
+# A review is JSON, whatever the client calls it.
+[[decoder]]
+media   = ["*"]
+decoder = "json"
+match   = "POST * /api/agent/v1/repos/{owner}/{name}/pulls/{pr}/review"
+
+# ---------------------------------------------------------------- reading
+
+# The job being run for the pull request: its head and base, the instructions, the rubric.
+[[route]]
+match = "GET * /api/agent/v1/repos/{owner}/{name}/pulls/{pr:int}"
+emit  = ['operation("read")', 'repository($owner, $name)', 'pull($pr)']
+
+# Its unified diff, at the job's head.
+[[route]]
+match = "GET * /api/agent/v1/repos/{owner}/{name}/pulls/{pr:int}/diff"
+emit  = ['operation("read")', 'repository($owner, $name)', 'pull($pr)']
+
+# ---------------------------------------------------------------- reviewing
+
+# The review, which the platform keeps as a draft for its operator to approve.
+[[route]]
+match = "POST * /api/agent/v1/repos/{owner}/{name}/pulls/{pr:int}/review"
+emit  = ['operation("submit_review")', 'repository($owner, $name)', 'pull($pr)']

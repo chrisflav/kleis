@@ -733,6 +733,94 @@ PY
 read -r SUB_PASS SUB_FAIL < "$DECL/counts" 2>/dev/null || { SUB_PASS=0; SUB_FAIL=1; }
 PASS=$SUB_PASS; FAIL=$SUB_FAIL
 echo
+echo "== an extension's service: the diff-reviewer platform, through the reviewer spec"
+# The shipped extension, the orchestra example's spec and grant as they are, and an account
+# bound to the TLS origin, which answers the agent API by echoing the request.
+DR="$WORK/diff-reviewer"
+DR_PORT="$(free_port)"
+mkdir -p "$DR/home/config/specs" "$DR/home/config/grants" "$DR/home/config/credentials" "$DR/secrets" "$DR/issuers"
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$DR/secrets/root_key"
+printf 'agent-secret-55' > "$DR/secrets/agent"
+printf 'unused' > "$DR/secrets/github"
+cp "$ROOT/examples/orchestra/specs/reviewer.kleis" "$DR/home/config/specs/"
+cp "$ROOT/examples/orchestra/grants/orchestra-reviewer-github.toml" "$DR/home/config/grants/"
+cat > "$DR/home/config/credentials/agent.toml" <<EOF2
+name        = "diff-reviewer/agent"
+service     = "diff-reviewer"
+hosts       = ["localhost"]
+secret_file = "$DR/secrets/agent"
+EOF2
+for c in orchestra-app orchestra-pat; do
+  printf 'name = "github/%s"\nservice = "github"\nsecret_file = "%s"\n' "$c" "$DR/secrets/github" \
+    > "$DR/home/config/credentials/$c.toml"
+done
+cat > "$DR/home/config/config.toml" <<EOF2
+listen = "127.0.0.1:$DR_PORT"
+mode = "connect"
+upstream_ca_file = "$WORK/origin.crt"
+extensions = ["github", "diff-reviewer"]
+
+[[issuer]]
+name = "orchestra"
+grants = ["orchestra-*"]
+specs = ["reviewer"]
+facts = ["task_*"]
+max_ttl = "24h"
+token_file = "$DR/issuers/orchestra.token"
+EOF2
+(
+  export KLEIS_HOME="$DR/home" KLEIS_ROOT_KEY_FILE="$DR/secrets/root_key" KLEIS_EXTENSIONS_DIR="$ROOT/extensions"
+  unset KLEIS_STORE_KEY
+  "$KLEISD" --check > "$DR/check.log" 2>&1
+  check $? "the extension, the spec and the grant load" "$(tail -5 "$DR/check.log")"
+  "$KLEISD" > "$DR/kleisd.log" 2>&1 &
+  DECL_PID=$!
+  for _ in $(seq 50); do
+    curl -s -o /dev/null "http://127.0.0.1:$DR_PORT/" && break
+    sleep 0.1
+  done
+  OUT="$(curl -s -H "Authorization: Bearer $(cat "$DR/issuers/orchestra.token")" \
+    -H 'content-type: application/json' \
+    -d '{"spec":"reviewer","ttl":"1h","bearer":"orchestra:t-1","facts":[
+         {"name":"task_upstream","terms":["acme","widgets"]},{"name":"task_issue","terms":[7]}]}' \
+    "http://127.0.0.1:$DR_PORT/.kleis/v1/derive")"
+  TASK="$(echo "$OUT" | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])' 2>/dev/null)"
+  [ -n "$TASK" ]; check $? "orchestra derives a reviewer token for one pull request" "$OUT"
+  SETUP="$(curl -s -H "Authorization: Bearer $TASK" "http://127.0.0.1:$DR_PORT/.kleis/v1/setup")"
+  echo "$SETUP" | python3 -c '
+import json, sys
+files = {f["path"]: f["content"] for f in json.load(sys.stdin)["files"]}
+assert json.loads(files[".config/diff-reviewer/agent.json"]) == {"url": "https://localhost", "token": "kleis"}
+' 2>/dev/null
+  check $? "setup writes the agent's config, with the placeholder token" "$SETUP"
+  agent() {
+    curl -s --proxy "http://kleis:$TASK@127.0.0.1:$DR_PORT" --proxy-basic --cacert "$("$KLEIS" ca)" \
+      -H "Authorization: Bearer kleis" -o "$DR/out" -w '%{http_code}' "$@"
+  }
+  API="https://localhost:$TLS_PORT/api/agent/v1/repos"
+  CODE="$(agent "$API/acme/widgets/pulls/7")"
+  [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer agent-secret-55"' "$DR/out" \
+    && ! grep -q 'Bearer kleis' "$DR/out"
+  check $? "the job of its own pull request is read on the agent token, the placeholder gone" "got $CODE: $(cat "$DR/out")"
+  CODE="$(agent "$API/acme/widgets/pulls/7/diff")"
+  [ "$CODE" = "200" ]; check $? "and its diff" "got $CODE: $(cat "$DR/out")"
+  CODE="$(agent -H 'content-type: application/json' \
+    -d '{"headSha":"abc","prType":null,"review":{"decision":"comment","body":"b","comments":[]}}' \
+    "$API/acme/widgets/pulls/7/review")"
+  [ "$CODE" = "200" ] && grep -q '"method": "POST"' "$DR/out"
+  check $? "its review is submitted" "got $CODE: $(cat "$DR/out")"
+  CODE="$(agent "$API/acme/widgets/pulls/8")"
+  [ "$CODE" = "403" ]; check $? "another pull request's job is refused" "got $CODE"
+  CODE="$(agent "$API/acme/other/pulls/7")"
+  [ "$CODE" = "403" ]; check $? "and another repository's" "got $CODE"
+  CODE="$(agent "https://localhost:$TLS_PORT/api/v1/jobs")"
+  [ "$CODE" = "403" ]; check $? "and the rest of the platform's API" "got $CODE"
+  kill "$DECL_PID" 2>/dev/null; wait "$DECL_PID" 2>/dev/null
+  echo "$PASS $FAIL" > "$DR/counts"
+)
+read -r SUB_PASS SUB_FAIL < "$DR/counts" 2>/dev/null || { SUB_FAIL=$((FAIL+1)); SUB_PASS=$PASS; }
+PASS=$SUB_PASS; FAIL=$SUB_FAIL
+echo
 echo "== the audit log"
 "$KLEIS" audit verify | grep -q 'chain intact'
 check $? "the audit chain is intact" "$("$KLEIS" audit verify)"

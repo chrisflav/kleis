@@ -22,6 +22,11 @@ own that orchestra minted for it, naming what the job may do.
        App's token;
      - the job's upstream goes on the operator's token;
   3. otherwise none: public dependencies are cloned and read anonymously.
+- `grants/orchestra-reviewer-github.toml`: what a review job may do on GitHub,
+  which is read.
+- `specs/`: what a job made from a spec may do (`worker`, `secretary`,
+  `reviewer`), and `diff-reviewer-poster`, which is not a job's; see
+  [Reviews](#reviews-for-diff-reviewer) below.
 - The GitHub manifest, `../github.toml`.
 
 ## The facts a job's token carries
@@ -80,6 +85,70 @@ credential = "github/pat-acme"
 Then add a `kleis` block to orchestra's `config.json`; see orchestra's
 `docs/kleis.md`.
 
+## Reviews for diff-reviewer
+
+[diff-reviewer](https://github.com/chrisflav/diff-reviewer) reviews pull
+requests with agents and posts what its operator approves.  It queues a job on
+orchestra per pull request, as an API client; the agent reads the job and the
+diff from the platform and submits its review there, with the
+`diff-reviewer agent` command.  The platform posts the approved review to
+GitHub as Christian.  Two specs, and the agent token and the PAT are not
+interchangeable:
+
+- `specs/reviewer.kleis`, the job's.  On the platform (the `diff-reviewer`
+  extension's account): read the job and the diff, and submit a review, only
+  for the pull request the job is for — `repository` equal to its
+  `task_upstream`, `pull` equal to its `task_issue`.  Nothing else on the
+  platform is reachable: no `/api/v1/`, no login.  On GitHub, the grant
+  `orchestra-reviewer-github`: clone, fetch and read, GraphQL queries, and no
+  write at all — no push, even to the job's fork, no pull request, review,
+  comment or label.
+- `specs/diff-reviewer-poster.kleis`, the platform's own.  On
+  `github/chrisflav`: read the repositories in its list, review their pull
+  requests and comment on their diffs, and `api_read`.  Any other repository is
+  refused.  It is not an issuer's spec: orchestra cannot derive it.
+
+Why the job does not get `orchestra-github` with `read_only`: that grant takes
+pushing away from a read-only job (`task_writable`), but its other writes turn
+on tools, so a read-only job given `create_pr` or `comment` could still open
+pull requests and review.  And with its fork equal to its upstream — a
+repository the App is installed on — the upstream counts as its fork, where a
+pull request needs no head from anywhere.  The review grant has no write rule
+to inherit.
+
+```sh
+cp specs/reviewer.kleis specs/diff-reviewer-poster.kleis "$KLEIS_HOME/config/specs/"
+
+# The platform's agent token (its DIFF_REVIEWER_AGENT_TOKEN_FILE), bound to the
+# platform's host; the account the reviewer spec names.
+kleis credential add diff-reviewer/agent --service diff-reviewer \
+  --hosts reviews.example --secret @agent.token
+# Christian's token, which approved reviews are posted with.
+printf '%s' "$PAT" | kleis credential add github/chrisflav --service github --secret -
+
+# The platform's token. It goes in the platform's HTTPS_PROXY
+# (http://kleis:<token>@<kleis>:8080), with `kleis ca` in its CA bundle; its
+# DIFF_REVIEWER_GITHUB_TOKEN_FILE holds the placeholder `kleis`.
+kleis token issue --spec diff-reviewer-poster --bearer diff-reviewer --ttl 90d
+```
+
+`config.toml` enables the `diff-reviewer` extension and lets the `orchestra`
+issuer derive `reviewer`.  On the orchestra side the platform is an API client,
+`<config>/clients/diff-reviewer.json`, and the client names the spec:
+
+```json
+{"token": "{{diff_reviewer_token}}", "read_only": true, "kleis_spec": "reviewer",
+ "queue_policy": {"repos": ["chrisflav/kleis"], "max_budget": 3.0}}
+```
+
+Each job the platform queues carries `upstream` and `issue_number`, which
+orchestra states as `task_upstream` and `task_issue`; the sandbox gets
+`~/.config/diff-reviewer/agent.json` from `/.kleis/v1/setup`, with the
+placeholder token `kleis`.  The repositories are in three places that must
+agree: the platform's registered repositories, the client's
+`queue_policy.repos`, and the list in `diff-reviewer-poster.kleis`
+(`reviewed([...])`), which kleis rereads when it changes.
+
 ## What is not covered
 
 - **GraphQL mutations** are refused.  `gh pr create`, `gh pr merge`,
@@ -97,3 +166,9 @@ Then add a `kleis` block to orchestra's `config.json`; see orchestra's
 - **GraphQL queries** go out on the App's token, so a job can read whatever the
   installation can, including other jobs' forks; the same was true of the
   installation token it used to hold.
+- **A review job's card** has the GitHub extension's phrases for its task facts
+  — "your fork is …; push there", "open pull requests there" — which are written
+  for a worker.  The grant quoted under them allows neither.
+- **The poster's list** is matched exactly: `reviewed(["chrisflav/kleis"])`
+  does not admit `/repos/ChrisFlav/kleis`, which GitHub would.  That refuses;
+  it never admits more.

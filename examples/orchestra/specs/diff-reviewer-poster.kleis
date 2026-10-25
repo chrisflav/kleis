@@ -1,0 +1,22 @@
+# What the diff-reviewer platform itself may do on GitHub, as Christian: list and read the pull
+# requests of the repositories it reviews, and post the reviews its operator approved. It is not
+# an orchestra task: its token is issued by hand and held by the platform process, which sends
+# `Authorization: Bearer kleis` to api.github.com through this proxy.
+#
+# The repositories are the one list below, kept by the operator. A request about any other repository is
+# refused, and so is every request about none except `api_read` (the user, rate limits, search).
+# Editing the list takes effect for the token already issued, at the daemon's next reload.
+#
+# `read` is the GitHub extension's group, so cloning and fetching a listed repository are allowed
+# too; GraphQL, which is in the group but is about no repository, is not.
+spec diff-reviewer-poster
+  description "The diff-reviewer platform: reads the pull requests it reviews and posts approved reviews."
+  max_ttl 90d
+
+  account github/chrisflav
+    allow read, review_pr, review_comment
+    datalog '''
+      reviewed(["chrisflav/kleis"]);
+      check if operation("api_read") or repository($o, $r), reviewed($s), $s.contains($o + "/" + $r);
+      reject if repository($o, $r), reviewed($s), !$s.contains($o + "/" + $r);
+    '''

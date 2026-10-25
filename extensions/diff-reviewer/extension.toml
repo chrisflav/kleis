@@ -1,0 +1,26 @@
+# The diff-reviewer platform's agent API, on any number of instances. See manifest.toml.
+
+service = "diff-reviewer"
+display = "diff-reviewer"
+client  = "the `diff-reviewer agent` command (`diff-reviewer agent show|diff|submit <owner/name> <pr>`); ~/.config/diff-reviewer/agent.json points at the server"
+hosts   = "dynamic"
+
+[groups]
+read   = { operations = ["read"], phrase = "read the review job of a pull request and its diff" }
+review = { operations = ["read", "submit_review"], phrase = "read the review job of a pull request and its diff, and submit a review of it" }
+
+[operations]
+read          = "read the review job of a pull request and its diff"
+submit_review = "submit a review of a pull request to the platform, which posts it to GitHub only as its operator has configured"
+
+[fields.pull]
+fact   = "pull"
+type   = "int"
+values = "single"
+phrase = "the pull request"
+
+# The token is a placeholder: kleis removes it and attaches the account's agent token.
+[[setup.files]]
+path    = ".config/diff-reviewer/agent.json"
+mode    = "0600"
+content = "{\"url\": \"https://{host}\", \"token\": \"kleis\"}\n"

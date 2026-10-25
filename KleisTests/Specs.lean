@@ -103,10 +103,51 @@ private def compileErr (src : String) : IO (Option String) := do
     | .ok _ => none
     | .error e => some e
 
+/-- The facts a manifest's routes emit for a request, printed. -/
+private def routeFacts (m : Service.Manifest) (method host path : String) : List String :=
+  let request : Model.Request := {
+    method, scheme := "https", host, port := 443
+    path := Str.pathOnly path, segments := Str.pathSegments path, query := Str.parseQuery path
+    headers := #[("host", host)], bodyPrefix := ByteArray.empty, bodyComplete := true
+    bodySize := some 0 }
+  (m.routes.flatMap fun rt => (rt.apply request none).getD []).map (Builder.Predicate.print ·.predicate)
+
+/-- The orchestra example's review specs, against the shipped GitHub and diff-reviewer
+extensions, with the accounts they name made up. -/
+private def reviewRegistry : IO Service.Registry := do
+  let credentials : Array Credential.Record := #[
+    account "diff-reviewer/agent" "diff-reviewer" ["reviews.example"],
+    account "github/orchestra-app" "github", account "github/orchestra-pat" "github",
+    account "github/chrisflav" "github"]
+  let exts ← [("github", []), ("diff-reviewer", ["reviews.example"])].mapM fun (n, h) => shipped n h
+  let grant ← match Policy.Grant.ofToml
+      (← IO.FS.readFile "examples/orchestra/grants/orchestra-reviewer-github.toml") with
+    | .ok g => pure g
+    | .error e => throw (IO.userError e)
+  let env : Spec.Env := { extensions := exts, credentials, grants := #[grant] }
+  let compiled ← ["reviewer", "diff-reviewer-poster"].mapM fun n => do
+    match Spec.load (← IO.FS.readFile s!"examples/orchestra/specs/{n}.kleis") env with
+    | .ok s => pure s
+    | .error e => throw (IO.userError s!"{n}: {e}")
+  pure { manifests := (exts.map (·.2)).toArray
+         grants := #[grant] ++ (compiled.flatMap fun s => s.accounts.map (·.grant)).toArray
+         extensions := (exts.map (·.1)).toArray
+         specs := compiled.toArray }
+
+/-- A task token from a spec, as `/.kleis/v1/derive` writes it: the task's facts in the
+authority block. -/
+private def taskToken (spec : String) (facts : List String)
+    (issuedBy : Option String := some "orchestra") : Except String Biscuit := do
+  let facts ← facts.mapM Token.factOfSource
+  let (t, _) ← Token.issue (fixedKey 7)
+    { grants := [], specs := [spec], bearer := "orchestra:t-1", lifetime := 3600, issuedBy, extraFacts := facts }
+    1700000000 (fixedKey 9)
+  pure t
+
 def specTests : IO Unit := do
   group "the shipped extensions load and agree with their manifests"
   for (n, h) in [("github", []), ("zulip", ["z.example"]), ("caldav", ["d.example"]), ("mail", []),
-                 ("taxis", ["t.example"])] do
+                 ("taxis", ["t.example"]), ("diff-reviewer", ["r.example"])] do
     let ok ← try let _ ← shipped n h; pure true catch _ => pure false
     check s!"{n}" ok
 
@@ -257,5 +298,148 @@ def specTests : IO Unit := do
   check "a setup path may not climb out of home"
     (!Service.safeRelativePath "../.ssh/authorized_keys" && !Service.safeRelativePath "/etc/passwd"
       && !Service.safeRelativePath "a/../../b" && Service.safeRelativePath ".config/zulip/x.zuliprc")
+
+  group "the diff-reviewer extension"
+  let (_, drm) ← shipped "diff-reviewer" ["reviews.example"]
+  let agent := "/api/agent/v1/repos/acme/widgets/pulls/7"
+  let about := ["repository(\"acme\", \"widgets\")", "pull(7)"]
+  checkEq "the job is a read of that pull request"
+    (routeFacts drm "GET" "reviews.example" agent) (["operation(\"read\")"] ++ about)
+  checkEq "so is its diff"
+    (routeFacts drm "GET" "reviews.example" s!"{agent}/diff") (["operation(\"read\")"] ++ about)
+  checkEq "a review is submit_review"
+    (routeFacts drm "POST" "reviews.example" s!"{agent}/review") (["operation(\"submit_review\")"] ++ about)
+  for (m, path) in [("GET", "/api/v1/jobs"), ("POST", "/api/v1/jobs/3/post"), ("POST", "/api/login"),
+                    ("GET", "/"), ("GET", "/api/agent/v1/repos/acme/widgets/pulls"),
+                    ("GET", "/api/agent/v1/repos/acme/widgets/pulls/seven"),
+                    ("GET", s!"{agent}/review"), ("POST", agent), ("POST", s!"{agent}/diff"),
+                    ("PUT", s!"{agent}/review"), ("DELETE", s!"{agent}/review"),
+                    ("GET", s!"{agent}/diff/more")] do
+    checkEq s!"{m} {path} is matched by nothing" (routeFacts drm m "reviews.example" path) []
+
+  group "the reviewer"
+  let rr ← reviewRegistry
+  -- Read-only, and given tools anyway: none of them reaches GitHub through this spec.
+  let task := ["task_fork(\"bot\", \"proj\")", "task_upstream(\"up\", \"proj\")", "task_issue(7)",
+    "task_tool(\"create_pr\")", "task_tool(\"comment\")", "task_tool(\"label_issue\")",
+    "task_tool(\"merge_pr\")", "task_pr_labels([\"orchestra\"])", "task_label_any(true)"]
+  let rt ← match taskToken "reviewer" task with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let dr (method path : String) (body : String := "") (t := rt) :=
+    spentOn (choose rr t method "reviews.example" path body
+      (if body.isEmpty then none else some "application/json"))
+  let review := "{\"headSha\": \"abc\", \"prType\": null, \"review\": " ++
+    "{\"decision\": \"comment\", \"body\": \"b\", \"comments\": []}}"
+  let own := "/api/agent/v1/repos/up/proj/pulls/7"
+  let agentToken := some "diff-reviewer/agent"
+  checkEq "reads its own pull request's job, on the agent token" (dr "GET" own) agentToken
+  checkEq "and its diff" (dr "GET" s!"{own}/diff") agentToken
+  checkEq "submits its review" (dr "POST" s!"{own}/review" review) agentToken
+  checkEq "not a review nobody can read" (dr "POST" s!"{own}/review" "{\"headSha\":") none
+  checkEq "not another pull request's job" (dr "GET" "/api/agent/v1/repos/up/proj/pulls/8") none
+  checkEq "nor a review of it" (dr "POST" "/api/agent/v1/repos/up/proj/pulls/8/review" review) none
+  checkEq "nor another repository's pull request of that number"
+    (dr "GET" "/api/agent/v1/repos/other/proj/pulls/7") none
+  checkEq "nor its fork's" (dr "POST" "/api/agent/v1/repos/bot/proj/pulls/7/review" review) none
+  checkEq "nor the scripts' API" (dr "GET" "/api/v1/jobs") none
+  checkEq "nor the login" (dr "POST" "/api/login" "{\"password\": \"x\"}") none
+  check "the agent token goes to no other server"
+    (spentOn (choose rr rt "GET" "other.example" own)).isNone
+  let factless ← match taskToken "reviewer" [] with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  checkEq "a token without the task's pull request reaches no job" (dr "GET" own (t := factless)) none
+  let wrongIssuer ← match taskToken "reviewer" task (issuedBy := some "somebody") with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let oid := String.ofList (List.replicate 40 'a')
+  let gh (method host path : String) (body : String := "") (t := rt) :=
+    spentOn (choose rr t method host path body (if body.isEmpty then none else some "application/json"))
+  let push (repo : String) (t := rt) :=
+    spentOn (choose rr t "POST" "github.com" s!"/{repo}.git/git-receive-pack"
+      (Bytes.toStringLossy (pushBody [(oid, "refs/heads/x")]))
+      (some "application/x-git-receive-pack-request"))
+  let pat := some "github/orchestra-pat"
+  checkEq "fetches the upstream on the operator's token"
+    (gh "GET" "github.com" "/up/proj.git/info/refs?service=git-upload-pack") pat
+  checkEq "reads its pull request through the API" (gh "GET" "api.github.com" "/repos/up/proj/pulls/7") pat
+  checkEq "reads a public repository anonymously"
+    (gh "GET" "api.github.com" "/repos/torvalds/linux") (some "-")
+  checkEq "runs a GraphQL query"
+    (gh "POST" "api.github.com" "/graphql" "{\"query\":\"query { viewer { login } }\"}")
+    (some "github/orchestra-app")
+  checkEq "but not under another issuer's name"
+    (gh "GET" "api.github.com" "/repos/up/proj/pulls/7" (t := wrongIssuer)) none
+  checkEq "pushes nowhere: not to its fork" (push "bot/proj") none
+  checkEq "nor to the upstream" (push "up/proj") none
+  checkEq "nor starts a push"
+    (gh "GET" "github.com" "/bot/proj.git/info/refs?service=git-receive-pack") none
+  let writes : List (String × String × String) := [
+    ("POST", "/repos/up/proj/pulls/7/reviews", "{\"event\":\"COMMENT\",\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/pulls/7/reviews", "{\"event\":\"APPROVE\"}"),
+    ("POST", "/repos/up/proj/pulls/7/comments", "{\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/pulls/7/comments/9/replies", "{\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/issues/7/comments", "{\"body\":\"x\"}"),
+    ("POST", "/repos/up/proj/issues/7/labels", "{\"labels\":[\"orchestra\"]}"),
+    ("PUT", "/repos/up/proj/issues/7/labels", "{\"labels\":[\"orchestra\"]}"),
+    ("DELETE", "/repos/up/proj/issues/7/labels/orchestra", ""),
+    ("POST", "/repos/up/proj/labels", "{\"name\":\"orchestra\"}"),
+    ("POST", "/repos/up/proj/pulls", "{\"head\":\"bot:x\",\"base\":\"main\"}"),
+    ("POST", "/repos/bot/proj/pulls", "{\"head\":\"x\",\"base\":\"main\"}"),
+    ("PATCH", "/repos/up/proj/pulls/7", "{\"title\":\"t\"}"),
+    ("PUT", "/repos/up/proj/pulls/7/merge", "{}"),
+    ("POST", "/orgs/bot/repos", "{\"name\":\"new\"}"),
+    ("POST", "/graphql", "{\"query\":\"mutation { addComment(input: {}) { clientMutationId } }\"}")]
+  for (m, path, body) in writes do
+    checkEq s!"refuses {m} {path}" (gh m "api.github.com" path body) none
+  -- A repository the App is installed on is worked on directly: fork and upstream are one.
+  let direct ← match taskToken "reviewer"
+      ["task_fork(\"up\", \"proj\")", "task_upstream(\"up\", \"proj\")", "task_issue(7)",
+       "task_tool(\"create_pr\")", "task_tool(\"comment\")"] with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  checkEq "with its fork its upstream, it still cannot push there" (push "up/proj" (t := direct)) none
+  checkEq "nor open a pull request there"
+    (gh "POST" "api.github.com" "/repos/up/proj/pulls" "{\"head\":\"x\",\"base\":\"main\"}"
+      (t := direct)) none
+  checkEq "nor review" (gh "POST" "api.github.com" "/repos/up/proj/pulls/7/reviews"
+    "{\"event\":\"COMMENT\",\"body\":\"x\"}" (t := direct)) none
+  checkEq "but reads it" (gh "GET" "api.github.com" "/repos/up/proj/pulls/7" (t := direct))
+    (some "github/orchestra-app")
+  match Card.setup rr rt with
+  | .error e => check "setup" false e
+  | .ok (_, files) =>
+    match files.find? (·.path == ".config/diff-reviewer/agent.json") with
+    | none => check "setup writes the agent's config" false (toString (files.map (·.path)))
+    | some f =>
+      checkEq "setup writes the agent's config, with the placeholder token" f.content
+        "{\"url\": \"https://reviews.example\", \"token\": \"kleis\"}\n"
+
+  group "the diff-reviewer platform, posting"
+  let pt ← match taskToken "diff-reviewer-poster" [] (issuedBy := none) with
+    | .ok t => pure t
+    | .error e => throw (IO.userError e)
+  let post (method path : String) (body : String := "") :=
+    spentOn (choose rr pt method "api.github.com" path body
+      (if body.isEmpty then none else some "application/json"))
+  let chris := some "github/chrisflav"
+  let posted := "{\"commit_id\":\"abc\",\"event\":\"COMMENT\",\"body\":\"b\",\"comments\":" ++
+    "[{\"path\":\"a.lean\",\"line\":3,\"side\":\"RIGHT\",\"body\":\"c\"}]}"
+  checkEq "posts a review on a listed repository, on Christian's token"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" posted) chris
+  checkEq "and an inline comment"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/comments" "{\"body\":\"c\"}") chris
+  checkEq "lists its open pull requests" (post "GET" "/repos/chrisflav/kleis/pulls?state=open") chris
+  checkEq "reads one" (post "GET" "/repos/chrisflav/kleis/pulls/7") chris
+  checkEq "reads about no repository" (post "GET" "/rate_limit") chris
+  checkEq "posts no review on a repository not listed"
+    (post "POST" "/repos/acme/widgets/pulls/7/reviews" posted) none
+  checkEq "nor reads one" (post "GET" "/repos/acme/widgets/pulls") none
+  checkEq "comments on no issue"
+    (post "POST" "/repos/chrisflav/kleis/issues/7/comments" "{\"body\":\"x\"}") none
+  checkEq "merges nothing" (post "PUT" "/repos/chrisflav/kleis/pulls/7/merge" "{}") none
+  checkEq "and runs no GraphQL"
+    (post "POST" "/graphql" "{\"query\":\"query { viewer { login } }\"}") none
 
 end KleisTests

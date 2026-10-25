@@ -18,7 +18,7 @@ passthrough = ["*"]
 # The services kleis knows, from the extensions it ships (extensions/ in the
 # repository, /usr/share/kleis/extensions in the image).  With "github" here, the
 # manifest comes from the extension; do not also copy github.toml into services/.
-extensions = ["github", "zulip", "caldav", "mail"]
+extensions = ["github", "zulip", "caldav", "mail", "diff-reviewer"]
 
 # The orchestrator makes a token per job: through /.kleis/v1/derive from one of
 # the specs below (specs/*.kleis), or through /.kleis/v1/tokens naming grants.  It
@@ -27,6 +27,6 @@ extensions = ["github", "zulip", "caldav", "mail"]
 [[issuer]]
 name    = "orchestra"
 grants  = ["orchestra-*"]
-specs   = ["worker", "secretary"]
+specs   = ["worker", "secretary", "reviewer"]
 facts   = ["task_*"]
 max_ttl = "24h"
