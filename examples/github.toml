@@ -17,12 +17,14 @@ hosts = ["github.com", "api.github.com", "codeload.github.com"]
 modes = ["rewrite", "connect"]
 
 # How much of a body is read, and into how many facts. A body past either is
-# refused, not relayed unread. Sized for a pull request review of some 500 inline
-# comments, about 2 MiB: one fact per scalar, five or so per comment.  The
-# daemon's own `[limits] max_decode_prefix` (64 KiB unless set) also bounds the
-# first, whichever is smaller.  Deciding on a body this large takes seconds.
-max_body_facts    = 4096
-max_decode_prefix = 4194304
+# refused, not relayed unread. Sized for the largest review diff-reviewer posts:
+# 200 inline comments, at six facts each (path, start_line, line, side,
+# start_side, body; a suggestion is in the body) and up to some 10 KiB of text.
+# The daemon's own `[limits] max_decode_prefix` (64 KiB unless set) also bounds
+# the first, whichever is smaller.  Deciding on a body at the limit takes about
+# half a second, and any bearer may send one: raise these with care.
+max_body_facts    = 1280
+max_decode_prefix = 2097152
 
 # What a request is about, for routing credentials (a grant's `credential_route`):
 # `owner/repo`, the repository being created, or the organisation.

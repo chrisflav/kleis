@@ -144,22 +144,32 @@ private def taskToken (spec : String) (facts : List String)
     1700000000 (fixedKey 9)
   pure t
 
-/-- A review with `n` inline comments, each with a body of `size` bytes: the shape the platform
-posts to GitHub. -/
-private def bigReview (n : Nat) (size : Nat := 3000) : String :=
+/-- A review with `n` inline comments, in the shape the platform posts to GitHub: six fields
+each, and a body of `size` bytes with a suggestion in it. -/
+private def bigReview (n : Nat) (size : Nat := 8000) : String :=
   let comment (i : Nat) := "{\"path\":\"Mathlib/Foo/Bar" ++ toString i ++ ".lean\",\"start_line\":" ++
-    toString i ++ ",\"line\":" ++ toString (i + 1) ++ ",\"side\":\"RIGHT\",\"body\":\"" ++
-    String.ofList (List.replicate size 'x') ++ "\"}"
+    toString i ++ ",\"line\":" ++ toString (i + 1) ++ ",\"side\":\"RIGHT\"," ++
+    "\"start_side\":\"RIGHT\",\"body\":\"" ++ String.ofList (List.replicate size 'x') ++
+    "\\n```suggestion\\nexact h\\n```\"}"
   "{\"commit_id\":\"abc\",\"event\":\"COMMENT\",\"body\":\"b\",\"comments\":[" ++
     ",".intercalate ((List.range n).map comment) ++ "]}"
 
-/-- A submission to the platform with `n` inline comments, in the agent API's shape. -/
-private def agentReview (n : Nat) (size : Nat := 3000) : String :=
+/-- A submission to the platform with `n` inline comments, in the agent API's shape: seven
+fields each, a body and a suggestion of `size` bytes between them. -/
+private def agentReview (n : Nat) (size : Nat := 8000) : String :=
+  let text (k : Nat) := String.ofList (List.replicate k 'x')
   let comment (i : Nat) := "{\"file\":\"Mathlib/Foo/Bar" ++ toString i ++ ".lean\",\"start_line\":" ++
     toString i ++ ",\"end_line\":" ++ toString (i + 1) ++ ",\"category\":\"style\"," ++
-    "\"severity\":\"minor\",\"body\":\"" ++ String.ofList (List.replicate size 'x') ++ "\"}"
+    "\"severity\":\"minor\",\"body\":\"" ++ text (size - size / 3) ++ "\",\"suggestion\":\"" ++
+    text (size / 3) ++ "\"}"
   "{\"headSha\":\"abc\",\"prType\":null,\"review\":{\"decision\":\"comment\",\"body\":\"b\"," ++
     "\"comments\":[" ++ ",".intercalate ((List.range n).map comment) ++ "]}}"
+
+/-- Whether a request was refused, and the reason says `needle`. -/
+private def refusedFor (c : Except String Policy.Choice) (needle : String) : Bool :=
+  match c with
+  | .ok c => !c.outcome.allowed && (c.reason.splitOn needle).length > 1
+  | .error _ => false
 
 def specTests : IO Unit := do
   group "the shipped extensions load and agree with their manifests"
@@ -361,8 +371,12 @@ def specTests : IO Unit := do
   checkEq "nor its fork's" (dr "POST" "/api/agent/v1/repos/bot/proj/pulls/7/review" review) none
   checkEq "nor another repository of its upstream's owner"
     (dr "POST" "/api/agent/v1/repos/up/other/pulls/7/review" review) none
-  checkEq "a review of 300 comments is submitted"
-    (dr "POST" s!"{own}/review" (agentReview 300)) agentToken
+  checkEq "a review of 200 comments is submitted"
+    (dr "POST" s!"{own}/review" (agentReview 200)) agentToken
+  -- 1536 facts: four for the review, seven a comment.
+  check "one of 219 is too many facts, and refused as unread"
+    (refusedFor (choose rr rt "POST" "reviews.example" s!"{own}/review" (agentReview 219)
+      (some "application/json")) "body_truncated")
   checkEq "nor the scripts' API" (dr "GET" "/api/v1/jobs") none
   checkEq "nor the login" (dr "POST" "/api/login" "{\"password\": \"x\"}") none
   check "the agent token goes to no other server"
@@ -457,8 +471,12 @@ def specTests : IO Unit := do
     checkEq s!"reads nothing about no repository: {path}" (post "GET" path) none
   checkEq "clones nothing, not even a listed repository"
     (spentOn (choose rr pt "GET" "github.com" "/chrisflav/kleis.git/info/refs?service=git-upload-pack")) none
-  checkEq "posts a review of 300 comments"
-    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" (bigReview 300)) chris
+  checkEq "posts a review of 200 comments"
+    (post "POST" "/repos/chrisflav/kleis/pulls/7/reviews" (bigReview 200)) chris
+  -- 1280 facts: three for the review, six a comment.
+  check "not one of 213, which is too many facts, and refused as unread"
+    (refusedFor (choose rr pt "POST" "api.github.com" "/repos/chrisflav/kleis/pulls/7/reviews"
+      (bigReview 213) (some "application/json")) "body_truncated")
   checkEq "posts no review on a repository not listed"
     (post "POST" "/repos/acme/widgets/pulls/7/reviews" posted) none
   -- Each of these is a substring of the listed name or contains it, so a list written as a

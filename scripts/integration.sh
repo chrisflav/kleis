@@ -774,7 +774,7 @@ upstream_ca_file = "$WORK/origin.crt"
 extensions = ["github", "diff-reviewer"]
 
 [limits]
-max_decode_prefix = 4194304
+max_decode_prefix = 2097152
 
 [[issuer]]
 name = "orchestra"
@@ -825,16 +825,17 @@ assert json.loads(files[".config/diff-reviewer/agent.json"]) == {"url": "https:/
     "$API/acme/widgets/pulls/7/review")"
   [ "$CODE" = "200" ] && grep -q '"method": "POST"' "$DR/out"
   check $? "its review is submitted" "got $CODE: $(cat "$DR/out")"
-  # Some 300 comments, about a megabyte: past the default limits, inside the example's.
+  # The platform's largest, 200 comments, some 1.6 MB: past the default limits, inside the
+  # example's.
   python3 -c '
 import json
 c = [{"file": f"F{i}.lean", "start_line": i, "end_line": i + 1, "category": "style",
-      "severity": "minor", "body": "x" * 3000} for i in range(300)]
+      "severity": "minor", "body": "x" * 5400, "suggestion": "y" * 2600} for i in range(200)]
 print(json.dumps({"headSha": "abc", "prType": None,
                   "review": {"decision": "comment", "body": "b", "comments": c}}))' > "$DR/big-submission"
   CODE="$(agent -H 'content-type: application/json' --data-binary @"$DR/big-submission" \
     "$API/acme/widgets/pulls/7/review")"
-  [ "$CODE" = "200" ]; check $? "and a review of 300 comments" "got $CODE: $(head -c 300 "$DR/out")"
+  [ "$CODE" = "200" ]; check $? "and a review of 200 comments" "got $CODE: $(head -c 300 "$DR/out")"
   CODE="$(agent "$API/acme/widgets/pulls/8")"
   [ "$CODE" = "403" ]; check $? "another pull request's job is refused" "got $CODE"
   CODE="$(agent "$API/acme/other/pulls/7")"
@@ -848,14 +849,14 @@ print(json.dumps({"headSha": "abc", "prType": None,
   }
   python3 -c '
 import json
-c = [{"path": f"F{i}.lean", "start_line": i, "line": i + 1, "side": "RIGHT", "body": "x" * 3000}
-     for i in range(300)]
+c = [{"path": f"F{i}.lean", "start_line": i, "line": i + 1, "side": "RIGHT", "start_side": "RIGHT",
+      "body": "x" * 8000 + "\n```suggestion\nexact h\n```"} for i in range(200)]
 print(json.dumps({"commit_id": "abc", "event": "COMMENT", "body": "b", "comments": c}))' > "$DR/big-review"
   CODE="$(github -H 'content-type: application/json' --data-binary @"$DR/big-review" \
     "https://127.0.0.1:$TLS_PORT/repos/chrisflav/kleis/pulls/7/reviews")"
   [ "$CODE" = "200" ] && grep -q '"authorization": "Bearer pat-secret-66"' "$DR/out" \
     && ! grep -q 'Bearer kleis' "$DR/out"
-  check $? "the platform posts a review of 300 comments on a listed repository, with the PAT" \
+  check $? "the platform posts a review of 200 comments on a listed repository, with the PAT" \
     "got $CODE: $(head -c 300 "$DR/out")"
   CODE="$(github -H 'content-type: application/json' -d '{"event":"COMMENT","body":"b"}' \
     "https://127.0.0.1:$TLS_PORT/repos/acme/widgets/pulls/7/reviews")"

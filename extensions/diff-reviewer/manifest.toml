@@ -19,11 +19,12 @@ modes = ["connect"]
 
 # Nothing here reads a body, and no decoder is bound to one. A body labelled
 # JSON is decoded by its media type all the same, and one past either limit is
-# refused, so these admit the largest review the platform takes: some 500 inline
-# comments, about 2 MiB, at seven facts or so each.  The daemon's own `[limits]
-# max_decode_prefix` (64 KiB unless set) also bounds the first.
-max_body_facts    = 4096
-max_decode_prefix = 4194304
+# refused, so these admit the largest review the platform takes: 200 inline
+# comments, at seven facts each (file, start_line, end_line, body, suggestion,
+# category, severity) and up to some 10 KiB of text.  The daemon's own
+# `[limits] max_decode_prefix` (64 KiB unless set) also bounds the first.
+max_body_facts    = 1536
+max_decode_prefix = 2097152
 
 [credential]
 provider = "static"
