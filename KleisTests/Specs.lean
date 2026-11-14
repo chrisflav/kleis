@@ -683,6 +683,22 @@ def specTests : IO Unit := do
   checkEq "opens a pull request from a proposal's branch"
     (post "POST" s!"{rubrics}/pulls" (pull "diff-reviewer/proposal/acme/widgets/x")) chris
   checkEq "and from no other" (post "POST" s!"{rubrics}/pulls" (pull "main")) none
+  let pullInto (base : String) := "{\"title\":\"t\",\"head\":\"diff-reviewer/proposal/acme/w/x\"," ++
+    "\"base\":\"" ++ base ++ "\",\"body\":\"why\"}"
+  for base in ["dev", "gh-pages", "diff-reviewer/proposal/acme/w/y", "main2"] do
+    checkEq s!"nor into another branch than the rubrics': {base}"
+      (post "POST" s!"{rubrics}/pulls" (pullInto base)) none
+  checkEq "nor into none" (post "POST" s!"{rubrics}/pulls"
+    "{\"title\":\"t\",\"head\":\"diff-reviewer/proposal/acme/w/x\",\"body\":\"why\"}") none
+  let treeOf (paths : List String) := "{\"base_tree\":\"" ++ sha ++ "\",\"tree\":[" ++
+    ",".intercalate (paths.map fun p => "{\"path\":\"" ++ p ++ "\",\"mode\":\"100644\"," ++
+      "\"type\":\"blob\",\"content\":\"x\"}") ++ "]}"
+  for paths in [[".github/workflows/x.yml"], ["acme/widgets/rubric.md", ".github/workflows/x.yml"],
+                [".github"], [".github/CODEOWNERS"]] do
+    checkEq s!"writes no tree with an entry under .github/: {paths}"
+      (post "POST" s!"{rubrics}/git/trees" (treeOf paths)) none
+  checkEq "but one beside it" (post "POST" s!"{rubrics}/git/trees"
+    (treeOf ["acme/widgets/rubric.md", "acme/.github/x.md", ".githubx/y"])) chris
   checkEq "edits no pull request" (post "PATCH" s!"{rubrics}/pulls/3" "{\"title\":\"x\"}") none
   checkEq "merges none" (post "PUT" s!"{rubrics}/pulls/3/merge" "{}") none
   checkEq "reviews none" (post "POST" s!"{rubrics}/pulls/3/reviews" posted) none
