@@ -641,6 +641,66 @@ def specTests : IO Unit := do
   checkEq "and runs no GraphQL"
     (post "POST" "/graphql" "{\"query\":\"query { viewer { login } }\"}") none
 
+  group "the diff-reviewer platform, on its rubrics repository"
+  -- Exactly the platform's routes there: its reads, by path, and a rubric proposal's tree,
+  -- commit, branch under refs/heads/diff-reviewer/proposal/ and pull request from it.
+  let rubrics := "/repos/chrisflav/review-rubrics"
+  let sha := String.ofList (List.replicate 40 'a')
+  let sha2 := String.ofList (List.replicate 40 'b')
+  for path in [rubrics, s!"{rubrics}/git/ref/heads/main",
+               s!"{rubrics}/git/ref/heads/diff-reviewer/proposal/acme/widgets/0123abcd",
+               s!"{rubrics}/git/commits/{sha}", s!"{rubrics}/git/trees/{sha}",
+               s!"{rubrics}/git/trees/{sha}?recursive=1", s!"{rubrics}/git/blobs/{sha}",
+               s!"{rubrics}/compare/{sha}...{sha2}?per_page=100&page=1",
+               s!"{rubrics}/commits?sha=main&path=acme/widgets&per_page=100&page=1",
+               s!"{rubrics}/pulls?head=chrisflav:diff-reviewer/proposal/acme/widgets/x&state=all",
+               s!"{rubrics}/pulls/3"] do
+    checkEq s!"reads {path}" (post "GET" path) chris
+  for path in [s!"{rubrics}/contents/acme/widgets/rubric.md", s!"{rubrics}/issues",
+               s!"{rubrics}/git/trees/main", s!"{rubrics}/git/blobs/{sha}/x",
+               s!"{rubrics}/pulls/3/files", s!"{rubrics}/actions/runs", s!"{rubrics}/branches",
+               s!"{rubrics}/compare/main...dev"] do
+    checkEq s!"reads nothing else: {path}" (post "GET" path) none
+  checkEq "nor heads it" (spentOn (choose rr pt "HEAD" "api.github.com" rubrics "")) none
+  checkEq "clones nothing of it"
+    (spentOn (choose rr pt "GET" "github.com"
+      "/chrisflav/review-rubrics.git/info/refs?service=git-upload-pack")) none
+  let tree := "{\"base_tree\":\"" ++ sha ++ "\",\"tree\":[{\"path\":\"acme/widgets/rubric.md\"," ++
+    "\"mode\":\"100644\",\"type\":\"blob\",\"content\":\"Check names.\\n\"}]}"
+  checkEq "writes a tree" (post "POST" s!"{rubrics}/git/trees" tree) chris
+  checkEq "and a commit" (post "POST" s!"{rubrics}/git/commits"
+    ("{\"message\":\"m\",\"tree\":\"" ++ sha ++ "\",\"parents\":[\"" ++ sha2 ++ "\"]}")) chris
+  let ref (r : String) := "{\"ref\":\"" ++ r ++ "\",\"sha\":\"" ++ sha ++ "\"}"
+  checkEq "makes a proposal's branch"
+    (post "POST" s!"{rubrics}/git/refs" (ref "refs/heads/diff-reviewer/proposal/acme/widgets/x"))
+    chris
+  for r in ["refs/heads/main", "refs/heads/diff-reviewer/other", "refs/tags/v1",
+            "refs/heads/diff-reviewer/proposalx", "refs/heads/x/diff-reviewer/proposal/y"] do
+    checkEq s!"and no other: {r}" (post "POST" s!"{rubrics}/git/refs" (ref r)) none
+  checkEq "nor one it does not name" (post "POST" s!"{rubrics}/git/refs" "{\"sha\":\"x\"}") none
+  let pull (head : String) := "{\"title\":\"t\",\"head\":\"" ++ head ++
+    "\",\"base\":\"main\",\"body\":\"why\"}"
+  checkEq "opens a pull request from a proposal's branch"
+    (post "POST" s!"{rubrics}/pulls" (pull "diff-reviewer/proposal/acme/widgets/x")) chris
+  checkEq "and from no other" (post "POST" s!"{rubrics}/pulls" (pull "main")) none
+  checkEq "edits no pull request" (post "PATCH" s!"{rubrics}/pulls/3" "{\"title\":\"x\"}") none
+  checkEq "merges none" (post "PUT" s!"{rubrics}/pulls/3/merge" "{}") none
+  checkEq "reviews none" (post "POST" s!"{rubrics}/pulls/3/reviews" posted) none
+  checkEq "comments on nothing" (post "POST" s!"{rubrics}/issues/3/comments" "{\"body\":\"x\"}")
+    none
+  checkEq "and pushes nothing"
+    (spentOn (choose rr pt "GET" "github.com"
+      "/chrisflav/review-rubrics.git/info/refs?service=git-receive-pack")) none
+  -- The writes are the rubrics repository's only: not on a reviewed repository, nor another.
+  for repo in ["chrisflav/kleis", "acme/widgets", "chrisflav/review-rubrics-fork"] do
+    checkEq s!"writes no tree on {repo}" (post "POST" s!"/repos/{repo}/git/trees" tree) none
+    checkEq s!"makes no branch on {repo}" (post "POST" s!"/repos/{repo}/git/refs"
+      (ref "refs/heads/diff-reviewer/proposal/acme/widgets/x")) none
+    checkEq s!"opens no pull request on {repo}" (post "POST" s!"/repos/{repo}/pulls"
+      (pull "diff-reviewer/proposal/acme/widgets/x")) none
+  checkEq "and reads no unlisted repository by the rubrics' routes"
+    (post "GET" s!"/repos/acme/widgets/git/blobs/{sha}") none
+
   group "bodies built to be expensive are refused quickly"
   -- Each shape at the default prefix and at the example's 2 MiB, through the platform's review
   -- route on GitHub and a job's on the platform. `choose` decodes the whole body, as the

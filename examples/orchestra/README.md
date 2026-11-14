@@ -130,6 +130,19 @@ and the PAT are not interchangeable:
   everything about none — `/user`, `/search`, `/rate_limit`, GraphQL — which
   would reach the rest of what the token can see.  It is not an issuer's spec:
   orchestra cannot derive it.
+  Beside them, the platform's rubrics repository (`rubrics([...])`, its
+  `DIFF_REVIEWER_RUBRICS_REPO`), with no `read`: only the routes the platform
+  uses there, each by its path — the repository itself, a branch's ref, a
+  commit, a tree and a blob by id, a compare of two commits, the commits of a
+  path, and its pull requests — and, for a rubric proposal, a tree, a commit
+  and a branch through the git data API (the GitHub manifest's `create_tree`,
+  `create_commit` and `create_ref`), the branch only under
+  `refs/heads/diff-reviewer/proposal/`, and a pull request from such a branch.
+  No contents, no other branch, no merge, no push.  The token behind
+  `github/chrisflav` needs Contents read on it, and Contents write and Pull
+  requests write for the proposals; a private repository has to be among the
+  fine-grained token's repositories.  A proposal's tree carries the rubric's
+  files, so it is one of the bodies the 2 MiB `max_decode_prefix` below is for.
 
 Why the job does not get `orchestra-github` with `read_only`: that grant takes
 pushing away from a read-only job (`task_writable`), but its other writes turn
@@ -202,7 +215,9 @@ with no port: an account's hosts are names, so the platform has to be served
 on 443.  The repositories are in four places that must
 agree: the platform's registered repositories, both clients'
 `queue_policy.repos`, and the list in `diff-reviewer-poster.kleis`
-(`reviewed([...])`), which kleis rereads when it changes.
+(`reviewed([...])`), which kleis rereads when it changes.  The rubrics
+repository is in two: the platform's `DIFF_REVIEWER_RUBRICS_REPO` and the
+spec's `rubrics([...])`.
 
 ## What is not covered
 
