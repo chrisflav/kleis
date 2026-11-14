@@ -20,8 +20,13 @@
 #   Writes, for a rubric proposal only: a tree, a commit, a branch under
 #   refs/heads/diff-reviewer/proposal/, and a pull request from such a branch into one of the
 #   rubrics branches (`rubrics_branches([...])`, the platform's DIFF_REVIEWER_RUBRICS_BRANCH).
-#   A tree that writes anything under `.github/` is refused: a workflow on a proposal's branch
-#   would run with the rubrics repository's secrets.
+#   A tree with an entry any of whose `/`-separated segments is `.github`, in any case, is
+#   refused: a workflow on a proposal's branch would run with the rubrics repository's secrets.
+#   Any segment, not only the first: a commit may take any tree as its root, so a `.github` written
+#   below the root (`acme/.github/workflows/x.yml`) becomes the root's when that subtree is made a
+#   commit's tree. Every tree holding a `.github` child was made by a path naming that segment, so
+#   this is enough. It also means a reviewed repository whose owner or name is literally
+#   `.github` cannot have rubric proposals: its directory is `<owner>/.github/`.
 # Nothing else there: no contents, no issues, no merge, no other branch, no push.
 #
 # The repositories are the one list below, kept by the operator. Every request must name one of
@@ -62,6 +67,5 @@ spec diff-reviewer-poster
       reject if pr_head($h), operation("open_pr"), !$h.starts_with("diff-reviewer/proposal/");
       reject if operation("open_pr"), rubrics_repository($o, $r), pr_base($b),
         rubrics_branches($bs), !$bs.contains($b);
-      reject if tree_entry($p), $p == ".github";
-      reject if tree_entry($p), $p.starts_with(".github/");
+      reject if tree_entry($p), $p.matches("(^|/)[.][Gg][Ii][Tt][Hh][Uu][Bb](/|$)");
     '''

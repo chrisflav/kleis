@@ -694,11 +694,23 @@ def specTests : IO Unit := do
     ",".intercalate (paths.map fun p => "{\"path\":\"" ++ p ++ "\",\"mode\":\"100644\"," ++
       "\"type\":\"blob\",\"content\":\"x\"}") ++ "]}"
   for paths in [[".github/workflows/x.yml"], ["acme/widgets/rubric.md", ".github/workflows/x.yml"],
-                [".github"], [".github/CODEOWNERS"]] do
-    checkEq s!"writes no tree with an entry under .github/: {paths}"
+                [".github"], [".github/CODEOWNERS"], ["acme/.github/x.md"],
+                ["/.github/x"], ["./.github"], [".github//x"], [".GitHub/workflows/x.yml"],
+                ["acme/.GITHUB/workflows/x.yml"], ["acme/widgets/.github"]] do
+    checkEq s!"writes no tree with a .github segment: {paths}"
       (post "POST" s!"{rubrics}/git/trees" (treeOf paths)) none
-  checkEq "but one beside it" (post "POST" s!"{rubrics}/git/trees"
-    (treeOf ["acme/widgets/rubric.md", "acme/.github/x.md", ".githubx/y"])) chris
+  checkEq "but one of names that only contain it" (post "POST" s!"{rubrics}/git/trees"
+    (treeOf ["acme/widgets/rubric.md", ".githubx/y", "acme/x.github/y", "acme/.github.md"]))
+    chris
+  -- The subtree attack: a `.github` written below the root, its subtree read, and made the root
+  -- of a commit on a proposal's branch. Its first step is refused, so there is no such subtree.
+  let attack := "{\"base_tree\":\"" ++ sha ++ "\",\"tree\":[{\"path\":" ++
+    "\"acme/.github/workflows/x.yml\",\"mode\":\"100644\",\"type\":\"blob\"," ++
+    "\"content\":\"on: push\"}]}"
+  checkEq "the subtree attack: the tree with acme/.github/workflows is refused"
+    (post "POST" s!"{rubrics}/git/trees" attack) none
+  checkEq "while reading a subtree and committing a tree are the platform's own steps"
+    (post "GET" s!"{rubrics}/git/trees/{sha}") chris
   checkEq "edits no pull request" (post "PATCH" s!"{rubrics}/pulls/3" "{\"title\":\"x\"}") none
   checkEq "merges none" (post "PUT" s!"{rubrics}/pulls/3/merge" "{}") none
   checkEq "reviews none" (post "POST" s!"{rubrics}/pulls/3/reviews" posted) none

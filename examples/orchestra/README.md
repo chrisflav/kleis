@@ -139,8 +139,9 @@ and the PAT are not interchangeable:
   `create_commit` and `create_ref`), the branch only under
   `refs/heads/diff-reviewer/proposal/`, and a pull request from such a branch
   into one of the rubrics branches (`rubrics_branches([...])`, its
-  `DIFF_REVIEWER_RUBRICS_BRANCH`).  A tree with an entry under `.github/` is
-  refused.  No contents, no other branch, no merge, no push.  The token behind
+  `DIFF_REVIEWER_RUBRICS_BRANCH`).  A tree with an entry any of whose path
+  segments is `.github`, in any case, is refused — at any depth, since a commit
+  may take a subtree as its root.  No contents, no other branch, no merge, no push.  The token behind
   `github/chrisflav` needs Contents read on it, and Contents write and Pull
   requests write for the proposals; a private repository has to be among the
   fine-grained token's repositories.  **It must not have Workflows: write**
