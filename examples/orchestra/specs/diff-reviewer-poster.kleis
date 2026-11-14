@@ -11,6 +11,16 @@
 # `read` is every GET and HEAD under a listed repository's /repos/{owner}/{name}/…: contents,
 # commits, issues, workflow runs, whatever the token can read there, not only pull requests.
 #
+# The rubrics repository (`rubrics([...])`, the platform's DIFF_REVIEWER_RUBRICS_REPO) is not a
+# reviewed one, and gets no `read`: only what the platform does there, each route by its path.
+#   Reads, every pass and for the rubric pages: the repository itself (after a 404 of its
+#   branch, to tell a missing branch from a repository the token cannot see), a branch's ref,
+#   a commit, a tree and a blob by their ids, a compare of two commits, the commits of a path,
+#   and pull requests (one, or the list naming a proposal's branch).
+#   Writes, for a rubric proposal only: a tree, a commit, a branch under
+#   refs/heads/diff-reviewer/proposal/, and a pull request from such a branch.
+# Nothing else there: no contents, no issues, no merge, no other branch, no push.
+#
 # The repositories are the one list below, kept by the operator. Every request must name one of
 # them: one about any other repository is refused, and so is one about none (`/user`, `/search`,
 # `/rate_limit`, GraphQL), which would reach the rest of what the token can see. Editing the list
@@ -21,14 +31,28 @@
 # REST API's `read` on a repository (pull requests, their details, their diffs), `review_pr` and
 # `review_comment`; not cloning or fetching.
 spec diff-reviewer-poster
-  description "The diff-reviewer platform: reads the pull requests it reviews and posts approved reviews."
+  description "The diff-reviewer platform: reads the pull requests it reviews, posts approved reviews, reads its rubrics repository and opens rubric proposals there."
   max_ttl 90d
 
   account github/chrisflav
     datalog '''
       reviewed(["chrisflav/kleis"]);
+      rubrics(["chrisflav/review-rubrics"]);
       allowed($op) <- operation($op), ["read", "review_pr", "review_comment"].contains($op),
         repository($o, $r), reviewed($s), $s.contains($o + "/" + $r);
+      rubrics_repository($o, $r) <- repository($o, $r), rubrics($s), $s.contains($o + "/" + $r);
+      allowed("rubrics_read") <- operation("read"), request_method("GET"),
+        rubrics_repository($o, $r), request_path($p),
+        $p.matches("^/repos/[^/]+/[^/]+(/git/ref/heads/[A-Za-z0-9._/-]+|/git/(commits|trees|blobs)/[0-9a-f]{40,64}|/compare/[0-9a-f]{40,64}[.][.][.][0-9a-f]{40,64}|/commits|/pulls|/pulls/[0-9]+)?$");
+      allowed("rubrics_write") <- operation($op), ["create_tree", "create_commit"].contains($op),
+        rubrics_repository($o, $r);
+      allowed("rubrics_branch") <- operation("create_ref"), rubrics_repository($o, $r),
+        new_ref($ref), $ref.starts_with("refs/heads/diff-reviewer/proposal/");
+      allowed("rubrics_pull") <- operation("open_pr"), rubrics_repository($o, $r),
+        pr_head($h), $h.starts_with("diff-reviewer/proposal/");
       check if allowed($x);
-      reject if repository($o, $r), reviewed($s), !$s.contains($o + "/" + $r);
+      reject if repository($o, $r), reviewed($s), rubrics($t), !$s.contains($o + "/" + $r),
+        !$t.contains($o + "/" + $r);
+      reject if new_ref($ref), !$ref.starts_with("refs/heads/diff-reviewer/proposal/");
+      reject if pr_head($h), operation("open_pr"), !$h.starts_with("diff-reviewer/proposal/");
     '''

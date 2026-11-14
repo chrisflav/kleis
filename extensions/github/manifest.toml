@@ -5,7 +5,8 @@
 #
 # What it covers: git over smart HTTP, release and archive downloads, the REST
 # API that `gh api` and `curl` reach — reads, pull requests, reviews, comments,
-# labels, repository creation — and the GraphQL endpoint, whose requests are
+# labels, repository creation, and trees, commits and branches written through
+# the git data API — and the GraphQL endpoint, whose requests are
 # read for whether they are queries or mutations.  A request no route matches
 # gets `operation("unrouted")`, and kleis refuses it whatever the grant.
 #
@@ -253,6 +254,25 @@ emit  = ['operation("review_comment")', 'repository($owner, $repo)',
 match = "POST api.github.com /repos/{owner}/{repo}/pulls/{number:int}/comments/{comment:int}/replies"
 emit  = ['operation("review_comment")', 'repository($owner, $repo)',
          'pull_request($number)', 'review_comment_id($comment)']
+
+# ---------------------------------------------------------------- api: git data
+
+# Writing a tree, a commit and a branch through the API rather than by pushing:
+# what diff-reviewer does to open a rubric proposal's pull request.  A branch
+# made so is `new_ref`, the whole ref as sent (`refs/heads/…`), so that a grant
+# can bound it as `ref_update` bounds a push.
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/git/trees"
+emit  = ['operation("create_tree")', 'repository($owner, $repo)']
+
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/git/commits"
+emit  = ['operation("create_commit")', 'repository($owner, $repo)']
+
+[[route]]
+match = "POST api.github.com /repos/{owner}/{repo}/git/refs"
+capture = { ref = "body:ref" }
+emit  = ['operation("create_ref")', 'repository($owner, $repo)', 'new_ref($ref)']
 
 # ---------------------------------------------------------------- api: issues
 

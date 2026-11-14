@@ -34,6 +34,9 @@ set_labels        = "set labels"
 remove_label      = "remove labels"
 create_label      = "create labels"
 create_repository = "create repositories"
+create_tree       = "write trees through the git data API"
+create_commit     = "write commits through the git data API"
+create_ref        = "make branches through the git data API"
 
 # What a card says about the facts an orchestrator states for a task (`/.kleis/v1/derive`).
 [facts]
