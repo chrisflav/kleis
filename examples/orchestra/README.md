@@ -137,11 +137,18 @@ and the PAT are not interchangeable:
   path, and its pull requests — and, for a rubric proposal, a tree, a commit
   and a branch through the git data API (the GitHub manifest's `create_tree`,
   `create_commit` and `create_ref`), the branch only under
-  `refs/heads/diff-reviewer/proposal/`, and a pull request from such a branch.
-  No contents, no other branch, no merge, no push.  The token behind
+  `refs/heads/diff-reviewer/proposal/`, and a pull request from such a branch
+  into one of the rubrics branches (`rubrics_branches([...])`, its
+  `DIFF_REVIEWER_RUBRICS_BRANCH`).  A tree with an entry any of whose path
+  segments is `.github`, in any case, is refused — at any depth, since a commit
+  may take a subtree as its root.  No contents, no other branch, no merge, no push.  The token behind
   `github/chrisflav` needs Contents read on it, and Contents write and Pull
   requests write for the proposals; a private repository has to be among the
-  fine-grained token's repositories.  A proposal's tree carries the rubric's
+  fine-grained token's repositories.  **It must not have Workflows: write**
+  (on any repository it reaches): with it, a branch the platform writes could
+  carry a `.github/workflows/` file, and the workflow would run with the
+  rubrics repository's secrets.  kleis refuses such a tree, and GitHub refuses
+  it too without that permission — keep both.  A proposal's tree carries the rubric's
   files, so it is one of the bodies the 2 MiB `max_decode_prefix` below is for.
 
 Why the job does not get `orchestra-github` with `read_only`: that grant takes
@@ -217,7 +224,8 @@ agree: the platform's registered repositories, both clients'
 `queue_policy.repos`, and the list in `diff-reviewer-poster.kleis`
 (`reviewed([...])`), which kleis rereads when it changes.  The rubrics
 repository is in two: the platform's `DIFF_REVIEWER_RUBRICS_REPO` and the
-spec's `rubrics([...])`.
+spec's `rubrics([...])`; and its branch too: `DIFF_REVIEWER_RUBRICS_BRANCH`
+and `rubrics_branches([...])`.
 
 ## What is not covered
 

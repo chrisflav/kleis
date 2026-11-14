@@ -58,6 +58,10 @@ deletes_ref($ref) <-
   body($q, true), $q.length() == 3, $q.get(0) == "updates",
   $q.get(1) == $p.get(1), $q.get(2) == "delete";
 
+// The path of each entry of a tree written through the git data API (`create_tree`).
+tree_entry($path) <-
+  operation("create_tree"),
+  body($p, $path), $p.length() == 3, $p.get(0) == "tree", $p.get(2) == "path";
 // What a fetch or clone is asking for.
 wants_object($oid) <-
   body($p, $oid), $p.length() == 2, $p.get(0) == "wants";
